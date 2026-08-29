@@ -224,7 +224,7 @@ async fn authenticate(State(state): State<AppState>, request: Request, next: Nex
 
 async fn limit_headers(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if request.headers().len() > state.limits.max_headers {
-        ApiError::payload("too_many_headers", "too many request headers").into_response()
+        ApiError::headers("too_many_headers", "too many request headers").into_response()
     } else {
         next.run(request).await
     }
@@ -251,6 +251,9 @@ impl ApiError {
     }
     fn payload(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, code, message)
+    }
+    fn headers(code: &'static str, message: &'static str) -> Self {
+        Self::new(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, code, message)
     }
     fn not_found(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)

@@ -29,6 +29,21 @@ impl Default for TokenStore {
 }
 
 impl TokenStore {
+    pub fn from_phc_hashes(hashes: Vec<String>) -> Result<Self, argon2::password_hash::Error> {
+        for encoded in &hashes {
+            PasswordHash::new(encoded)?;
+        }
+        Ok(Self {
+            hashes,
+            dummy_hash: hash("invalid-token")?,
+        })
+    }
+
+    #[must_use]
+    pub fn phc_hashes(&self) -> &[String] {
+        &self.hashes
+    }
+
     pub fn create(&mut self) -> Result<CreatedToken, argon2::password_hash::Error> {
         let mut bytes = [0_u8; 24];
         OsRng.fill_bytes(&mut bytes);
