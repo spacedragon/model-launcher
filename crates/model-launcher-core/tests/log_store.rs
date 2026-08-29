@@ -119,11 +119,7 @@ fn authorization_and_bearer_secrets_are_redacted_before_storage_and_broadcast() 
     assert!(!combined.contains(secret));
     assert!(!combined.contains("abc123"));
     assert!(!combined.contains("loose-token"));
-    assert!(
-        snapshot[0]
-            .message
-            .contains("Authorization : Bearer [REDACTED]")
-    );
+    assert!(snapshot[0].message.contains("Authorization : [REDACTED]"));
 }
 
 #[test]
@@ -159,6 +155,48 @@ fn folded_authorization_credentials_are_redacted_from_every_observation_surface(
         assert!(!combined.contains(secret), "leaked {secret}");
     }
     assert!(snapshot[0].message.contains("safe: visible"));
+}
+
+#[test]
+fn inline_authorization_fields_and_mixed_line_delimiters_are_redacted_everywhere() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = [
+        "inline-basic",
+        "inline-digest",
+        "bare-custom",
+        "folded-custom",
+    ];
+    store.append(record(
+        1,
+        concat!(
+            "request headers: Authorization: Basic inline-basic\r\n",
+            "safe NotAuthorization: keep-this\n",
+            "x aUtHoRiZaTiOn : Digest inline-digest\r",
+            "prefix AUTHORIZATION:\r\n\tfolded-custom\r",
+            "x authorization: Custom bare-custom\rnext: safe"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(
+        snapshot[0]
+            .message
+            .contains("request headers: Authorization:")
+    );
+    assert!(snapshot[0].message.contains("NotAuthorization: keep-this"));
+    assert!(snapshot[0].message.contains("next: safe"));
 }
 
 #[test]

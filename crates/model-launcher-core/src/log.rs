@@ -215,14 +215,7 @@ fn saturating_add(counter: &AtomicU64, amount: u64) {
 fn redact_authorization_headers(message: &str) -> String {
     let mut output = String::with_capacity(message.len());
     let mut authorization_continuation = false;
-    for line in message.split_inclusive('\n') {
-        let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
-            (content, "\r\n")
-        } else if let Some(content) = line.strip_suffix('\n') {
-            (content, "\n")
-        } else {
-            (line, "")
-        };
+    for (content, ending) in logical_lines(message) {
         if authorization_continuation && content.starts_with([' ', '\t']) {
             let whitespace_len = content.len() - content.trim_start_matches([' ', '\t']).len();
             output.push_str(&content[..whitespace_len]);
@@ -231,20 +224,9 @@ fn redact_authorization_headers(message: &str) -> String {
             continue;
         }
         authorization_continuation = false;
-        if let Some((name, value)) = content.split_once(':')
-            && name.trim().eq_ignore_ascii_case("authorization")
-        {
-            output.push_str(&content[..name.len()]);
-            output.push(':');
-            if value
-                .trim_start()
-                .to_ascii_lowercase()
-                .starts_with("bearer")
-            {
-                output.push_str(" Bearer [REDACTED]");
-            } else {
-                output.push_str(" [REDACTED]");
-            }
+        if let Some(colon) = authorization_colon(content) {
+            output.push_str(&content[..=colon]);
+            output.push_str(" [REDACTED]");
             output.push_str(ending);
             authorization_continuation = true;
         } else {
@@ -253,6 +235,80 @@ fn redact_authorization_headers(message: &str) -> String {
         }
     }
     output
+}
+
+fn logical_lines(message: &str) -> impl Iterator<Item = (&str, &str)> {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= message.len() {
+            return None;
+        }
+        let bytes = message.as_bytes();
+        let mut end = start;
+        while end < bytes.len() && !matches!(bytes[end], b'\r' | b'\n') {
+            end += 1;
+        }
+        let content = &message[start..end];
+        let ending = if bytes.get(end) == Some(&b'\r') && bytes.get(end + 1) == Some(&b'\n') {
+            start = end + 2;
+            "\r\n"
+        } else if bytes.get(end) == Some(&b'\r') {
+            start = end + 1;
+            "\r"
+        } else if bytes.get(end) == Some(&b'\n') {
+            start = end + 1;
+            "\n"
+        } else {
+            start = end;
+            ""
+        };
+        Some((content, ending))
+    })
+}
+
+fn authorization_colon(line: &str) -> Option<usize> {
+    const NAME: &[u8] = b"authorization";
+    let bytes = line.as_bytes();
+    if bytes.len() < NAME.len() {
+        return None;
+    }
+    for start in 0..=bytes.len() - NAME.len() {
+        if start != 0 && is_http_token_byte(bytes[start - 1]) {
+            continue;
+        }
+        if !bytes[start..start + NAME.len()].eq_ignore_ascii_case(NAME) {
+            continue;
+        }
+        let mut cursor = start + NAME.len();
+        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b':') {
+            return Some(cursor);
+        }
+    }
+    None
+}
+
+const fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[derive(Debug)]
