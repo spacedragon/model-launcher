@@ -1,8 +1,11 @@
-use model_launcher::{Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase};
+use model_launcher::{
+    Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase, WatcherBarrier,
+    WatcherBarrierPoint,
+};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
 use model_launcher_core::{
-    EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine, LaunchSettings,
-    LifecycleState, ModelRecord,
+    ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
+    LaunchSettings, LifecycleState, ModelRecord,
 };
 use std::{
     sync::{
@@ -430,4 +433,78 @@ async fn listener_bind_failure_cleans_partially_started_lifecycle() {
     assert_eq!(starts.load(Ordering::SeqCst), 0);
     drop(occupied);
     assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+}
+
+fn idle_engine() -> Arc<dyn InferenceEngine> {
+    Arc::new(Engine {
+        starts: Arc::new(AtomicUsize::new(0)),
+        stops: Arc::new(AtomicUsize::new(0)),
+    })
+}
+
+#[tokio::test]
+async fn watcher_batch_waiting_before_gate_is_discarded_after_shutdown_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let mut opts = options(temp.path(), "http://127.0.0.1:1".into());
+    opts.watch_catalog = true;
+    opts.shutdown_timeout = Duration::from_secs(2);
+    let barrier = WatcherBarrier::new(WatcherBarrierPoint::BeforeGate);
+    let service = Service::start_with_watcher_barrier(opts, idle_engine(), barrier.clone())
+        .await
+        .unwrap();
+    std::fs::write(temp.path().join("models/late.gguf"), b"GGUFtiny").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), barrier.entered())
+        .await
+        .unwrap();
+    let handle = service.handle();
+    let mut events = handle.subscribe_shutdown();
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    while events.recv().await.unwrap() != ShutdownEvent::Started(ShutdownPhase::StopGateway) {}
+    barrier.release();
+    shutdown.await.unwrap().unwrap();
+    assert!(handle.snapshot().models.is_empty());
+    assert!(
+        ConfigStore::new(temp.path().join("config"))
+            .load()
+            .unwrap()
+            .models
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_watcher_already_inside_mutation_gate_and_persists_latest() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let mut opts = options(temp.path(), "http://127.0.0.1:1".into());
+    opts.watch_catalog = true;
+    opts.shutdown_timeout = Duration::from_secs(2);
+    let barrier = WatcherBarrier::new(WatcherBarrierPoint::InsideGate);
+    let service = Service::start_with_watcher_barrier(opts, idle_engine(), barrier.clone())
+        .await
+        .unwrap();
+    std::fs::write(temp.path().join("models/latest.gguf"), b"GGUFtiny").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), barrier.entered())
+        .await
+        .unwrap();
+    let handle = service.handle();
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!shutdown.is_finished());
+    barrier.release();
+    shutdown.await.unwrap().unwrap();
+    let memory = handle.snapshot().models;
+    let disk = ConfigStore::new(temp.path().join("config"))
+        .load()
+        .unwrap()
+        .models;
+    assert_eq!(memory, disk);
+    assert_eq!(disk.len(), 1);
 }

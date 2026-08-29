@@ -73,12 +73,43 @@ pub enum ShutdownEvent {
     Started(ShutdownPhase),
     Completed(ShutdownPhase),
 }
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum WatcherBarrierPoint {
+    BeforeGate,
+    InsideGate,
+}
+#[doc(hidden)]
+pub struct WatcherBarrier {
+    point: WatcherBarrierPoint,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+impl WatcherBarrier {
+    pub fn new(point: WatcherBarrierPoint) -> Arc<Self> {
+        Arc::new(Self {
+            point,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+    pub async fn entered(&self) {
+        self.entered.notified().await;
+    }
+    pub fn release(&self) {
+        self.release.notify_waiters();
+    }
+    async fn pause(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+}
 impl Service {
     pub async fn start(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, ServiceError> {
-        Self::start_with_background_task(options, engine, None).await
+        Self::start_inner(options, engine, None, None).await
     }
 
     #[doc(hidden)]
@@ -86,6 +117,24 @@ impl Service {
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
         injected_background: Option<tokio::task::JoinHandle<()>>,
+    ) -> Result<Self, ServiceError> {
+        Self::start_inner(options, engine, injected_background, None).await
+    }
+
+    #[doc(hidden)]
+    pub async fn start_with_watcher_barrier(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        barrier: Arc<WatcherBarrier>,
+    ) -> Result<Self, ServiceError> {
+        Self::start_inner(options, engine, None, Some(barrier)).await
+    }
+
+    async fn start_inner(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        injected_background: Option<tokio::task::JoinHandle<()>>,
+        watcher_barrier: Option<Arc<WatcherBarrier>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
         let catalog = CatalogService::new(&options.catalog_dir, store.clone());
@@ -141,14 +190,18 @@ impl Service {
             let watcher_models = models.clone();
             let watcher_mutation = mutation.clone();
             let watcher_shutdown = shutdown.clone();
+            let watcher_barrier = watcher_barrier.clone();
             let task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { break; },
-                        result = watcher.process_next(&catalog) => match result {
-                            Ok(Some(result)) => { let _gate=watcher_mutation.lock().await; if matches!(*watcher_shutdown.lock().await, ShutdownState::Running) { *watcher_models.write().expect("model lock poisoned") = result.config; } },
-                            Ok(None) => break,
-                            Err(_) => {}
+                        batch = watcher.wait_next_batch() => {
+                            let Some(batch)=batch else { break; };
+                            if let Some(barrier)=&watcher_barrier && matches!(barrier.point, WatcherBarrierPoint::BeforeGate) { barrier.pause().await; }
+                            let _gate=watcher_mutation.lock().await;
+                            if !matches!(*watcher_shutdown.lock().await, ShutdownState::Running) { break; }
+                            if let Some(barrier)=&watcher_barrier && matches!(barrier.point, WatcherBarrierPoint::InsideGate) { barrier.pause().await; }
+                            if let Ok(result)=catalog.process_batch(batch) { *watcher_models.write().expect("model lock poisoned") = result.config; }
                         }
                     }
                 }
@@ -326,16 +379,18 @@ impl Inner {
             Err(_) => errors.push("lifecycle shutdown timed out".into()),
         }
         self.event(ShutdownEvent::Completed(ShutdownPhase::StopLifecycle));
-        let _mutation = self.mutation.lock().await;
-        self.event(ShutdownEvent::Started(ShutdownPhase::PersistConfig));
-        let latest = self.models.read().expect("model lock poisoned").clone();
-        if let Err(error) = self.store.update(|disk| {
-            disk.models = latest.models.clone();
-            Ok(())
-        }) {
-            errors.push(error.to_string());
+        {
+            let _mutation = self.mutation.lock().await;
+            self.event(ShutdownEvent::Started(ShutdownPhase::PersistConfig));
+            let latest = self.models.read().expect("model lock poisoned").clone();
+            if let Err(error) = self.store.update(|disk| {
+                disk.models = latest.models.clone();
+                Ok(())
+            }) {
+                errors.push(error.to_string());
+            }
+            self.event(ShutdownEvent::Completed(ShutdownPhase::PersistConfig));
         }
-        self.event(ShutdownEvent::Completed(ShutdownPhase::PersistConfig));
         self.event(ShutdownEvent::Started(ShutdownPhase::StopWatcher));
         if let Some(stop) = watch_stop {
             let _ = stop.send(true);

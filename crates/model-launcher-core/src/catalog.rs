@@ -1211,7 +1211,7 @@ pub struct CatalogWatchBatch {
 }
 
 impl CatalogWatchReceiver {
-    async fn next_batch(&mut self) -> Option<CatalogWatchBatch> {
+    pub async fn wait_next_batch(&mut self) -> Option<CatalogWatchBatch> {
         let first = self.events.recv().await?;
         let mut errors = Vec::new();
         let mut locally_dropped = 0_u64;
@@ -1299,9 +1299,15 @@ impl CatalogService {
         &self,
         receiver: &mut CatalogWatchReceiver,
     ) -> Result<Option<ReconcileResult>, AppError> {
-        let Some(batch) = receiver.next_batch().await else {
+        let Some(batch) = receiver.wait_next_batch().await else {
             return Ok(None);
         };
+        self.process_batch(batch).map(Some)
+    }
+
+    /// Applies an already-debounced watcher batch. Callers can place the complete scan, durable
+    /// reconciliation, and their in-memory assignment under one application mutation gate.
+    pub fn process_batch(&self, batch: CatalogWatchBatch) -> Result<ReconcileResult, AppError> {
         let mut watch_diagnostics = batch
             .errors
             .into_iter()
@@ -1324,7 +1330,7 @@ impl CatalogService {
         let mut output = self.reconcile_now()?;
         watch_diagnostics.append(&mut output.diagnostics);
         output.diagnostics = watch_diagnostics;
-        Ok(Some(output))
+        Ok(output)
     }
 }
 
@@ -1357,7 +1363,11 @@ impl CatalogWatcher {
     }
 
     pub async fn next(&mut self) -> Option<CatalogWatchBatch> {
-        self.events.next_batch().await
+        self.wait_next_batch().await
+    }
+
+    pub async fn wait_next_batch(&mut self) -> Option<CatalogWatchBatch> {
+        self.events.wait_next_batch().await
     }
 
     pub async fn process_next(
