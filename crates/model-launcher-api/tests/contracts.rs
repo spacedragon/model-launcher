@@ -285,6 +285,28 @@ fn token_store_rejects_malicious_phc_inputs_and_excessive_counts() {
     assert!(TokenStore::from_phc_hashes(vec![valid.replacen("m=19456", "m=999999", 1)]).is_err());
     assert!(TokenStore::from_phc_hashes(vec![valid; 17]).is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_token_verification_keeps_async_worker_responsive() {
+    let mut store = TokenStore::default();
+    let token = store.create().unwrap().plaintext;
+    let store = Arc::new(store);
+    let checks = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            let token = token.clone();
+            tokio::spawn(async move { store.verify(&token).await })
+        })
+        .collect::<Vec<_>>();
+    let heartbeat = tokio::spawn(async {
+        tokio::task::yield_now().await;
+        42
+    });
+    assert_eq!(heartbeat.await.unwrap(), 42);
+    for check in checks {
+        assert!(check.await.unwrap());
+    }
+}
 #[test]
 fn lan_without_auth_is_allowed_with_typed_warning() {
     let mut value = config(Authentication::Disabled);
@@ -415,6 +437,36 @@ async fn bounded_stop_aborts_hung_idle_connection_and_releases_port() {
     lifecycle.wait_for_termination().await;
     upstream.control.release_gate();
     upstream.stop().await.unwrap();
+}
+
+#[test]
+fn dropping_server_then_runtime_does_not_detach_listener_task() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let address = runtime.block_on(async {
+        let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+        let gateway = Gateway::new(
+            config(Authentication::Disabled),
+            vec![api_model()],
+            lifecycle.handle(),
+            Arc::new(|_| None),
+        )
+        .unwrap();
+        let server = gateway.start().await.unwrap();
+        let address = server.local_addr();
+        drop(server);
+        address
+    });
+    drop(runtime);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        drop(tokio::net::TcpListener::bind(address).await.unwrap());
+    });
 }
 
 #[tokio::test]
