@@ -286,31 +286,31 @@ git commit -m "feat: add llama cpp WSL engine adapter"
 - Create: `tests/fake-llama-server/Cargo.toml`
 - Create: `tests/fake-llama-server/src/main.rs`
 
-- [ ] **Step 1: Add pinned JSON fixture tests**
+- [x] **Step 1: Add pinned JSON fixture tests**
 
 Encode the 2026-08-29 LM Studio v1 baseline from the spec. Test list/load/unload success and errors, omitted-versus-null behavior, optional load config echo, authentication, and stable application error codes.
 
-- [ ] **Step 2: Add failing proxy tests**
+- [x] **Step 2: Add failing proxy tests**
 
 Start the fake upstream on an ephemeral port. Verify request body forwarding, safe headers, model-field routing, byte-identical SSE chunks, client disconnect accounting, body/header/connection limits, startup timeout, JIT load, same-model shared load, `model_busy`, `model_starting`, and unknown model errors. Eject during active SSE must cancel upstream work, terminate the client stream with the documented error behavior, and decrement the in-flight count exactly once.
 
-- [ ] **Step 3: Verify failure**
+- [x] **Step 3: Verify failure**
 
 Run: `cargo test -p model-launcher-api --test contracts`
 
 Expected: fails because routes are unimplemented.
 
-- [ ] **Step 4: Implement Axum routes and proxy**
+- [x] **Step 4: Implement Axum routes and proxy**
 
 Use typed management DTOs and streaming Reqwest bodies. Put authentication and request limits in middleware. Treat model selection as a lifecycle command, not direct engine access. Hash generated tokens with Argon2; expose plaintext only from the creation result.
 
-- [ ] **Step 5: Verify contracts and streaming**
+- [x] **Step 5: Verify contracts and streaming**
 
 Run: `cargo test -p model-launcher-api --all-targets && cargo clippy -p model-launcher-api --all-targets -- -D warnings`
 
 Expected: all fixture, auth, routing, and SSE tests pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/model-launcher-api tests/fake-llama-server

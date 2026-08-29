@@ -1,0 +1,1 @@
+{"models":[{"type":"llm","publisher":"Acme","key":"acme/tiny","display_name":"Tiny","architecture":"llama","quantization":"Q4_K_M","size_bytes":42,"params_string":"1B"}]}
