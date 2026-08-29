@@ -9,9 +9,9 @@ use std::{
 };
 
 use model_launcher_core::{
-    AppError, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
-    LaunchProfile, LaunchSettings, Lifecycle, LifecycleState, ModelId, ModelKey, ModelRecord,
-    ModelState,
+    AppError, CatalogIdentity, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec,
+    InferenceEngine, LaunchProfile, LaunchSettings, Lifecycle, LifecycleState, ModelId, ModelKey,
+    ModelRecord, ModelState,
 };
 use tokio::sync::{Notify, oneshot};
 
@@ -260,6 +260,7 @@ fn model(name: &str) -> ModelRecord {
         key: ModelKey::parse(name).unwrap(),
         display_name: name.to_owned(),
         path: PathBuf::from(format!("/{name}.gguf")),
+        file_identity: CatalogIdentity::Unavailable,
         size_bytes: 1,
         state: ModelState::Available,
         launch_profile: LaunchProfile::default(),

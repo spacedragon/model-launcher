@@ -1,4 +1,5 @@
 mod capability;
+mod catalog;
 mod config;
 mod engine;
 mod error;
@@ -7,6 +8,7 @@ mod log;
 mod model;
 
 pub use capability::*;
+pub use catalog::*;
 pub use config::*;
 pub use engine::*;
 pub use error::*;

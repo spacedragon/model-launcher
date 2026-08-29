@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use uuid::Uuid;
 
-use crate::{AppError, LaunchSettings};
+use crate::{AppError, CatalogIdentity, LaunchSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -99,6 +99,9 @@ pub struct ModelRecord {
     pub key: ModelKey,
     pub display_name: String,
     pub path: PathBuf,
+    /// Best-effort platform file identity used to reconnect moves without hashing model data.
+    #[serde(default)]
+    pub file_identity: CatalogIdentity,
     pub size_bytes: u64,
     pub state: ModelState,
     pub launch_profile: LaunchProfile,

@@ -13,8 +13,12 @@ uuid.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
 regex.workspace = true
+walkdir.workspace = true
+gguf-rs-lib.workspace = true
+notify.workspace = true
 
 [dev-dependencies]
+gguf-rs-lib.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

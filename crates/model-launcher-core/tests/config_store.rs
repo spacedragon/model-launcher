@@ -9,8 +9,8 @@ use std::{
 };
 
 use model_launcher_core::{
-    ConfigDiagnosticKind, ConfigIoStage, ConfigStore, FileReplacer, LauncherConfig, ModelId,
-    ModelKey, ModelRecord, ModelState,
+    CatalogIdentity, ConfigDiagnosticKind, ConfigIoStage, ConfigStore, FileReplacer,
+    LauncherConfig, ModelId, ModelKey, ModelRecord, ModelState,
 };
 use uuid::Uuid;
 
@@ -85,6 +85,7 @@ fn model(state: ModelState) -> ModelRecord {
         key: ModelKey::parse("Qwen/qwen3-8b-q4").expect("fixture key"),
         display_name: "Qwen 3 8B".into(),
         path: PathBuf::from("models/qwen.gguf"),
+        file_identity: CatalogIdentity::Unavailable,
         size_bytes: 4_294_967_296,
         state,
         launch_profile: Default::default(),

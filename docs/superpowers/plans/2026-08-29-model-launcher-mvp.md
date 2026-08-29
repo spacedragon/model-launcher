@@ -207,27 +207,27 @@ git commit -m "feat: add bounded redacted structured logs"
 - Test: `crates/model-launcher-core/tests/catalog.rs`
 - Test fixtures: `crates/model-launcher-core/tests/fixtures/`
 
-- [ ] **Step 1: Write failing catalog tests**
+- [x] **Step 1: Write failing catalog tests**
 
 Create tiny generated GGUF fixtures and filename-only fixtures. Cover recursive discovery, case-insensitive extension, shard grouping, malformed metadata fallback, duplicate generated keys, user-renamed keys, moved-file reconnection, missing records, explicit removal of a missing record, and debounced reconciliation.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-core --test catalog`
 
 Expected: catalog API is missing.
 
-- [ ] **Step 3: Implement scan and reconciliation**
+- [x] **Step 3: Implement scan and reconciliation**
 
 Use `walkdir`, `gguf-rs-lib`, and `notify` 8.2. Keep one pure `scan(root) -> ScanResult` function and a separate watcher adapter. Persist only normalized records through `ConfigStore`.
 
-- [ ] **Step 4: Verify scan behavior**
+- [x] **Step 4: Verify scan behavior**
 
 Run: `cargo test -p model-launcher-core --test catalog && cargo test -p model-launcher-core`
 
 Expected: all pass, including malformed and moved model cases.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/model-launcher-core
