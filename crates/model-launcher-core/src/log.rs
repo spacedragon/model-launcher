@@ -280,8 +280,11 @@ fn authorization_colon(line: &str) -> Option<usize> {
             continue;
         }
         let mut cursor = start + NAME.len();
-        while matches!(bytes.get(cursor), Some(b' ' | b'\t')) {
-            cursor += 1;
+        for (offset, character) in line[cursor..].char_indices() {
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor = start + NAME.len() + offset + character.len_utf8();
         }
         if bytes.get(cursor) == Some(&b':') {
             return Some(cursor);

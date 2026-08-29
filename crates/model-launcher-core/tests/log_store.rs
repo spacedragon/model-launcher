@@ -200,6 +200,40 @@ fn inline_authorization_fields_and_mixed_line_delimiters_are_redacted_everywhere
 }
 
 #[test]
+fn unicode_whitespace_before_authorization_colon_is_redacted_everywhere() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = ["nbsp-basic", "em-custom", "ideographic-custom"];
+    store.append(record(
+        1,
+        concat!(
+            "request Authorization\u{00a0}: Basic nbsp-basic\n",
+            "x authorization\u{2003}: Custom em-custom\r",
+            "AUTHORIZATION\u{3000}: Custom ideographic-custom\r\n",
+            "safe NotAuthorization\u{2003}: keep-this"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(
+        snapshot[0]
+            .message
+            .contains("NotAuthorization\u{2003}: keep-this")
+    );
+}
+
+#[test]
 fn bounded_broadcast_reports_lagged_record_count() {
     let store = store(LogStoreLimits::new(8, 1_024, 2));
     let mut subscriber = store.subscribe();
