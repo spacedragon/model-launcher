@@ -11,6 +11,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 

@@ -172,27 +172,27 @@ git commit -m "feat: supervise model lifecycle and restart backoff"
 - Modify: `crates/model-launcher-core/src/lib.rs`
 - Test: `crates/model-launcher-core/tests/log_store.rs`
 
-- [ ] **Step 1: Write failing log-store tests**
+- [x] **Step 1: Write failing log-store tests**
 
 Cover fixed record/byte retention limits, timestamp/source/level/generation/model fields, stdout/stderr line framing, source/level filtering, deterministic export, Authorization and Bearer-token redaction, and oversized-line truncation.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-core --test log_store`
 
 Expected: fails because `LogStore` is absent.
 
-- [ ] **Step 3: Implement `LogStore` and engine stream ingestion**
+- [x] **Step 3: Implement `LogStore` and engine stream ingestion**
 
 Use a bounded `VecDeque<LogRecord>` behind a focused store API. Apply redaction before records enter storage, broadcast appended records over a bounded channel, count dropped records, and export snapshots rather than holding a lock during I/O. Accept engine stdout/stderr as byte streams and safely frame lossy UTF-8 lines with a maximum line length.
 
-- [ ] **Step 4: Verify limits and redaction**
+- [x] **Step 4: Verify limits and redaction**
 
 Run: `cargo test -p model-launcher-core --test log_store && cargo clippy -p model-launcher-core --all-targets -- -D warnings`
 
 Expected: all tests pass and no secret fixture appears in snapshots or export.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/model-launcher-core
