@@ -682,11 +682,14 @@ name = "model-launcher-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "bytes",
  "fake-llama-server",
  "futures-util",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "model-launcher-core",
  "rand",
  "reqwest",

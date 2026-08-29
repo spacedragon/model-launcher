@@ -10,8 +10,39 @@ use fake_llama_server::FakeServer;
 use futures_util::StreamExt as _;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
-    ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest, TokenStore,
+    Accept, ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest,
+    TokenStore,
 };
+
+struct ScriptedAcceptor {
+    listener: tokio::net::TcpListener,
+    transient: std::sync::atomic::AtomicUsize,
+    calls: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl Accept for ScriptedAcceptor {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .transient
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.listener.accept().await
+    }
+}
+struct FatalAcceptor;
+#[async_trait::async_trait]
+impl Accept for FatalAcceptor {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scripted fatal accept",
+        ))
+    }
+}
 use model_launcher_core::{
     AppError, CatalogIdentity, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec,
     InferenceEngine, LaunchProfile, Lifecycle, ModelId, ModelKey, ModelRecord, ModelState,
@@ -400,6 +431,55 @@ async fn listener_connection_cap_covers_idle_prebody_connections() {
     let (count, _) = second_response.await.unwrap().unwrap();
     assert!(count > 0);
     stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn scripted_acceptor_retries_transient_and_reports_fatal_error() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = Arc::new(ScriptedAcceptor {
+        listener,
+        transient: std::sync::atomic::AtomicUsize::new(1),
+        calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| None),
+    )
+    .unwrap();
+    let server = gateway
+        .start_with_acceptor(address, acceptor.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reqwest::get(format!("http://{address}/v1/models"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert!(acceptor.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+    stop(lifecycle, server).await;
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| None),
+    )
+    .unwrap();
+    let server = gateway
+        .start_with_acceptor("127.0.0.1:1".parse().unwrap(), Arc::new(FatalAcceptor))
+        .await
+        .unwrap();
+    tokio::task::yield_now().await;
+    let error = server.stop().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    lifecycle.handle().shutdown().await.unwrap();
+    lifecycle.wait_for_termination().await;
 }
 
 #[tokio::test]

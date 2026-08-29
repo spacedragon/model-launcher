@@ -14,6 +14,7 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{DefaultBodyLimit, Request, State},
     http::{StatusCode, header},
     middleware::{self, Next},
@@ -25,10 +26,11 @@ use model_launcher_core::{
 };
 use serde::Serialize;
 use tokio::{
-    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
+    sync::{Semaphore, oneshot},
+    task::JoinSet,
 };
+use tower::ServiceExt as _;
 
 pub type UpstreamResolver = Arc<dyn Fn(&ModelRecord) -> Option<String> + Send + Sync>;
 
@@ -256,19 +258,20 @@ impl Gateway {
     pub async fn start(self) -> std::io::Result<GatewayServer> {
         let listener = TcpListener::bind(self.config.bind).await?;
         let address = listener.local_addr()?;
+        self.start_with_acceptor(address, Arc::new(TcpAcceptor(listener)))
+            .await
+    }
+
+    pub async fn start_with_acceptor(
+        self,
+        address: SocketAddr,
+        acceptor: Arc<dyn Accept>,
+    ) -> std::io::Result<GatewayServer> {
         let (shutdown, stop) = oneshot::channel();
         let grace = self.config.limits.shutdown_grace;
-        let limited = LimitedListener {
-            listener,
-            permits: Arc::new(Semaphore::new(self.config.limits.max_connections)),
-        };
-        let task = tokio::spawn(async move {
-            axum::serve(limited, self.router())
-                .with_graceful_shutdown(async {
-                    let _ = stop.await;
-                })
-                .await
-        });
+        let permits = Arc::new(Semaphore::new(self.config.limits.max_connections));
+        let router = self.router();
+        let task = tokio::spawn(run_server(acceptor, router, permits, stop));
         Ok(GatewayServer {
             address,
             shutdown: Some(shutdown),
@@ -456,77 +459,70 @@ pub fn is_loopback(address: IpAddr) -> bool {
     address.is_loopback()
 }
 
-struct LimitedListener {
-    listener: TcpListener,
+async fn run_server(
+    acceptor: Arc<dyn Accept>,
+    router: Router,
     permits: Arc<Semaphore>,
-}
-struct LimitedIo {
-    stream: tokio::net::TcpStream,
-    _permit: OwnedSemaphorePermit,
+    mut stop: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    let mut connections = JoinSet::new();
+    loop {
+        let accepted = tokio::select! {
+            _ = &mut stop => break,
+            value = accept_one(acceptor.as_ref(), permits.clone()) => value,
+        };
+        let (stream, permit) = match accepted {
+            Ok(value) => value,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let app = router.clone();
+        connections.spawn(async move {
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let app = app.clone();
+                    async move { app.oneshot(request.map(Body::new)).await }
+                },
+            );
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+            drop(permit);
+        });
+    }
+    while connections.join_next().await.is_some() {}
+    Ok(())
 }
 
-impl axum::serve::Listener for LimitedListener {
-    type Io = LimitedIo;
-    type Addr = SocketAddr;
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        let permit = match self.permits.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => std::future::pending().await,
-        };
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, address)) => {
-                    return (
-                        LimitedIo {
-                            stream,
-                            _permit: permit,
-                        },
-                        address,
-                    );
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
-                    ) =>
-                {
-                    tokio::task::yield_now().await
-                }
-                Err(_) => tokio::task::yield_now().await,
-            }
-        }
-    }
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.listener.local_addr()
-    }
+async fn accept_one(
+    acceptor: &dyn Accept,
+    permits: Arc<Semaphore>,
+) -> std::io::Result<(tokio::net::TcpStream, tokio::sync::OwnedSemaphorePermit)> {
+    let permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|_| std::io::Error::other("gateway connection admission closed"))?;
+    let (stream, _) = acceptor.accept().await?;
+    Ok((stream, permit))
 }
-impl AsyncRead for LimitedIo {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_read(cx, buffer)
-    }
+
+#[async_trait::async_trait]
+pub trait Accept: Send + Sync {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)>;
 }
-impl AsyncWrite for LimitedIo {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        bytes: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+
+struct TcpAcceptor(TcpListener);
+#[async_trait::async_trait]
+impl Accept for TcpAcceptor {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        self.0.accept().await
     }
 }

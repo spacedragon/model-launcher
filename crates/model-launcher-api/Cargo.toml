@@ -21,6 +21,9 @@ futures-util = "0.3"
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 thiserror.workspace = true
+async-trait.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
