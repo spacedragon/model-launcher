@@ -112,6 +112,20 @@ impl WindowManager {
             self.address.clone(),
             self.actions.clone(),
         )?;
+        #[cfg(windows)]
+        window.window().on_close_requested(|| {
+            let _ = slint::invoke_from_event_loop(|| {
+                DESKTOP.with_borrow_mut(|desktop| {
+                    if let Some(desktop) = desktop.as_mut() {
+                        if let Some(message) = (desktop.windows.actions.close_notice)() {
+                            desktop.tray.show_close_notice(&message);
+                        }
+                        let _ = desktop.windows.close();
+                    }
+                })
+            });
+            slint::CloseRequestResponse::HideWindow
+        });
         let weak = window.as_weak();
         window.show()?;
         self.window = Some(window);
@@ -236,7 +250,6 @@ pub fn run_desktop(
     address: String,
     actions: UiActions,
 ) -> Result<(), slint::PlatformError> {
-    use slint::ComponentHandle as _;
     let active = snapshot
         .lifecycle
         .desired_model
@@ -257,23 +270,7 @@ pub fn run_desktop(
     )
     .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
     let mut windows = WindowManager::new(address, actions);
-    let weak = windows.open()?;
-    weak.upgrade()
-        .expect("fresh window")
-        .window()
-        .on_close_requested(|| {
-            let _ = slint::invoke_from_event_loop(|| {
-                DESKTOP.with_borrow_mut(|desktop| {
-                    if let Some(desktop) = desktop.as_mut() {
-                        if let Some(message) = (desktop.windows.actions.close_notice)() {
-                            desktop.tray.show_close_notice(&message);
-                        }
-                        let _ = desktop.windows.close();
-                    }
-                })
-            });
-            slint::CloseRequestResponse::HideWindow
-        });
+    windows.open()?;
     let refresh = slint::Timer::default();
     refresh.start(
         slint::TimerMode::Repeated,
