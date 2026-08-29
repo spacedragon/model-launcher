@@ -10,7 +10,7 @@ use thiserror::Error;
 pub const LAUNCH_SCRIPT: &str = "stat=$(cat \"/proc/$$/stat\" 2>/dev/null) || exit 70; rest=${stat##*) }; start=$(set -- $rest; printf '%s' \"${20}\"); case $start in ''|*[!0-9]*) exit 70;; esac; printf 'MODEL_LAUNCHER_PID=%s\\nMODEL_LAUNCHER_START_TIME=%s\\n' \"$$\" \"$start\"; exec \"$@\"";
 pub const LAUNCH_SENTINEL: &str = "model-launcher";
 pub const SIGNAL_SENTINEL: &str = "model-launcher-signal";
-pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"${20}\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; kill \"$signal\" -- \"$pid\" && printf 'Signaled\\n'";
+pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"${20}\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; case $signal in TERM) kill -TERM \"$pid\";; KILL) kill -KILL \"$pid\";; *) exit 64;; esac && printf 'Signaled\\n'";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedPid {
@@ -39,8 +39,8 @@ pub fn proc_stat_argv(distribution: &str, pid: u32) -> Vec<String> {
 }
 pub fn guarded_signal_argv(distribution: &str, owned: OwnedPid, signal: Signal) -> Vec<String> {
     let signal = match signal {
-        Signal::Term => "-TERM",
-        Signal::Kill => "-KILL",
+        Signal::Term => "TERM",
+        Signal::Kill => "KILL",
     };
     [
         "-d",
@@ -359,7 +359,7 @@ mod tests {
                 SIGNAL_SENTINEL
             ]
         );
-        assert_eq!(&argv[7..], &["-KILL", "42", "98765"]);
+        assert_eq!(&argv[7..], &["KILL", "42", "98765"]);
         assert!(
             GUARDED_SIGNAL_SCRIPT.contains("${20}"),
             "field 22 maps to positional field 20 after comm and must use braced shell syntax"
@@ -388,6 +388,55 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_signal_script_runs_under_posix_sh_and_respects_identity() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        let Ok(start_time) = stat
+            .as_deref()
+            .map(parse_proc_start_time)
+            .unwrap_or(Err(PidError::Invalid))
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
+        let mismatch = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                GUARDED_SIGNAL_SCRIPT,
+                SIGNAL_SENTINEL,
+                "TERM",
+                &pid.to_string(),
+                &(start_time + 1).to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&mismatch.stdout),
+            "IdentityMismatch\n"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        let matched = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                GUARDED_SIGNAL_SCRIPT,
+                SIGNAL_SENTINEL,
+                "TERM",
+                &pid.to_string(),
+                &start_time.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&matched.stdout), "Signaled\n");
+        let _ = child.wait();
     }
 
     #[test]

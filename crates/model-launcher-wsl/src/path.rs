@@ -21,6 +21,12 @@ pub fn windows_to_wsl_path(value: &str) -> Result<String, WslPathError> {
     if components.contains(&"..") {
         return Err(WslPathError::Traversal);
     }
+    if components
+        .iter()
+        .any(|component| invalid_windows_component(component))
+    {
+        return Err(WslPathError::InvalidRoot);
+    }
     let suffix = components
         .into_iter()
         .filter(|component| !component.is_empty() && *component != ".")
@@ -32,6 +38,26 @@ pub fn windows_to_wsl_path(value: &str) -> Result<String, WslPathError> {
     } else {
         format!("/mnt/{drive}/{suffix}")
     })
+}
+fn invalid_windows_component(component: &str) -> bool {
+    if component.is_empty() {
+        return false;
+    }
+    if component.contains(':') || component.ends_with(['.', ' ']) {
+        return true;
+    }
+    let stem = component
+        .split('.')
+        .next()
+        .unwrap_or(component)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        || stem
+            .strip_prefix("LPT")
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
 #[cfg(test)]
@@ -58,6 +84,22 @@ mod tests {
             r#"C:\Models\..\m.gguf"#,
             r#"1:\m.gguf"#,
             r#"C:relative"#,
+        ] {
+            assert!(windows_to_wsl_path(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_ads_reserved_dos_names_and_trailing_dot_or_space() {
+        for value in [
+            r#"C:\models\file.gguf:stream"#,
+            r#"C:\CON"#,
+            r#"C:\con.txt"#,
+            r#"C:\aux.GGUF"#,
+            r#"C:\COM9.bin"#,
+            r#"C:\lpt1"#,
+            r#"C:\model. "#,
+            r#"C:\model."#,
         ] {
             assert!(windows_to_wsl_path(value).is_err(), "accepted {value:?}");
         }

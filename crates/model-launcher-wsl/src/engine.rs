@@ -6,8 +6,8 @@ use crate::{
 use async_trait::async_trait;
 use model_launcher_core::{
     AppError, EngineCapabilities, EngineFuture, EngineLogFramer, EngineProcess, EngineSpec,
-    InferenceEngine, LaunchSettings, LogLevel, LogSource, LogStore, MAX_ENGINE_LOG_LINE_BYTES,
-    ModelId, ModelRecord,
+    InferenceEngine, LaunchSettings, LogLevel, LogRecord, LogSource, LogStore,
+    MAX_ENGINE_LOG_LINE_BYTES, ModelId, ModelRecord,
 };
 use std::{
     io::{self, Write},
@@ -40,6 +40,60 @@ pub enum WslError {
     AddressInUse,
     #[error("internal endpoint is not owned by the launched process")]
     NonOwnedEndpoint,
+}
+
+#[derive(Default)]
+pub struct CleanupObserver {
+    failures: std::sync::atomic::AtomicU64,
+    completed: std::sync::atomic::AtomicU64,
+    notify: tokio::sync::Notify,
+    logs: Option<LogStore>,
+}
+impl CleanupObserver {
+    #[must_use]
+    pub fn with_logs(logs: LogStore) -> Self {
+        Self {
+            logs: Some(logs),
+            ..Self::default()
+        }
+    }
+    #[must_use]
+    pub fn failures(&self) -> u64 {
+        self.failures.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[must_use]
+    pub fn completed(&self) -> u64 {
+        self.completed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub async fn wait_completed(&self) {
+        let seen = self.completed();
+        loop {
+            self.notify.notified().await;
+            if self.completed() > seen {
+                return;
+            }
+        }
+    }
+    fn finish(&self, error: Option<String>) {
+        if let Some(error) = error {
+            self.failures
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(logs) = &self.logs {
+                logs.append(LogRecord {
+                    timestamp_ms: now_ms(),
+                    source: LogSource::Application,
+                    level: LogLevel::Error,
+                    generation: None,
+                    model_id: None,
+                    message: format!("WSL cleanup failed: {error}"),
+                    truncated: false,
+                });
+            }
+        }
+        self.completed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
 }
 
 #[async_trait]
@@ -160,25 +214,45 @@ struct TokioWslChild {
 #[async_trait]
 impl WslChild for TokioWslChild {
     async fn pid_control_line(&mut self) -> Result<String, WslError> {
+        if let Some(mut stderr) = self.stderr.take() {
+            let logs = self.logs.clone();
+            let tail = self.stderr_tail.clone();
+            self.drains.push(tokio::spawn(async move {
+                drain_stream(
+                    &mut stderr,
+                    logs,
+                    LogSource::EngineStderr,
+                    LogLevel::Error,
+                    Some(tail),
+                )
+                .await;
+            }));
+        }
         let mut line = String::new();
-        let count = self
-            .stdout
-            .as_mut()
-            .ok_or_else(|| WslError::Command("stdout unavailable".into()))?
-            .read_line(&mut line)
-            .await
-            .map_err(|e| WslError::Command(e.to_string()))?;
+        let count = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.stdout
+                .as_mut()
+                .ok_or_else(|| WslError::Command("stdout unavailable".into()))?
+                .read_line(&mut line),
+        )
+        .await
+        .map_err(|_| WslError::Command("PID handshake timed out".into()))?
+        .map_err(|e| WslError::Command(e.to_string()))?;
         if count == 0 {
             return Err(WslError::Command("missing PID control line".into()));
         }
         let mut start_line = String::new();
-        let count = self
-            .stdout
-            .as_mut()
-            .ok_or_else(|| WslError::Command("stdout unavailable".into()))?
-            .read_line(&mut start_line)
-            .await
-            .map_err(|e| WslError::Command(e.to_string()))?;
+        let count = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.stdout
+                .as_mut()
+                .ok_or_else(|| WslError::Command("stdout unavailable".into()))?
+                .read_line(&mut start_line),
+        )
+        .await
+        .map_err(|_| WslError::Command("PID start-time handshake timed out".into()))?
+        .map_err(|e| WslError::Command(e.to_string()))?;
         if count == 0 {
             return Err(WslError::Command(
                 "missing PID start-time control line".into(),
@@ -199,20 +273,6 @@ impl WslChild for TokioWslChild {
                     LogSource::EngineStdout,
                     LogLevel::Info,
                     None,
-                )
-                .await;
-            }));
-        }
-        if let Some(mut stderr) = self.stderr.take() {
-            let logs = self.logs.clone();
-            let tail = self.stderr_tail.clone();
-            self.drains.push(tokio::spawn(async move {
-                drain_stream(
-                    &mut stderr,
-                    logs,
-                    LogSource::EngineStderr,
-                    LogLevel::Error,
-                    Some(tail),
                 )
                 .await;
             }));
@@ -285,6 +345,9 @@ impl WslChild for TokioWslChild {
             .wait()
             .await
             .map_err(|e| WslError::Command(e.to_string()))?;
+        for drain in self.drains.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
+        }
         Ok(())
     }
 }
@@ -379,8 +442,18 @@ fn append_bounded_tail(tail: &Mutex<Vec<u8>>, bytes: &[u8]) {
     tail.extend_from_slice(bytes);
 }
 fn is_address_in_use(bytes: &[u8]) -> bool {
-    let diagnostic = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    diagnostic.contains("address already in use") || diagnostic.contains("eaddrinuse")
+    String::from_utf8_lossy(bytes).lines().any(|line| {
+        let line = line.to_ascii_lowercase();
+        let context = ["bind", "listen", "listener", "socket"].iter().any(|word| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == *word)
+        });
+        context
+            && (line.contains("address already in use")
+                || line
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|token| token == "eaddrinuse"))
+    })
 }
 fn classify_pre_ready_exit(status: &str, stderr_tail: &[u8]) -> WslError {
     if is_address_in_use(stderr_tail) {
@@ -485,6 +558,7 @@ impl ProbeCache {
         distribution: &str,
         executable: &str,
     ) -> Result<ProbeSnapshot, ProbeRefreshError> {
+        let _refresh_guard = PROBE_REFRESH_LOCK.lock().await;
         let cached = ProbeSnapshot::load(&self.path).ok();
         let snapshot = self
             .prober
@@ -501,6 +575,7 @@ impl ProbeCache {
         Ok(snapshot)
     }
 }
+static PROBE_REFRESH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 static SNAPSHOT_SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SNAPSHOT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -569,6 +644,7 @@ pub struct LlamaCppWslEngine {
     executable: String,
     runner: Arc<dyn CommandRunner>,
     allocator: Arc<dyn PortAllocator>,
+    cleanup_observer: Arc<CleanupObserver>,
 }
 impl LlamaCppWslEngine {
     #[must_use]
@@ -582,11 +658,17 @@ impl LlamaCppWslEngine {
             executable: executable.into(),
             runner,
             allocator: Arc::new(crate::InternalPortAllocator),
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         }
     }
     #[must_use]
     pub fn with_port_allocator(mut self, allocator: Arc<dyn PortAllocator>) -> Self {
         self.allocator = allocator;
+        self
+    }
+    #[must_use]
+    pub fn with_cleanup_observer(mut self, observer: Arc<CleanupObserver>) -> Self {
+        self.cleanup_observer = observer;
         self
     }
     async fn probe(&self) -> Result<ProbeSnapshot, WslError> {
@@ -690,6 +772,7 @@ impl InferenceEngine for LlamaCppWslEngine {
                     allocator: self.allocator.clone(),
                 }),
                 owned_active: true,
+                cleanup_observer: self.cleanup_observer.clone(),
             }) as Box<dyn EngineProcess>)
         })
     }
@@ -703,6 +786,7 @@ struct WslEngineProcess {
     child: Option<Box<dyn WslChild>>,
     retry: Option<RetryContext>,
     owned_active: bool,
+    cleanup_observer: Arc<CleanupObserver>,
 }
 struct RetryContext {
     executable: String,
@@ -909,6 +993,7 @@ impl Drop for WslEngineProcess {
         let runner = self.runner.clone();
         let distribution = self.distribution.clone();
         let owned_pid = self.owned_pid;
+        let observer = self.cleanup_observer.clone();
         let Some(child) = self.child.take() else {
             return;
         };
@@ -918,9 +1003,11 @@ impl Drop for WslEngineProcess {
                 distribution,
                 owned_pid,
                 child,
+                observer,
             ));
         } else {
-            let _ = std::thread::Builder::new()
+            let spawn_observer = observer.clone();
+            if let Err(error) = std::thread::Builder::new()
                 .name("wsl-owned-cleanup".into())
                 .spawn(move || {
                     if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
@@ -932,9 +1019,15 @@ impl Drop for WslEngineProcess {
                             distribution,
                             owned_pid,
                             child,
+                            observer,
                         ));
+                    } else {
+                        observer.finish(Some("cleanup runtime build failed".into()));
                     }
-                });
+                })
+            {
+                spawn_observer.finish(Some(format!("cleanup thread spawn failed: {error}")));
+            }
         }
     }
 }
@@ -944,25 +1037,43 @@ async fn supervise_owned_cleanup(
     distribution: String,
     owned_pid: OwnedPid,
     mut child: Box<dyn WslChild>,
+    observer: Arc<CleanupObserver>,
 ) {
-    let _ = runner
+    let mut failure = None;
+    match runner
         .output(
             "wsl.exe",
             &guarded_signal_argv(&distribution, owned_pid, Signal::Term),
         )
-        .await;
+        .await
+    {
+        Ok(output) if output.success => {}
+        Ok(output) => failure = Some(output.stderr),
+        Err(error) => failure = Some(error.to_string()),
+    }
     let exited = tokio::time::timeout(Duration::from_millis(250), child.wait_for_exit())
         .await
         .is_ok_and(|result| result.is_ok());
     if !exited && child.is_running().await.unwrap_or(true) {
-        let _ = runner
+        match runner
             .output(
                 "wsl.exe",
                 &guarded_signal_argv(&distribution, owned_pid, Signal::Kill),
             )
-            .await;
-        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait_for_exit()).await;
+            .await
+        {
+            Ok(output) if output.success => {}
+            Ok(output) => failure = Some(output.stderr),
+            Err(error) => failure = Some(error.to_string()),
+        }
+        if !tokio::time::timeout(Duration::from_secs(1), child.wait_for_exit())
+            .await
+            .is_ok_and(|result| result.is_ok())
+        {
+            failure = Some("owned child did not exit after KILL".into());
+        }
     }
+    observer.finish(failure);
 }
 
 #[cfg(test)]
@@ -1052,11 +1163,15 @@ mod tests {
         for diagnostic in [
             "bind: Address already in use",
             "listen failed: EADDRINUSE",
-            "ADDRESS ALREADY IN USE",
+            "listener: ADDRESS ALREADY IN USE",
         ] {
             assert!(is_address_in_use(diagnostic.as_bytes()));
         }
         assert!(!is_address_in_use(b"engine exited: invalid model"));
+        assert!(!is_address_in_use(
+            b"config value = 'address already in use'"
+        ));
+        assert!(!is_address_in_use(b"model metadata mentions EADDRINUSE"));
     }
     struct BadHandshakeChild {
         aborted: Arc<AtomicBool>,
@@ -1167,6 +1282,7 @@ mod tests {
             }])),
             signals: Mutex::new(Vec::new()),
         });
+        let observer = Arc::new(CleanupObserver::default());
         let allocator = Arc::new(FakeAllocator(Mutex::new(VecDeque::from([2002]))));
         let mut process = WslEngineProcess {
             distribution: "Ubuntu".into(),
@@ -1190,13 +1306,14 @@ mod tests {
                 allocator,
             }),
             owned_active: true,
+            cleanup_observer: observer.clone(),
         };
         process.wait_ready(Duration::from_secs(1)).await.unwrap();
         let signals = runner.signals.lock().unwrap();
         assert!(
             signals
                 .iter()
-                .any(|argv| argv.get(7).is_some_and(|v| v == "-TERM")
+                .any(|argv| argv.get(7).is_some_and(|v| v == "TERM")
                     && argv.get(8).is_some_and(|v| v == "11"))
         );
         assert_eq!(process.pid, 22);
@@ -1249,6 +1366,7 @@ mod tests {
                 allocator,
             }),
             owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         };
         let error = process
             .wait_ready(Duration::from_secs(1))
@@ -1283,6 +1401,7 @@ mod tests {
             })),
             retry: None,
             owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         };
         drop(process);
         tokio::task::yield_now().await;
@@ -1294,7 +1413,7 @@ mod tests {
             1,
             "an exited owned child must never receive a PID-reuse-prone KILL"
         );
-        assert_eq!(&signals[0][7..], &["-TERM", "77", "107"]);
+        assert_eq!(&signals[0][7..], &["TERM", "77", "107"]);
     }
     #[test]
     fn drop_outside_tokio_runtime_schedules_bounded_owned_cleanup() {
@@ -1302,6 +1421,7 @@ mod tests {
             children: Mutex::new(VecDeque::new()),
             signals: Mutex::new(Vec::new()),
         });
+        let observer = Arc::new(CleanupObserver::default());
         let started = std::time::Instant::now();
         drop(WslEngineProcess {
             distribution: "Ubuntu".into(),
@@ -1317,17 +1437,20 @@ mod tests {
             })),
             retry: None,
             owned_active: true,
+            cleanup_observer: observer.clone(),
         });
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "Drop must not synchronously wait for cleanup"
         );
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while runner.signals.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        while observer.completed() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         let signals = runner.signals.lock().unwrap();
-        assert_eq!(&signals[0][7..], &["-TERM", "79", "109"]);
+        assert_eq!(&signals[0][7..], &["TERM", "79", "109"]);
+        assert_eq!(observer.completed(), 1);
+        assert_eq!(observer.failures(), 0);
     }
     struct HangingChild;
     #[async_trait]
@@ -1368,13 +1491,14 @@ mod tests {
             child: Some(Box::new(HangingChild)),
             retry: None,
             owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(251)).await;
         tokio::task::yield_now().await;
         let signals = runner.signals.lock().unwrap();
         assert_eq!(signals.len(), 2);
-        assert_eq!(&signals[1][7..], &["-KILL", "78", "108"]);
+        assert_eq!(&signals[1][7..], &["KILL", "78", "108"]);
     }
 
     struct DelayedEndpointChild {
@@ -1423,6 +1547,7 @@ mod tests {
             child: Some(Box::new(DelayedEndpointChild { checks: 2 })),
             retry: None,
             owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         };
         let started = tokio::time::Instant::now();
         process.wait_for_exit().await.unwrap();
@@ -1463,8 +1588,8 @@ mod tests {
     impl CommandRunner for SignalRunner {
         async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
             self.calls.lock().unwrap().push(argv.to_vec());
-            let fail = (self.fail_term && argv.contains(&"-TERM".into()))
-                || (self.fail_kill && argv.contains(&"-KILL".into()));
+            let fail = (self.fail_term && argv.contains(&"TERM".into()))
+                || (self.fail_kill && argv.contains(&"KILL".into()));
             Ok(CommandOutput {
                 success: !fail,
                 stdout: String::new(),
@@ -1491,6 +1616,7 @@ mod tests {
             child: Some(Box::new(StopChild { waits })),
             retry: None,
             owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
         }
     }
     #[tokio::test]
@@ -1517,7 +1643,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|argv| argv.get(7).is_some_and(|v| v == "-KILL")
+                    .any(|argv| argv.get(7).is_some_and(|v| v == "KILL")
                         && argv.get(8).is_some_and(|v| v == "55"))
             );
         }
