@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, RwLock},
@@ -195,15 +196,18 @@ impl Service {
             .then(|| CatalogWatcher::watch(&options.catalog_dir, Duration::from_millis(250)))
             .transpose()
             .map_err(|error| ServiceError::Watcher(error.to_string()))?;
-        let capabilities = engine.probe_capabilities().await?;
+        let capabilities = Arc::new(RwLock::new(engine.probe_capabilities().await?));
         let models = Arc::new(RwLock::new(initial.config));
         let resolver = Arc::new(ServiceModels {
             models: models.clone(),
             capabilities: capabilities.clone(),
         });
-        let lifecycle = Lifecycle::spawn(engine);
+        let lifecycle = Lifecycle::spawn(engine.clone());
         let lifecycle_handle = lifecycle.handle();
-        let api_models = api_models(&models.read().expect("model lock poisoned"), &capabilities);
+        let api_models = api_models(
+            &models.read().expect("model lock poisoned"),
+            &capabilities.read().expect("capabilities lock"),
+        );
         let upstream = options.upstream.clone();
         let upstream: UpstreamResolver = Arc::new(move |_| Some(upstream.clone()));
         let gateway = match Gateway::new_with_management(
@@ -215,7 +219,7 @@ impl Service {
             Arc::new(PersistProfiles {
                 store: store.clone(),
                 models: models.clone(),
-                capabilities,
+                capabilities: capabilities.clone(),
             }),
         ) {
             Ok(gateway) => gateway,
@@ -273,7 +277,9 @@ impl Service {
             logs,
             tokens,
             settings,
+            engine,
             models,
+            recent: RwLock::new(VecDeque::new()),
             store,
             shutdown_timeout: options.shutdown_timeout,
             events,
@@ -334,7 +340,21 @@ impl ServiceHandle {
         }
     }
     pub fn capabilities(&self) -> EngineCapabilities {
-        self.inner.capabilities.clone()
+        self.inner
+            .capabilities
+            .read()
+            .expect("capabilities lock")
+            .clone()
+    }
+    pub fn recent_models(&self) -> Vec<ModelRecord> {
+        let models = self.inner.models.read().expect("model lock poisoned");
+        self.inner
+            .recent
+            .read()
+            .expect("recent lock poisoned")
+            .iter()
+            .filter_map(|id| models.models.iter().find(|model| model.id == *id).cloned())
+            .collect()
     }
     pub fn engine_settings(&self) -> (Option<String>, Option<String>) {
         let config = self.inner.models.read().expect("model lock poisoned");
@@ -403,6 +423,7 @@ impl ServiceHandle {
         config.engine_distribution = latest.engine_distribution;
         config.engine_executable = latest.engine_executable;
         manager.apply(distribution, executable);
+        *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
         Ok(caps)
     }
     pub async fn load(&self, id: model_launcher_core::ModelId) -> Result<(), ServiceError> {
@@ -417,6 +438,56 @@ impl ServiceHandle {
             .cloned()
             .ok_or(AppError::ModelNotFound)?;
         self.inner.lifecycle.load(model).await?;
+        self.inner.record_recent(id);
+        Ok(())
+    }
+    pub async fn load_model_with_profile(
+        &self,
+        id: model_launcher_core::ModelId,
+        key: String,
+        settings: model_launcher_core::LaunchSettings,
+    ) -> Result<(), ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        let key = model_launcher_core::ModelKey::parse(key)?;
+        let mut model = self
+            .inner
+            .models
+            .read()
+            .expect("model lock poisoned")
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .cloned()
+            .ok_or(AppError::ModelNotFound)?;
+        if self
+            .inner
+            .models
+            .read()
+            .expect("model lock poisoned")
+            .models
+            .iter()
+            .any(|candidate| candidate.id != id && candidate.key == key)
+        {
+            return Err(AppError::InvalidModelKey.into());
+        }
+        model.key = key;
+        model.launch_profile.settings = settings;
+        self.inner
+            .engine
+            .validate_launch(&model, &model.launch_profile.settings)
+            .await?;
+        let next = self.inner.store.update(|config| {
+            let record = config
+                .models
+                .iter_mut()
+                .find(|record| record.id == id)
+                .ok_or(AppError::ModelNotFound)?;
+            *record = model.clone();
+            Ok(())
+        })?;
+        *self.inner.models.write().expect("model lock poisoned") = next;
+        self.inner.lifecycle.load(model).await?;
+        self.inner.record_recent(id);
         Ok(())
     }
     pub async fn eject(&self) -> Result<(), ServiceError> {
@@ -485,11 +556,13 @@ impl ServiceHandle {
 struct Inner {
     address: SocketAddr,
     lifecycle: LifecycleHandle,
-    capabilities: EngineCapabilities,
+    capabilities: Arc<RwLock<EngineCapabilities>>,
     logs: LogStore,
     tokens: Option<Arc<model_launcher_api::TokenStore>>,
     settings: Option<Arc<dyn EngineSettingsManager>>,
+    engine: Arc<dyn InferenceEngine>,
     models: Arc<RwLock<LauncherConfig>>,
+    recent: RwLock<VecDeque<model_launcher_core::ModelId>>,
     store: ConfigStore,
     shutdown_timeout: Duration,
     events: broadcast::Sender<ShutdownEvent>,
@@ -500,6 +573,13 @@ struct Inner {
 }
 
 impl Inner {
+    fn record_recent(&self, id: model_launcher_core::ModelId) {
+        let mut recent = self.recent.write().expect("recent lock poisoned");
+        recent.retain(|candidate| *candidate != id);
+        recent.push_front(id);
+        recent.truncate(8);
+    }
+
     fn event(&self, event: ShutdownEvent) {
         let _ = self.events.send(event);
     }
@@ -585,10 +665,11 @@ enum ShutdownState {
 
 struct ServiceModels {
     models: Arc<RwLock<LauncherConfig>>,
-    capabilities: EngineCapabilities,
+    capabilities: Arc<RwLock<EngineCapabilities>>,
 }
 impl ManagementModelResolver for ServiceModels {
     fn resolve(&self, key: &str) -> Option<ManagementModel> {
+        let capabilities = self.capabilities.read().ok()?.clone();
         self.models
             .read()
             .ok()?
@@ -598,14 +679,14 @@ impl ManagementModelResolver for ServiceModels {
             .cloned()
             .map(|model| ManagementModel {
                 model,
-                capabilities: self.capabilities.clone(),
+                capabilities,
             })
     }
 }
 struct PersistProfiles {
     store: ConfigStore,
     models: Arc<RwLock<LauncherConfig>>,
-    capabilities: EngineCapabilities,
+    capabilities: Arc<RwLock<EngineCapabilities>>,
 }
 impl ProfileUpdater for PersistProfiles {
     fn apply(
@@ -613,7 +694,11 @@ impl ProfileUpdater for PersistProfiles {
         resolved: ManagementModel,
         request: &model_launcher_api::LoadRequest,
     ) -> Result<ModelRecord, AppError> {
-        let model = apply_profile(resolved.model, &self.capabilities, request)?;
+        let capabilities = self
+            .capabilities
+            .read()
+            .map_err(|_| AppError::ConfigFormat("capabilities lock poisoned".into()))?;
+        let model = apply_profile(resolved.model, &capabilities, request)?;
         let next = self.store.update(|config| {
             let record = config
                 .models

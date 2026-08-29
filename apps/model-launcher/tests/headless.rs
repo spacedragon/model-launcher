@@ -85,6 +85,67 @@ async fn engine_settings_validate_persist_then_apply_exact_inputs() {
 }
 
 #[tokio::test]
+async fn profile_load_validates_persists_key_and_profile_before_lifecycle_load() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    std::fs::write(temp.path().join("models/tiny.gguf"), b"GGUFtiny").unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let model = handle.snapshot().models[0].clone();
+    let settings = LaunchSettings::default();
+    handle
+        .load_model_with_profile(model.id, "edited/key".into(), settings.clone())
+        .await
+        .unwrap();
+    let persisted = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    let persisted = persisted
+        .models
+        .iter()
+        .find(|candidate| candidate.id == model.id)
+        .unwrap();
+    assert_eq!(persisted.key.as_str(), "edited/key");
+    assert_eq!(persisted.launch_profile.settings, settings);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recent_models_are_successful_mru_entries_with_stable_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    for name in ["alpha.gguf", "beta.gguf", "gamma.gguf"] {
+        std::fs::write(temp.path().join("models").join(name), b"GGUFtiny").unwrap();
+    }
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let models = handle.snapshot().models;
+    handle.load(models[0].id).await.unwrap();
+    handle.load(models[1].id).await.unwrap();
+    handle.load(models[0].id).await.unwrap();
+
+    let recent = handle.recent_models();
+    assert_eq!(recent.len(), 2);
+    assert_eq!(recent[0].id, models[0].id);
+    assert_eq!(recent[1].id, models[1].id);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn service_persists_live_tokens_and_exposes_redacted_logs() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();

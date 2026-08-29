@@ -11,6 +11,7 @@ use std::sync::Arc;
 fn real_main_window_weak_reference_dies_for_fifty_recreate_cycles() {
     let snapshot = AppSnapshot {
         models: vec![],
+        recent_models: vec![],
         lifecycle: LifecycleSnapshot::default(),
         capabilities: EngineCapabilities::default(),
     };

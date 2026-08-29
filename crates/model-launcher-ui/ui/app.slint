@@ -20,7 +20,9 @@ export component MainWindow inherits Window {
     property <bool> load-dialog-open: false;
     property <string> selected-model-id;
     property <string> selected-model-key;
-    callback load-model(string);
+    in property <bool> cap-context; in property <bool> cap-gpu; in property <bool> cap-threads;
+    in property <bool> cap-batch; in property <bool> cap-parallel; in property <bool> cap-flash; in property <bool> cap-kv;
+    callback load-model(string, string, int, int, int, int, int, bool, string);
     callback eject-model(string);
     callback rescan(); callback copy-text(string); callback export-logs(); callback save-settings(string, string, string);
     callback generate-token();
@@ -60,5 +62,5 @@ export component MainWindow inherits Window {
             if root.page == 3: VerticalLayout { padding: 20px; spacing: 8px; Text { text: "Settings"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; } Text { text: "Model directory"; color: #667085; font-family: "Segoe UI"; } dir := LineEdit { text <=> root.model-directory; accessible-label: "Model directory"; } Text { text: "WSL distribution"; color: #667085; font-family: "Segoe UI"; } distro := LineEdit { text <=> root.engine-distribution; accessible-label: "WSL distribution"; } Text { text: "llama-server path"; color: #667085; font-family: "Segoe UI"; } exe := LineEdit { text <=> root.engine-executable; accessible-label: "llama-server path"; } Button { text: "Save settings"; primary: true; clicked => { root.save-settings(dir.text, distro.text, exe.text); } } Text { text: "Saving validates the engine identity and probes supported settings again."; color: #667085; font-family: "Segoe UI"; } Rectangle { vertical-stretch: 1; } }
         }
     }
-    LoadDialog { open <=> root.load-dialog-open; model-key <=> root.selected-model-key; confirm(key, context, gpu) => { root.load-model(root.selected-model-id); } }
+    LoadDialog { open <=> root.load-dialog-open; model-key <=> root.selected-model-key; show-context: root.cap-context; show-gpu: root.cap-gpu; show-threads: root.cap-threads; show-batch: root.cap-batch; show-parallel: root.cap-parallel; show-flash: root.cap-flash; show-kv: root.cap-kv; confirm(key, context, gpu, threads, batch, parallel, flash, kv) => { root.load-model(root.selected-model-id, key, context, gpu, threads, batch, parallel, flash, kv); root.load-dialog-open=false; } }
 }

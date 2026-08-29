@@ -12,7 +12,7 @@ slint::include_modules!();
 
 #[derive(Clone)]
 pub struct UiActions {
-    pub load: Arc<dyn Fn(ModelId) + Send + Sync>,
+    pub load: Arc<dyn Fn(UiLoadRequest) + Send + Sync>,
     pub eject: Arc<dyn Fn() + Send + Sync>,
     pub rescan: Arc<dyn Fn() + Send + Sync>,
     pub snapshot: Arc<dyn Fn() -> AppSnapshot + Send + Sync>,
@@ -25,50 +25,30 @@ pub struct UiActions {
     pub engine_settings: Arc<dyn Fn() -> EngineSettings + Send + Sync>,
 }
 
+#[derive(Clone)]
+pub struct UiLoadRequest {
+    pub id: ModelId,
+    pub key: String,
+    pub settings: LaunchSettings,
+}
+
 #[cfg(not(windows))]
 pub fn run_desktop(
     snapshot: AppSnapshot,
     address: String,
     actions: UiActions,
 ) -> Result<(), slint::PlatformError> {
-    use slint::{ComponentHandle as _, ModelRc, SharedString, VecModel};
+    use slint::{ComponentHandle as _, ModelRc, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
-    let rows: Vec<ModelDisplay> = view_model
-        .rows()
-        .iter()
-        .map(|row| {
-            let action = view_model.action(row.id);
-            let (label, enabled) = match action {
-                ModelAction::Load => ("Load", true),
-                ModelAction::Eject => ("Eject", true),
-                ModelAction::Disabled(_) => ("Load", false),
-            };
-            ModelDisplay {
-                id: row.id.as_uuid().to_string().into(),
-                name: row.name.clone().into(),
-                key: row.key.clone().into(),
-                size: row.size.clone().into(),
-                path: row.path.clone().into(),
-                status: row.status.clone().into(),
-                action: label.into(),
-                action_enabled: enabled,
-            }
-        })
-        .collect();
+    let rows = display_rows(&view_model);
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+    hydrate_capabilities(&window, &view_model.snapshot.capabilities);
     window.set_logs(log_lines((actions.logs)(LogFilter::default())));
     hydrate_engine_settings(&window, (actions.engine_settings)());
-    window.on_load_model({
-        let actions = actions.clone();
-        move |raw: SharedString| {
-            if let Ok(id) = uuid::Uuid::parse_str(&raw) {
-                (actions.load)(ModelId::from_uuid(id));
-            }
-        }
-    });
+    install_load_callback(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -171,6 +151,21 @@ impl WindowManager {
         Ok(())
     }
 
+    pub fn refresh(&self) {
+        use slint::{ModelRc, VecModel};
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let view_model = ViewModel::from_snapshot((self.actions.snapshot)());
+        window.set_models(ModelRc::from(Rc::new(VecModel::from(display_rows(
+            &view_model,
+        )))));
+        window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+        window.set_logs(log_lines((self.actions.logs)(LogFilter::default())));
+        hydrate_capabilities(window, &view_model.snapshot.capabilities);
+        hydrate_engine_settings(window, (self.actions.engine_settings)());
+    }
+
     #[must_use]
     pub fn last_window_destroyed(&self) -> bool {
         self.last_closed.upgrade().is_none()
@@ -182,44 +177,17 @@ fn create_window(
     address: String,
     actions: UiActions,
 ) -> Result<MainWindow, slint::PlatformError> {
-    use slint::{ComponentHandle as _, ModelRc, SharedString, VecModel};
+    use slint::{ComponentHandle as _, ModelRc, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
-    let rows: Vec<ModelDisplay> = view_model
-        .rows()
-        .iter()
-        .map(|row| {
-            let action = view_model.action(row.id);
-            let (label, enabled) = match action {
-                ModelAction::Load => ("Load", true),
-                ModelAction::Eject => ("Eject", true),
-                ModelAction::Disabled(_) => ("Load", false),
-            };
-            ModelDisplay {
-                id: row.id.as_uuid().to_string().into(),
-                name: row.name.clone().into(),
-                key: row.key.clone().into(),
-                size: row.size.clone().into(),
-                path: row.path.clone().into(),
-                status: row.status.clone().into(),
-                action: label.into(),
-                action_enabled: enabled,
-            }
-        })
-        .collect();
+    let rows = display_rows(&view_model);
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+    hydrate_capabilities(&window, &view_model.snapshot.capabilities);
     window.set_logs(log_lines((actions.logs)(LogFilter::default())));
     hydrate_engine_settings(&window, (actions.engine_settings)());
-    window.on_load_model({
-        let actions = actions.clone();
-        move |raw: SharedString| {
-            if let Ok(id) = uuid::Uuid::parse_str(&raw) {
-                (actions.load)(ModelId::from_uuid(id));
-            }
-        }
-    });
+    install_load_callback(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -261,6 +229,31 @@ fn create_window(
     });
     install_log_filter(&window, actions.clone());
     Ok(window)
+}
+
+fn display_rows(view_model: &ViewModel) -> Vec<ModelDisplay> {
+    view_model
+        .rows()
+        .iter()
+        .map(|row| {
+            let action = view_model.action(row.id);
+            let (label, enabled) = match action {
+                ModelAction::Load => ("Load", true),
+                ModelAction::Eject => ("Eject", true),
+                ModelAction::Disabled(_) => ("Load", false),
+            };
+            ModelDisplay {
+                id: row.id.as_uuid().to_string().into(),
+                name: row.name.clone().into(),
+                key: row.key.clone().into(),
+                size: row.size.clone().into(),
+                path: row.path.clone().into(),
+                status: row.status.clone().into(),
+                action: label.into(),
+                action_enabled: enabled,
+            }
+        })
+        .collect()
 }
 
 fn log_lines(records: Vec<LogRecord>) -> slint::ModelRc<slint::SharedString> {
@@ -311,6 +304,44 @@ fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
     window.set_engine_executable(settings.executable.into());
 }
 
+fn hydrate_capabilities(window: &MainWindow, caps: &EngineCapabilities) {
+    window.set_cap_context(caps.context_length);
+    window.set_cap_gpu(caps.gpu_layers);
+    window.set_cap_threads(caps.cpu_threads);
+    window.set_cap_batch(caps.batch_size);
+    window.set_cap_parallel(caps.parallel_slots);
+    window.set_cap_flash(caps.flash_attention);
+    window.set_cap_kv(caps.kv_cache_type);
+}
+
+fn install_load_callback(window: &MainWindow, actions: UiActions) {
+    window.on_load_model(
+        move |raw, key, context, gpu, threads, batch, parallel, flash, kv| {
+            let Ok(uuid) = uuid::Uuid::parse_str(&raw) else {
+                return;
+            };
+            let settings = LaunchSettings {
+                context_length: model_launcher_core::ContextLength::new(context as u32).ok(),
+                gpu_layers: Some(model_launcher_core::GpuLayers::new(gpu as u32)),
+                cpu_threads: model_launcher_core::CpuThreads::new(threads as u32).ok(),
+                batch_size: model_launcher_core::BatchSize::new(batch as u32).ok(),
+                parallel_slots: model_launcher_core::ParallelSlots::new(parallel as u32).ok(),
+                flash_attention: Some(flash),
+                kv_cache_type: match kv.as_str() {
+                    "q8_0" => Some(model_launcher_core::KvCacheType::Q8_0),
+                    "q4_0" => Some(model_launcher_core::KvCacheType::Q4_0),
+                    _ => Some(model_launcher_core::KvCacheType::F16),
+                },
+            };
+            (actions.load)(UiLoadRequest {
+                id: ModelId::from_uuid(uuid),
+                key: key.into(),
+                settings,
+            });
+        },
+    );
+}
+
 #[cfg(windows)]
 thread_local! {
     static DESKTOP: std::cell::RefCell<Option<WindowsDesktop>> = const { std::cell::RefCell::new(None) };
@@ -334,9 +365,17 @@ fn dispatch_windows(command: TrayCommand) {
                 let _ = desktop.windows.open();
             }
             TrayCommand::Eject => (desktop.windows.actions.eject)(),
-            TrayCommand::LoadRecent(index) => {
-                if let Some(model) = (desktop.windows.actions.snapshot)().models.get(index) {
-                    (desktop.windows.actions.load)(model.id);
+            TrayCommand::LoadRecent(id) => {
+                if let Some(model) = (desktop.windows.actions.snapshot)()
+                    .models
+                    .into_iter()
+                    .find(|model| model.id == id)
+                {
+                    (desktop.windows.actions.load)(UiLoadRequest {
+                        id: model.id,
+                        key: model.key.to_string(),
+                        settings: model.launch_profile.settings.clone(),
+                    });
                 }
             }
             TrayCommand::Quit => (desktop.windows.actions.quit)(),
@@ -355,11 +394,11 @@ pub fn run_desktop(
         .desired_model
         .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
         .map(|model| model.display_name.as_str());
-    let recent: Vec<String> = snapshot
-        .models
+    let recent: Vec<(ModelId, String)> = snapshot
+        .recent_models
         .iter()
         .take(8)
-        .map(|model| model.display_name.clone())
+        .map(|model| (model.id, model.display_name.clone()))
         .collect();
     let dispatch: Arc<dyn Fn(TrayCommand) + Send + Sync> = Arc::new(dispatch_windows);
     let tray = tray::NativeTray::new(
@@ -378,15 +417,23 @@ pub fn run_desktop(
         || {
             DESKTOP.with_borrow(|desktop| {
                 if let Some(desktop) = desktop.as_ref() {
+                    desktop.windows.refresh();
                     let snapshot = (desktop.windows.actions.snapshot)();
                     let active = snapshot
                         .lifecycle
                         .desired_model
                         .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
                         .map(|model| model.display_name.as_str());
-                    desktop
-                        .tray
-                        .update(&format!("{:?}", snapshot.lifecycle.state), active);
+                    let recent: Vec<_> = snapshot
+                        .recent_models
+                        .iter()
+                        .map(|model| (model.id, model.display_name.clone()))
+                        .collect();
+                    desktop.tray.update(
+                        &format!("{:?}", snapshot.lifecycle.state),
+                        active,
+                        &recent,
+                    );
                 }
             });
         },
@@ -404,6 +451,7 @@ pub fn run_desktop(
 #[derive(Clone, Debug)]
 pub struct AppSnapshot {
     pub models: Vec<ModelRecord>,
+    pub recent_models: Vec<ModelRecord>,
     pub lifecycle: LifecycleSnapshot,
     pub capabilities: EngineCapabilities,
 }

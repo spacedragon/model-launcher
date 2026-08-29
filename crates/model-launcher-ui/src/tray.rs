@@ -1,10 +1,11 @@
+use model_launcher_core::ModelId;
 use std::sync::{Arc, Weak};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayCommand {
     Open,
     Eject,
-    LoadRecent(usize),
+    LoadRecent(ModelId),
     Quit,
 }
 
@@ -31,7 +32,12 @@ impl TrayController {
         match command {
             "open" => Some(TrayCommand::Open),
             "eject" => Some(TrayCommand::Eject),
-            "recent" => Some(TrayCommand::LoadRecent(0)),
+            _ if command.starts_with("recent:") => {
+                uuid::Uuid::parse_str(command.trim_start_matches("recent:"))
+                    .ok()
+                    .map(ModelId::from_uuid)
+                    .map(TrayCommand::LoadRecent)
+            }
             "quit" => Some(TrayCommand::Quit),
             _ => None,
         }
@@ -63,9 +69,6 @@ impl TrayController {
 #[cfg(windows)]
 pub struct NativeTray {
     icon: tray_icon::TrayIcon,
-    status: tray_icon::menu::MenuItem,
-    active: tray_icon::menu::MenuItem,
-    eject: tray_icon::menu::MenuItem,
 }
 
 #[cfg(windows)]
@@ -73,47 +76,23 @@ impl NativeTray {
     pub fn new(
         status_text: &str,
         active_model: Option<&str>,
-        recent: &[String],
+        recent: &[(ModelId, String)],
         dispatch: std::sync::Arc<dyn Fn(TrayCommand) + Send + Sync>,
     ) -> Result<Self, String> {
-        use tray_icon::{
-            TrayIconBuilder,
-            menu::{Menu, MenuEvent, MenuItem, Submenu},
-        };
-        let status = MenuItem::with_id("status", status_text, false, None);
-        let active = MenuItem::with_id(
-            "active",
-            active_model.unwrap_or("No model loaded"),
-            false,
-            None,
-        );
-        let open = MenuItem::with_id("open", "Open Model Launcher", true, None);
-        let eject = MenuItem::with_id("eject", "Eject current model", active_model.is_some(), None);
-        let recent_menu = Submenu::with_id("recent", "Recent Models", !recent.is_empty());
-        for (index, name) in recent.iter().take(8).enumerate() {
-            recent_menu
-                .append(&MenuItem::with_id(
-                    format!("recent:{index}"),
-                    name,
-                    true,
-                    None,
-                ))
-                .map_err(|error| error.to_string())?;
-        }
-        let quit = MenuItem::with_id("quit", "Quit", true, None);
-        let menu = Menu::with_items(&[&status, &active, &open, &eject, &recent_menu, &quit])
-            .map_err(|error| error.to_string())?;
+        use tray_icon::{TrayIconBuilder, menu::MenuEvent};
+        let menu = build_menu(status_text, active_model, recent)?;
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let id = event.id().as_ref();
             let command = match id {
                 "open" => Some(TrayCommand::Open),
                 "eject" => Some(TrayCommand::Eject),
                 "quit" => Some(TrayCommand::Quit),
-                id if id.starts_with("recent:") => id
-                    .trim_start_matches("recent:")
-                    .parse()
-                    .ok()
-                    .map(TrayCommand::LoadRecent),
+                id if id.starts_with("recent:") => {
+                    uuid::Uuid::parse_str(id.trim_start_matches("recent:"))
+                        .ok()
+                        .map(ModelId::from_uuid)
+                        .map(TrayCommand::LoadRecent)
+                }
                 _ => None,
             };
             if let Some(command) = command {
@@ -126,22 +105,51 @@ impl NativeTray {
             .with_tooltip(format!("Model Launcher — {status_text}"))
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(Self {
-            icon,
-            status,
-            active,
-            eject,
-        })
+        Ok(Self { icon })
     }
 
-    pub fn update(&self, status: &str, active_model: Option<&str>) {
-        self.status.set_text(status);
-        self.active
-            .set_text(active_model.unwrap_or("No model loaded"));
-        self.eject.set_enabled(active_model.is_some());
+    pub fn update(&self, status: &str, active_model: Option<&str>, recent: &[(ModelId, String)]) {
+        let _ = self
+            .icon
+            .set_tooltip(Some(format!("Model Launcher — {status}")));
+        if let Ok(menu) = build_menu(status, active_model, recent) {
+            self.icon.set_menu(Some(Box::new(menu)));
+        }
     }
 
     pub fn show_close_notice(&self, message: &str) {
         let _ = self.icon.set_tooltip(Some(message));
     }
+}
+
+#[cfg(windows)]
+fn build_menu(
+    status_text: &str,
+    active_model: Option<&str>,
+    recent: &[(ModelId, String)],
+) -> Result<tray_icon::menu::Menu, String> {
+    use tray_icon::menu::{Menu, MenuItem, Submenu};
+    let status = MenuItem::with_id("status", status_text, false, None);
+    let active = MenuItem::with_id(
+        "active",
+        active_model.unwrap_or("No model loaded"),
+        false,
+        None,
+    );
+    let open = MenuItem::with_id("open", "Open Model Launcher", true, None);
+    let eject = MenuItem::with_id("eject", "Eject current model", active_model.is_some(), None);
+    let recent_menu = Submenu::with_id("recent", "Recent Models", !recent.is_empty());
+    for (id, name) in recent.iter().take(8) {
+        recent_menu
+            .append(&MenuItem::with_id(
+                format!("recent:{}", id.as_uuid()),
+                name,
+                true,
+                None,
+            ))
+            .map_err(|error| error.to_string())?;
+    }
+    let quit = MenuItem::with_id("quit", "Quit", true, None);
+    Menu::with_items(&[&status, &active, &open, &eject, &recent_menu, &quit])
+        .map_err(|error| error.to_string())
 }

@@ -56,10 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         load: Arc::new({
             let handle = handle.clone();
             let runtime_handle = runtime_handle.clone();
-            move |id| {
+            move |request: model_launcher_ui::UiLoadRequest| {
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
-                    let _ = handle.load(id).await;
+                    let _ = handle
+                        .load_model_with_profile(request.id, request.key, request.settings)
+                        .await;
                 });
             }
         }),
@@ -91,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let snapshot = handle.snapshot();
                 AppSnapshot {
                     models: snapshot.models,
+                    recent_models: handle.recent_models(),
                     lifecycle: snapshot.lifecycle,
                     capabilities: handle.capabilities(),
                 }
@@ -161,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_desktop(
         AppSnapshot {
             models: snapshot.models,
+            recent_models: handle.recent_models(),
             lifecycle: snapshot.lifecycle,
             capabilities: handle.capabilities(),
         },

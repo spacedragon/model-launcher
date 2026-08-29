@@ -34,6 +34,7 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
     let alpha = model("Alpha", 2_147_483_648);
     let snapshot = AppSnapshot {
         models: vec![alpha.clone()],
+        recent_models: vec![],
         lifecycle: LifecycleSnapshot::default(),
         capabilities: EngineCapabilities::default(),
     };
@@ -75,6 +76,7 @@ fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
     };
     let vm = ViewModel::from_snapshot(AppSnapshot {
         models: vec![active.clone(), other.clone()],
+        recent_models: vec![],
         lifecycle,
         capabilities: EngineCapabilities::default(),
     });
@@ -210,7 +212,11 @@ fn tray_maps_commands_without_opening_a_real_window_and_drops_windows() {
         }
     });
     assert_eq!(tray.map_command("open"), Some(TrayCommand::Open));
-    assert_eq!(tray.map_command("recent"), Some(TrayCommand::LoadRecent(0)));
+    let recent_id = ModelId::new();
+    assert_eq!(
+        tray.map_command(&format!("recent:{}", recent_id.as_uuid())),
+        Some(TrayCommand::LoadRecent(recent_id))
+    );
     assert_eq!(opened.load(Ordering::SeqCst), 0);
     for _ in 0..50 {
         tray.open_for_test();
