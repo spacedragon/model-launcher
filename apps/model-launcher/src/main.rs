@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .await;
                     match result {
-                        Ok(_) => model_launcher_ui::report_status("Settings saved"),
+                        Ok(_) => model_launcher_ui::report_settings_saved(),
                         Err(error) => {
                             model_launcher_ui::report_status(format!("Settings failed: {error}"))
                         }

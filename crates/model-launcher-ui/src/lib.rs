@@ -112,7 +112,11 @@ pub fn run_desktop(
             let _ = clipboard.set_contents(text.into());
         }
     });
-    install_log_filter(&window, actions.clone());
+    install_log_filter(
+        &window,
+        actions.clone(),
+        Arc::new(std::sync::RwLock::new(LogFilter::default())),
+    );
     window.run()
 }
 
@@ -123,6 +127,7 @@ pub struct WindowManager {
     actions: UiActions,
     token_reveal: Option<TokenReveal>,
     token_timeout: slint::Timer,
+    current_log_filter: Arc<std::sync::RwLock<LogFilter>>,
 }
 
 impl WindowManager {
@@ -134,6 +139,7 @@ impl WindowManager {
             actions,
             token_reveal: None,
             token_timeout: slint::Timer::default(),
+            current_log_filter: Arc::new(std::sync::RwLock::new(LogFilter::default())),
         }
     }
 
@@ -147,6 +153,7 @@ impl WindowManager {
             (self.actions.snapshot)(),
             self.address.clone(),
             self.actions.clone(),
+            self.current_log_filter.clone(),
         )?;
         #[cfg(windows)]
         window.window().on_close_requested(|| {
@@ -222,7 +229,7 @@ impl WindowManager {
         self.token_reveal = None;
     }
 
-    pub fn refresh(&self) {
+    pub fn refresh_dynamic(&self) {
         use slint::{ModelRc, VecModel};
         let Some(window) = self.window.as_ref() else {
             return;
@@ -234,8 +241,19 @@ impl WindowManager {
         )))));
         window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
         hydrate_server(window, &view_model.snapshot);
-        set_logs(window, (self.actions.logs)(LogFilter::default()));
-        hydrate_capabilities(window, &view_model.snapshot.capabilities);
+        let filter = *self
+            .current_log_filter
+            .read()
+            .expect("log filter lock poisoned");
+        set_logs(window, (self.actions.logs)(filter));
+    }
+
+    pub fn hydrate_settings_and_capabilities(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let snapshot = (self.actions.snapshot)();
+        hydrate_capabilities(window, &snapshot.capabilities);
         hydrate_engine_settings(window, (self.actions.engine_settings)());
     }
 
@@ -249,6 +267,7 @@ fn create_window(
     snapshot: AppSnapshot,
     address: String,
     actions: UiActions,
+    current_log_filter: Arc<std::sync::RwLock<LogFilter>>,
 ) -> Result<MainWindow, slint::PlatformError> {
     use slint::{ComponentHandle as _, ModelRc, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
@@ -325,7 +344,7 @@ fn create_window(
             let _ = clipboard.set_contents(text.into());
         }
     });
-    install_log_filter(&window, actions.clone());
+    install_log_filter(&window, actions.clone(), current_log_filter);
     Ok(window)
 }
 
@@ -401,7 +420,11 @@ fn set_logs(window: &MainWindow, records: Vec<LogRecord>) {
     window.set_logs(log_lines(&records));
 }
 
-fn install_log_filter(window: &MainWindow, actions: UiActions) {
+fn install_log_filter(
+    window: &MainWindow,
+    actions: UiActions,
+    current_filter: Arc<std::sync::RwLock<LogFilter>>,
+) {
     use slint::ComponentHandle as _;
     let weak = window.as_weak();
     window.on_filter_logs(move |source, level| {
@@ -419,14 +442,13 @@ fn install_log_filter(window: &MainWindow, actions: UiActions) {
             "Error" => Some(model_launcher_core::LogLevel::Error),
             _ => None,
         };
+        let filter = LogFilter {
+            source,
+            minimum_level,
+        };
+        *current_filter.write().expect("log filter lock poisoned") = filter;
         if let Some(window) = weak.upgrade() {
-            set_logs(
-                &window,
-                (actions.logs)(LogFilter {
-                    source,
-                    minimum_level,
-                }),
-            );
+            set_logs(&window, (actions.logs)(filter));
         }
     });
 }
@@ -536,7 +558,7 @@ pub fn request_refresh() {
     let _ = slint::invoke_from_event_loop(|| {
         DESKTOP.with_borrow(|desktop| {
             if let Some(desktop) = desktop.as_ref() {
-                desktop.windows.refresh();
+                desktop.windows.refresh_dynamic();
                 let snapshot = (desktop.windows.actions.snapshot)();
                 let active = snapshot
                     .lifecycle
@@ -572,6 +594,20 @@ pub fn report_status(message: impl Into<String>) {
 }
 
 #[cfg(windows)]
+pub fn report_settings_saved() {
+    let _ = slint::invoke_from_event_loop(|| {
+        DESKTOP.with_borrow(|desktop| {
+            if let Some(desktop) = desktop.as_ref() {
+                desktop.windows.hydrate_settings_and_capabilities();
+                if let Some(window) = desktop.windows.window.as_ref() {
+                    window.set_operation_status("Settings saved".into());
+                }
+            }
+        });
+    });
+}
+
+#[cfg(windows)]
 pub fn report_generated_token(token: String) {
     let _ = slint::invoke_from_event_loop(move || {
         DESKTOP.with_borrow_mut(|desktop| {
@@ -596,6 +632,9 @@ pub fn request_refresh() {}
 
 #[cfg(not(windows))]
 pub fn report_status(_message: impl Into<String>) {}
+
+#[cfg(not(windows))]
+pub fn report_settings_saved() {}
 
 #[cfg(not(windows))]
 pub fn report_generated_token(_token: String) {}
