@@ -875,7 +875,7 @@ async fn controllable_fake_upstream_preserves_split_non_utf8_sse_bytes() {
 }
 
 #[tokio::test]
-async fn bounded_request_spool_preserves_incoming_data_frame_sequence() {
+async fn bounded_request_spool_preserves_incoming_bytes() {
     let upstream = FakeServer::spawn().await.unwrap();
     let (lifecycle, server) = start(Authentication::Disabled, upstream.base_url()).await;
     let frames = vec![
@@ -883,7 +883,10 @@ async fn bounded_request_spool_preserves_incoming_data_frame_sequence() {
         Bytes::from_static(b"\"acme/tiny\","),
         Bytes::from_static(b"\"prompt\":\"x\"}"),
     ];
-    let expected = frames.iter().map(Bytes::len).collect::<Vec<_>>();
+    let expected = frames
+        .iter()
+        .flat_map(|frame| frame.iter().copied())
+        .collect::<Vec<_>>();
     let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
         frames.into_iter().map(Ok::<_, std::io::Error>),
     ));
@@ -894,7 +897,7 @@ async fn bounded_request_spool_preserves_incoming_data_frame_sequence() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(upstream.control.request_chunks(), expected);
+    assert_eq!(upstream.control.request_bytes(), expected);
     stop(lifecycle, server).await;
     upstream.stop().await.unwrap();
 }

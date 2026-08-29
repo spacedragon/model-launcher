@@ -21,7 +21,7 @@ pub struct Control {
     stream_drops: AtomicUsize,
     gate_entered: Notify,
     gate_release: Notify,
-    request_chunks: std::sync::Mutex<Vec<usize>>,
+    request_bytes: std::sync::Mutex<Vec<u8>>,
 }
 impl Control {
     pub fn requests(&self) -> usize {
@@ -36,8 +36,8 @@ impl Control {
     pub fn release_gate(&self) {
         self.gate_release.notify_waiters();
     }
-    pub fn request_chunks(&self) -> Vec<usize> {
-        self.request_chunks.lock().unwrap().clone()
+    pub fn request_bytes(&self) -> Vec<u8> {
+        self.request_bytes.lock().unwrap().clone()
     }
 }
 
@@ -135,14 +135,12 @@ async fn handle(State(control): State<Arc<Control>>, request: Request) -> Respon
     let (parts, body) = request.into_parts();
     let mut stream = body.into_data_stream();
     let mut bytes = Vec::new();
-    let mut sizes = Vec::new();
     while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
         if let Ok(chunk) = chunk {
-            sizes.push(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
     }
-    *control.request_chunks.lock().unwrap() = sizes;
+    *control.request_bytes.lock().unwrap() = bytes.clone();
     let bytes = Bytes::from(bytes);
     let mut response = Response::new(Body::from(bytes));
     if let Some(value) = parts.headers.get("x-safe") {
