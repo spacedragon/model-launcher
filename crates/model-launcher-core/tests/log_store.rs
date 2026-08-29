@@ -234,6 +234,36 @@ fn unicode_whitespace_before_authorization_colon_is_redacted_everywhere() {
 }
 
 #[test]
+fn unicode_whitespace_folded_continuations_are_redacted_until_an_empty_line() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = ["nbsp-folded", "em-folded", "ideographic-folded"];
+    store.append(record(
+        1,
+        concat!(
+            "Authorization:\r\n\u{00a0}Basic nbsp-folded\r\n",
+            "Authorization:\n\u{2003}Custom em-folded\n",
+            "Authorization:\r\u{3000}Custom ideographic-folded\r",
+            "\r\u{2003}safe-after-empty"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(snapshot[0].message.contains("\u{2003}safe-after-empty"));
+}
+
+#[test]
 fn bounded_broadcast_reports_lagged_record_count() {
     let store = store(LogStoreLimits::new(8, 1_024, 2));
     let mut subscriber = store.subscribe();

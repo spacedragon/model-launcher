@@ -216,8 +216,8 @@ fn redact_authorization_headers(message: &str) -> String {
     let mut output = String::with_capacity(message.len());
     let mut authorization_continuation = false;
     for (content, ending) in logical_lines(message) {
-        if authorization_continuation && content.starts_with([' ', '\t']) {
-            let whitespace_len = content.len() - content.trim_start_matches([' ', '\t']).len();
+        if authorization_continuation && content.chars().next().is_some_and(char::is_whitespace) {
+            let whitespace_len = leading_whitespace_bytes(content);
             output.push_str(&content[..whitespace_len]);
             output.push_str("[REDACTED]");
             output.push_str(ending);
@@ -235,6 +235,17 @@ fn redact_authorization_headers(message: &str) -> String {
         }
     }
     output
+}
+
+fn leading_whitespace_bytes(value: &str) -> usize {
+    let mut length = 0;
+    for (offset, character) in value.char_indices() {
+        if !character.is_whitespace() {
+            break;
+        }
+        length = offset + character.len_utf8();
+    }
+    length
 }
 
 fn logical_lines(message: &str) -> impl Iterator<Item = (&str, &str)> {
