@@ -5,6 +5,7 @@ use axum::{
 };
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::{ApiError, AppState};
 
@@ -48,8 +49,9 @@ pub(crate) async fn proxy(
         parts.uri.path_and_query().map_or("/", |v| v.as_str())
     );
     let mut outgoing = state.client.request(parts.method, url).body(bytes);
+    let nominated = nominated_headers(&parts.headers);
     for (name, value) in &parts.headers {
-        if safe_request_header(name) {
+        if safe_request_header(name) && !nominated.contains(name.as_str()) {
             outgoing = outgoing.header(name, value);
         }
     }
@@ -96,6 +98,7 @@ fn safe_request_header(name: &HeaderName) -> bool {
     )
 }
 fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap<HeaderValue>) {
+    let nominated = nominated_headers(source);
     for (name, value) in source {
         if !matches!(
             name.as_str(),
@@ -106,8 +109,21 @@ fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap<HeaderValue>
                 | "te"
                 | "trailer"
                 | "content-length"
-        ) {
+        ) && !nominated.contains(name.as_str())
+        {
             target.append(name, value.clone());
         }
     }
+}
+
+fn nominated_headers(headers: &HeaderMap) -> HashSet<String> {
+    headers
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
 }

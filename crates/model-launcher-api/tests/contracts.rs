@@ -97,6 +97,7 @@ fn config(authentication: Authentication) -> GatewayConfig {
         limits: GatewayLimits {
             max_body_bytes: 256,
             max_headers: 8,
+            max_header_bytes: 256,
             max_connections: 2,
             startup_timeout: Duration::from_secs(1),
         },
@@ -240,8 +241,9 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
             async move {
                 let auth = request.headers().get("authorization").cloned();
                 let safe = request.headers().get("x-safe").cloned();
+                let nominated = request.headers().get("x-remove").cloned();
                 let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                *capture.lock().unwrap() = Some((bytes, auth, safe));
+                *capture.lock().unwrap() = Some((bytes, auth, safe, nominated));
                 let mut response = Response::new(Body::from(Bytes::from_static(b"data:\x00x\n\n")));
                 response.headers_mut().insert(
                     "content-type",
@@ -250,6 +252,12 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
                 response
                     .headers_mut()
                     .insert("x-safe-response", HeaderValue::from_static("yes"));
+                response
+                    .headers_mut()
+                    .insert("connection", HeaderValue::from_static("x-remove-response"));
+                response
+                    .headers_mut()
+                    .insert("x-remove-response", HeaderValue::from_static("secret"));
                 response
                     .headers_mut()
                     .insert("content-length", HeaderValue::from_static("9"));
@@ -275,12 +283,15 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
         ))
         .bearer_auth(token)
         .header("x-safe", "yes")
+        .header("connection", "x-remove")
+        .header("x-remove", "secret")
         .body(body.as_slice())
         .send()
         .await
         .unwrap();
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     assert_eq!(response.headers()["x-safe-response"], "yes");
+    assert!(!response.headers().contains_key("x-remove-response"));
     assert_eq!(
         response.bytes().await.unwrap(),
         Bytes::from_static(b"data:\x00x\n\n")
@@ -289,6 +300,7 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
     assert_eq!(got.0, body.as_slice());
     assert!(got.1.is_none());
     assert_eq!(got.2.unwrap(), "yes");
+    assert!(got.3.is_none());
     stop(lifecycle, server).await;
     task.abort();
 }
@@ -327,5 +339,78 @@ async fn unknown_and_limits_have_stable_statuses() {
         request.send().await.unwrap().status(),
         StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
     );
+    let bytes = client
+        .post(&url)
+        .header("x-large", "x".repeat(300))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bytes.status(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
     stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn active_response_holds_connection_permit_and_overload_is_stable() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let upstream = Router::new().route(
+        "/v1/completions",
+        post({
+            let entered = entered.clone();
+            let release = release.clone();
+            move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "{}"
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let mut gateway_config = config(Authentication::Disabled);
+    gateway_config.limits.max_connections = 1;
+    let endpoint = format!("http://{upstream_addr}");
+    let gateway = Gateway::new(
+        gateway_config,
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let url = format!("http://{}/v1/completions", server.local_addr());
+    let first = tokio::spawn({
+        let url = url.clone();
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .body(r#"{"model":"acme/tiny"}"#)
+                .send()
+                .await
+        }
+    });
+    entered.notified().await;
+    let overloaded = reqwest::Client::new()
+        .post(url)
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(overloaded.headers()["retry-after"], "1");
+    assert_eq!(
+        overloaded.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"connection_limit","message":"too many active connections"}})
+    );
+    release.notify_one();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    stop(lifecycle, server).await;
+    upstream_task.abort();
 }

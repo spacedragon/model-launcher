@@ -33,6 +33,7 @@ pub type UpstreamResolver = Arc<dyn Fn(&ModelRecord) -> Option<String> + Send + 
 pub struct GatewayLimits {
     pub max_body_bytes: usize,
     pub max_headers: usize,
+    pub max_header_bytes: usize,
     pub max_connections: usize,
     pub startup_timeout: Duration,
 }
@@ -42,6 +43,7 @@ impl Default for GatewayLimits {
         Self {
             max_body_bytes: 8 * 1024 * 1024,
             max_headers: 64,
+            max_header_bytes: 32 * 1024,
             max_connections: 128,
             startup_timeout: Duration::from_secs(30),
         }
@@ -223,7 +225,14 @@ async fn authenticate(State(state): State<AppState>, request: Request, next: Nex
 }
 
 async fn limit_headers(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if request.headers().len() > state.limits.max_headers {
+    let header_bytes = request
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len().saturating_add(value.as_bytes().len()))
+        .try_fold(0_usize, usize::checked_add);
+    if request.headers().len() > state.limits.max_headers
+        || header_bytes.is_none_or(|bytes| bytes > state.limits.max_header_bytes)
+    {
         ApiError::headers("too_many_headers", "too many request headers").into_response()
     } else {
         next.run(request).await
