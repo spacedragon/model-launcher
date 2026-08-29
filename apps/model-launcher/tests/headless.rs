@@ -21,6 +21,11 @@ struct Engine {
     stops: Arc<AtomicUsize>,
 }
 
+struct ProbeFailEngine {
+    starts: Arc<AtomicUsize>,
+    stops: Arc<AtomicUsize>,
+}
+
 struct RecordingSettings(Arc<std::sync::Mutex<Vec<String>>>);
 #[async_trait::async_trait]
 impl EngineSettingsManager for RecordingSettings {
@@ -366,6 +371,69 @@ impl InferenceEngine for Engine {
         let stops = self.stops.clone();
         Box::pin(async move { Ok(Box::new(Process(stops)) as Box<dyn EngineProcess>) })
     }
+}
+impl InferenceEngine for ProbeFailEngine {
+    fn spec(&self) -> EngineFuture<'_, EngineSpec> {
+        Box::pin(async { Err(model_launcher_core::AppError::EngineUnavailable) })
+    }
+    fn probe_capabilities(&self) -> EngineFuture<'_, EngineCapabilities> {
+        Box::pin(async { Err(model_launcher_core::AppError::EngineUnavailable) })
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a LaunchSettings,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn spawn<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a LaunchSettings,
+    ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+        let stops = self.stops.clone();
+        Box::pin(async move { Ok(Box::new(Process(stops)) as Box<dyn EngineProcess>) })
+    }
+}
+
+#[tokio::test]
+async fn initial_probe_failure_starts_disabled_and_valid_settings_recover_loading() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    std::fs::write(temp.path().join("models/tiny.gguf"), b"GGUFtiny").unwrap();
+    let starts = Arc::new(AtomicUsize::new(0));
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(ProbeFailEngine {
+            starts: starts.clone(),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        Arc::new(RecordingSettings(Arc::new(std::sync::Mutex::new(
+            Vec::new(),
+        )))),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let snapshot = handle.snapshot();
+    assert!(!snapshot.engine_valid);
+    assert_eq!(
+        snapshot.engine_diagnostic.as_deref(),
+        Some("engine is unavailable")
+    );
+    assert!(handle.load(snapshot.models[0].id).await.is_err());
+    assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+    handle
+        .save_engine_settings("Ubuntu".into(), "/opt/llama-server".into())
+        .await
+        .unwrap();
+    assert!(handle.snapshot().engine_valid);
+    handle.load(snapshot.models[0].id).await.unwrap();
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    handle.shutdown().await.unwrap();
 }
 struct Process(Arc<AtomicUsize>);
 impl EngineProcess for Process {

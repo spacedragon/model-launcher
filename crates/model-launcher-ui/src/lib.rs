@@ -543,6 +543,13 @@ fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
 fn hydrate_server(window: &MainWindow, snapshot: &AppSnapshot) {
     window.set_authentication_status(snapshot.authentication_status.clone().into());
     window.set_server_warning(snapshot.server_warning.clone().into());
+    window.set_engine_diagnostic(
+        snapshot
+            .engine_diagnostic
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
 }
 
 fn launch_settings(
@@ -769,6 +776,8 @@ pub struct AppSnapshot {
     pub capabilities: EngineCapabilities,
     pub authentication_status: String,
     pub server_warning: String,
+    pub engine_valid: bool,
+    pub engine_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -863,6 +872,14 @@ impl ViewModel {
         if self.snapshot.lifecycle.in_flight > 0 {
             return ModelAction::Disabled(
                 "Finish active requests or eject the current model first.".into(),
+            );
+        }
+        if !self.snapshot.engine_valid {
+            return ModelAction::Disabled(
+                self.snapshot
+                    .engine_diagnostic
+                    .clone()
+                    .unwrap_or_else(|| "Engine settings must be validated before loading.".into()),
             );
         }
         ModelAction::Load

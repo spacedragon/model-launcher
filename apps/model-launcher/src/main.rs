@@ -105,6 +105,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     capabilities: handle.capabilities(),
                     authentication_status: "Token authentication enabled".into(),
                     server_warning: String::new(),
+                    engine_valid: snapshot.engine_valid,
+                    engine_diagnostic: snapshot.engine_diagnostic,
                 }
             }
         }),
@@ -237,6 +239,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             capabilities: handle.capabilities(),
             authentication_status: "Token authentication enabled".into(),
             server_warning: String::new(),
+            engine_valid: snapshot.engine_valid,
+            engine_diagnostic: snapshot.engine_diagnostic,
         },
         handle.local_addr().to_string(),
         actions,

@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -58,6 +61,47 @@ impl std::fmt::Display for ShutdownFailure {
 pub struct ServiceSnapshot {
     pub models: Vec<ModelRecord>,
     pub lifecycle: LifecycleSnapshot,
+    pub engine_valid: bool,
+    pub engine_diagnostic: Option<String>,
+}
+
+struct EngineHealth {
+    valid: AtomicBool,
+    diagnostic: RwLock<Option<String>>,
+}
+
+struct GuardedEngine {
+    inner: Arc<dyn InferenceEngine>,
+    health: Arc<EngineHealth>,
+}
+
+impl InferenceEngine for GuardedEngine {
+    fn spec(&self) -> model_launcher_core::EngineFuture<'_, model_launcher_core::EngineSpec> {
+        self.inner.spec()
+    }
+    fn probe_capabilities(&self) -> model_launcher_core::EngineFuture<'_, EngineCapabilities> {
+        self.inner.probe_capabilities()
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        model: &'a ModelRecord,
+        settings: &'a model_launcher_core::LaunchSettings,
+    ) -> model_launcher_core::EngineFuture<'a, ()> {
+        if !self.health.valid.load(Ordering::Acquire) {
+            return Box::pin(async { Err(AppError::EngineUnavailable) });
+        }
+        self.inner.validate_launch(model, settings)
+    }
+    fn spawn<'a>(
+        &'a self,
+        model: &'a ModelRecord,
+        settings: &'a model_launcher_core::LaunchSettings,
+    ) -> model_launcher_core::EngineFuture<'a, Box<dyn model_launcher_core::EngineProcess>> {
+        if !self.health.valid.load(Ordering::Acquire) {
+            return Box::pin(async { Err(AppError::EngineUnavailable) });
+        }
+        self.inner.spawn(model, settings)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,7 +254,19 @@ impl Service {
             .then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
             .transpose()
             .map_err(|error| ServiceError::Watcher(error.to_string()))?;
-        let capabilities = Arc::new(RwLock::new(engine.probe_capabilities().await?));
+        let (initial_capabilities, initial_diagnostic) = match engine.probe_capabilities().await {
+            Ok(capabilities) => (capabilities, None),
+            Err(error) => (EngineCapabilities::default(), Some(error.to_string())),
+        };
+        let health = Arc::new(EngineHealth {
+            valid: AtomicBool::new(initial_diagnostic.is_none()),
+            diagnostic: RwLock::new(initial_diagnostic),
+        });
+        let engine: Arc<dyn InferenceEngine> = Arc::new(GuardedEngine {
+            inner: engine,
+            health: health.clone(),
+        });
+        let capabilities = Arc::new(RwLock::new(initial_capabilities));
         let models = Arc::new(RwLock::new(initial.config));
         let resolver = Arc::new(ServiceModels {
             models: models.clone(),
@@ -296,6 +352,7 @@ impl Service {
             tokens,
             settings,
             engine,
+            health,
             models,
             catalog_root: RwLock::new(catalog_root),
             watch_catalog: options.watch_catalog,
@@ -358,6 +415,14 @@ impl ServiceHandle {
                 .models
                 .clone(),
             lifecycle: self.inner.lifecycle.snapshot(),
+            engine_valid: self.inner.health.valid.load(Ordering::Acquire),
+            engine_diagnostic: self
+                .inner
+                .health
+                .diagnostic
+                .read()
+                .expect("engine diagnostic lock poisoned")
+                .clone(),
         }
     }
     pub fn capabilities(&self) -> EngineCapabilities {
@@ -469,6 +534,13 @@ impl ServiceHandle {
         config.engine_executable = latest.engine_executable;
         manager.apply(distribution, executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
+        self.inner.health.valid.store(true, Ordering::Release);
+        *self
+            .inner
+            .health
+            .diagnostic
+            .write()
+            .expect("engine diagnostic lock poisoned") = None;
         self.inner.changed();
         Ok(caps)
     }
@@ -506,6 +578,13 @@ impl ServiceHandle {
         self.inner.restart_watcher().await?;
         manager.apply(settings.engine_distribution, settings.engine_executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
+        self.inner.health.valid.store(true, Ordering::Release);
+        *self
+            .inner
+            .health
+            .diagnostic
+            .write()
+            .expect("engine diagnostic lock poisoned") = None;
         let _ = latest;
         self.inner.changed();
         Ok(caps)
@@ -651,6 +730,7 @@ struct Inner {
     tokens: Option<Arc<model_launcher_api::TokenStore>>,
     settings: Option<Arc<dyn EngineSettingsManager>>,
     engine: Arc<dyn InferenceEngine>,
+    health: Arc<EngineHealth>,
     models: Arc<RwLock<LauncherConfig>>,
     catalog_root: RwLock<PathBuf>,
     watch_catalog: bool,

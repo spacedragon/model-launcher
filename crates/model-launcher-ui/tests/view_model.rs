@@ -40,6 +40,8 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
         capabilities: EngineCapabilities::default(),
         authentication_status: String::new(),
         server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
     };
     let vm = ViewModel::from_snapshot(snapshot);
     assert_eq!(vm.rows()[0].name, "Alpha");
@@ -80,6 +82,8 @@ fn model_search_matches_name_key_and_path_case_insensitively() {
         capabilities: EngineCapabilities::default(),
         authentication_status: String::new(),
         server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
     });
 
     assert_eq!(vm.filtered_rows("CHAT")[0].id, alpha.id);
@@ -105,12 +109,33 @@ fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
         capabilities: EngineCapabilities::default(),
         authentication_status: String::new(),
         server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
     });
     assert_eq!(
         vm.action(other.id),
         ModelAction::Disabled("Finish active requests or eject the current model first.".into())
     );
     assert_eq!(vm.action(active.id), ModelAction::Eject);
+}
+
+#[test]
+fn invalid_engine_disables_load_with_probe_diagnostic() {
+    let alpha = model("Alpha", 1);
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: false,
+        engine_diagnostic: Some("safe probe diagnostic".into()),
+    });
+    assert_eq!(
+        vm.action(alpha.id),
+        ModelAction::Disabled("safe probe diagnostic".into())
+    );
 }
 
 #[test]
@@ -275,6 +300,8 @@ fn tray_recent_request_resolves_stable_id_after_catalog_reordering() {
         capabilities: EngineCapabilities::default(),
         authentication_status: String::new(),
         server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
     };
 
     let request = load_request_for(&snapshot, alpha.id).unwrap();
@@ -301,6 +328,8 @@ fn load_dialog_adapter_hydrates_every_saved_profile_value() {
         capabilities: EngineCapabilities::default(),
         authentication_status: String::new(),
         server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
     };
 
     let values = load_dialog_values_for(&snapshot, alpha.id).unwrap();
