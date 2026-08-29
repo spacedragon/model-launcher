@@ -218,6 +218,7 @@ impl Service {
         let inner = Arc::new(Inner {
             address,
             lifecycle: lifecycle_handle,
+            capabilities: resolver.capabilities.clone(),
             models,
             store,
             shutdown_timeout: options.shutdown_timeout,
@@ -277,6 +278,27 @@ impl ServiceHandle {
                 .clone(),
             lifecycle: self.inner.lifecycle.snapshot(),
         }
+    }
+    pub fn capabilities(&self) -> EngineCapabilities {
+        self.inner.capabilities.clone()
+    }
+    pub async fn load(&self, id: model_launcher_core::ModelId) -> Result<(), ServiceError> {
+        let model = self
+            .inner
+            .models
+            .read()
+            .expect("model lock poisoned")
+            .models
+            .iter()
+            .find(|model| model.id == id)
+            .cloned()
+            .ok_or(AppError::ModelNotFound)?;
+        self.inner.lifecycle.load(model).await?;
+        Ok(())
+    }
+    pub async fn eject(&self) -> Result<(), ServiceError> {
+        self.inner.lifecycle.eject().await?;
+        Ok(())
     }
     pub fn subscribe_shutdown(&self) -> broadcast::Receiver<ShutdownEvent> {
         self.inner.events.subscribe()
@@ -340,6 +362,7 @@ impl ServiceHandle {
 struct Inner {
     address: SocketAddr,
     lifecycle: LifecycleHandle,
+    capabilities: EngineCapabilities,
     models: Arc<RwLock<LauncherConfig>>,
     store: ConfigStore,
     shutdown_timeout: Duration,

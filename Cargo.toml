@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/model-launcher", "crates/model-launcher-core", "crates/model-launcher-wsl", "crates/model-launcher-api", "tests/fake-llama-server"]
+members = ["apps/model-launcher", "crates/model-launcher-core", "crates/model-launcher-wsl", "crates/model-launcher-api", "crates/model-launcher-ui", "tests/fake-llama-server"]
 resolver = "2"
 
 [workspace.package]
@@ -19,3 +19,4 @@ regex = "1"
 walkdir = "2"
 gguf-rs-lib = "0.3"
 notify = "8.2"
+slint = { version = "=1.16.1", default-features = false, features = ["std", "backend-winit", "renderer-femtovg", "accessibility", "compat-1-2"] }

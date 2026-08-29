@@ -1,10 +1,13 @@
 use model_launcher::{Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
+use model_launcher_ui::{AppSnapshot, UiActions, run_desktop};
 use model_launcher_wsl::{LlamaCppWslEngine, TokioCommandRunner};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     let base = platform_data_dir();
     let options = ServiceOptions {
         config_dir: base.join("config"),
@@ -25,9 +28,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "/usr/local/bin/llama-server".into()),
         Arc::new(TokioCommandRunner::default()),
     ));
-    let service = Service::start(options, engine).await?;
-    tokio::signal::ctrl_c().await?;
-    service.handle().shutdown().await?;
+    let service = runtime.block_on(Service::start(options.clone(), engine))?;
+    let handle = service.handle();
+    let snapshot = handle.snapshot();
+    let runtime_handle = runtime.handle().clone();
+    let actions = UiActions {
+        load: Arc::new({
+            let handle = handle.clone();
+            let runtime_handle = runtime_handle.clone();
+            move |id| {
+                let handle = handle.clone();
+                runtime_handle.spawn(async move {
+                    let _ = handle.load(id).await;
+                });
+            }
+        }),
+        eject: Arc::new({
+            let handle = handle.clone();
+            let runtime_handle = runtime_handle.clone();
+            move || {
+                let handle = handle.clone();
+                runtime_handle.spawn(async move {
+                    let _ = handle.eject().await;
+                });
+            }
+        }),
+        rescan: Arc::new({
+            let handle = handle.clone();
+            let runtime_handle = runtime_handle.clone();
+            let catalog = options.catalog_dir.clone();
+            move || {
+                let handle = handle.clone();
+                let catalog = catalog.clone();
+                runtime_handle.spawn(async move {
+                    let _ = handle.rescan(catalog).await;
+                });
+            }
+        }),
+    };
+    run_desktop(
+        AppSnapshot {
+            models: snapshot.models,
+            lifecycle: snapshot.lifecycle,
+            capabilities: handle.capabilities(),
+        },
+        handle.local_addr().to_string(),
+        actions,
+    )?;
+    runtime.block_on(handle.shutdown())?;
     Ok(())
 }
 

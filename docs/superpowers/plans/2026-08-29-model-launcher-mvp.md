@@ -363,25 +363,25 @@ git commit -m "feat: compose headless model launcher service"
 - Modify: `apps/model-launcher/src/main.rs`
 - Test: `crates/model-launcher-ui/tests/view_model.rs`
 
-- [ ] **Step 1: Write failing view-model tests**
+- [x] **Step 1: Write failing view-model tests**
 
 Test snapshot-to-row mapping, responsive metadata priority, busy-state action disabling, supported-setting visibility, one-time close notice, one-time plaintext token reveal, save-settings-triggered capability reprobe, recent model ordering, bounded log snapshot/filter/export commands, and tray command mapping without opening a real window.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-ui --test view_model`
 
 Expected: UI crate is absent.
 
-- [ ] **Step 3: Implement the accepted layout**
+- [x] **Step 3: Implement the accepted layout**
 
 Use Slint 1.16.1 with system-tray enabled. Implement the 38px title region, 48px horizontal navigation, full-width compact model list, Quiet Native palette, capability-driven load dialog, Server/Logs/Settings pages, and tray menu. The Logs page consumes bounded snapshots/subscriptions from `LogStore`, filters by source/level, and invokes redacted export. Keep core state in Rust; Slint receives display models and emits commands.
 
-- [ ] **Step 4: Implement destroy/recreate behavior**
+- [x] **Step 4: Implement destroy/recreate behavior**
 
 Keep only the tray component and an application handle while closed. Drop `MainWindow` after close, and instantiate/hydrate a new one on Open. Add an instrumentation-only weak reference assertion used by the test harness.
 
-- [ ] **Step 5: Verify UI logic and compile**
+- [x] **Step 5: Verify UI logic and compile**
 
 Run: `cargo test -p model-launcher-ui && cargo build -p model-launcher`
 
