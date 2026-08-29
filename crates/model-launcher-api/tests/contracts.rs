@@ -368,18 +368,15 @@ async fn listener_connection_cap_covers_idle_prebody_connections() {
         .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n")
         .await
         .unwrap();
-    let mut byte = [0_u8; 1];
-    assert_eq!(second.read(&mut byte).await.unwrap(), 0);
+    let second_response = tokio::spawn(async move {
+        let mut byte = [0_u8; 1];
+        second.read(&mut byte).await.map(|count| (count, byte))
+    });
+    tokio::task::yield_now().await;
+    assert!(!second_response.is_finished());
     drop(first);
-    let mut recovered = tokio::net::TcpStream::connect(server.local_addr())
-        .await
-        .unwrap();
-    recovered
-        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    assert!(recovered.read(&mut byte).await.unwrap() > 0);
-    drop(recovered);
+    let (count, _) = second_response.await.unwrap().unwrap();
+    assert!(count > 0);
     stop(lifecycle, server).await;
 }
 

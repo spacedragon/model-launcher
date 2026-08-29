@@ -312,6 +312,9 @@ impl Drop for GatewayServer {
         if let Some(stop) = self.shutdown.take() {
             let _ = stop.send(());
         }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -466,20 +469,30 @@ impl axum::serve::Listener for LimitedListener {
     type Io = LimitedIo;
     type Addr = SocketAddr;
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let permit = match self.permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => std::future::pending().await,
+        };
         loop {
-            let (stream, address) = self
-                .listener
-                .accept()
-                .await
-                .expect("bound gateway listener accepts");
-            if let Ok(permit) = self.permits.clone().try_acquire_owned() {
-                return (
-                    LimitedIo {
-                        stream,
-                        _permit: permit,
-                    },
-                    address,
-                );
+            match self.listener.accept().await {
+                Ok((stream, address)) => {
+                    return (
+                        LimitedIo {
+                            stream,
+                            _permit: permit,
+                        },
+                        address,
+                    );
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    tokio::task::yield_now().await
+                }
+                Err(_) => tokio::task::yield_now().await,
             }
         }
     }
