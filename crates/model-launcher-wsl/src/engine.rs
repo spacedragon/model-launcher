@@ -207,13 +207,7 @@ impl WslChild for TokioWslChild {
                     let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
                 }
                 let tail = self.stderr_tail.lock().expect("stderr tail lock").clone();
-                if is_address_in_use(&tail) {
-                    return Err(WslError::AddressInUse);
-                }
-                return Err(WslError::Command(format!(
-                    "engine exited before readiness: {status}: {}",
-                    String::from_utf8_lossy(&tail)
-                )));
+                return Err(classify_pre_ready_exit(&status.to_string(), &tail));
             }
             if tokio::net::TcpStream::connect(self.addr).await.is_ok() {
                 return if self.endpoint_is_owned().await? {
@@ -363,6 +357,16 @@ fn append_bounded_tail(tail: &Mutex<Vec<u8>>, bytes: &[u8]) {
 fn is_address_in_use(bytes: &[u8]) -> bool {
     let diagnostic = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     diagnostic.contains("address already in use") || diagnostic.contains("eaddrinuse")
+}
+fn classify_pre_ready_exit(status: &str, stderr_tail: &[u8]) -> WslError {
+    if is_address_in_use(stderr_tail) {
+        WslError::AddressInUse
+    } else {
+        WslError::Command(format!(
+            "engine exited before readiness: {status}: {}",
+            String::from_utf8_lossy(stderr_tail)
+        ))
+    }
 }
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -1099,7 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stolen_port_terminates_owned_pid_then_retries_with_fresh_port() {
+    async fn address_in_use_stderr_exit_terminates_owned_pid_then_retries_fresh_port() {
         let runner = Arc::new(AttemptRunner {
             children: Mutex::new(VecDeque::from([AttemptChild {
                 pid: 22,
@@ -1114,7 +1118,10 @@ mod tests {
             runner: runner.clone(),
             child: Some(Box::new(AttemptChild {
                 pid: 11,
-                ready: Some(Err(WslError::NonOwnedEndpoint)),
+                ready: Some(Err(classify_pre_ready_exit(
+                    "exit 1",
+                    b"listen: ADDRESS ALREADY IN USE",
+                ))),
             })),
             retry: Some(RetryContext {
                 executable: "/llama".into(),
