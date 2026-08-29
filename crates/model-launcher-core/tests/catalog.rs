@@ -8,9 +8,9 @@ use gguf_rs_lib::{builder::GGUFBuilder, format::MetadataValue};
 use model_launcher_core::{
     CatalogDebouncer, CatalogDiagnosticKind, CatalogIdentity, CatalogService, CatalogWatchEvent,
     CatalogWatcher, ConfigStore, ContextLength, LauncherConfig, MAX_CATALOG_DIAGNOSTICS,
-    MAX_DISCOVERED_GGUF_FILES, MAX_DISCOVERED_MODELS, ModelKey, ModelState, ReconcileOptions,
-    WATCH_MAX_BATCH_DIAGNOSTICS, catalog_watch_channel, catalog_watch_channel_with_limits,
-    reconcile_catalog, scan,
+    MAX_DISCOVERED_GGUF_FILES, MAX_DISCOVERED_MODELS, MAX_TOTAL_CATALOG_TENSORS, ModelKey,
+    ModelState, ReconcileOptions, WATCH_MAX_BATCH_DIAGNOSTICS, catalog_watch_channel,
+    catalog_watch_channel_with_limits, reconcile_catalog, scan,
 };
 use uuid::Uuid;
 
@@ -502,6 +502,40 @@ fn total_metadata_budget_and_diagnostic_count_are_bounded() {
             .iter()
             .any(|item| item.message.contains("total metadata entry budget"))
     );
+}
+
+#[test]
+fn cumulative_tensor_budget_is_incomplete_and_preserves_saved_config() {
+    fn header(tensors: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&tensors.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes
+    }
+    let models = TestDir::new();
+    models.file("existing.gguf", &tiny_gguf("Existing"));
+    let config = TestDir::new();
+    let store = ConfigStore::new(config.path());
+    let service = CatalogService::new(models.path(), store.clone());
+    let initial = service.reconcile_now().unwrap().config;
+    let per_file = MAX_TOTAL_CATALOG_TENSORS / 3;
+    for index in 0..4 {
+        models.file(&format!("tensor-budget-{index}.gguf"), &header(per_file));
+    }
+
+    let scanned = scan(models.path());
+    assert!(!scanned.complete);
+    assert!(
+        scanned
+            .diagnostics
+            .iter()
+            .any(|item| { item.message.contains("total tensor descriptor budget") })
+    );
+    let output = service.reconcile_scan(scanned).unwrap();
+    assert_eq!(output.config, initial);
+    assert_eq!(store.load().unwrap(), initial);
 }
 
 #[test]

@@ -247,6 +247,9 @@ pub const MAX_CATALOG_METADATA_ENTRIES: u64 = 16_384;
 pub const MAX_TOTAL_CATALOG_METADATA_ENTRIES: u64 = 65_536;
 /// Catalog tensor descriptor budget; catalog reads descriptors but never tensor payloads.
 pub const MAX_CATALOG_TENSORS: u64 = 100_000;
+/// Aggregate tensor descriptor budget across a scan. Catalog never reads tensor payloads, but the
+/// pinned GGUF reader still validates descriptors, so storms of otherwise-small files are capped.
+pub const MAX_TOTAL_CATALOG_TENSORS: u64 = 250_000;
 pub const MAX_CATALOG_METADATA_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_CATALOG_DECODED_METADATA_BYTES: usize = 8 * 1024 * 1024;
 
@@ -401,7 +404,10 @@ fn scan_impl(
         .map(|(key, _)| key)
         .collect::<HashSet<_>>();
     let mut consumed = HashSet::new();
-    let mut remaining_metadata_entries = MAX_TOTAL_CATALOG_METADATA_ENTRIES;
+    let mut budgets = ScanBudgets {
+        remaining_metadata_entries: MAX_TOTAL_CATALOG_METADATA_ENTRIES,
+        remaining_tensors: MAX_TOTAL_CATALOG_TENSORS,
+    };
     for path in &files {
         if consumed.contains(path) {
             continue;
@@ -526,7 +532,7 @@ fn scan_impl(
             launch_snapshot.before.size,
             launch_snapshot.before.identity.clone(),
             launch,
-            &mut remaining_metadata_entries,
+            &mut budgets,
             &mut model_diagnostics,
         );
         for diagnostic in model_diagnostics {
@@ -744,7 +750,7 @@ fn read_model(
     expected_launch_size: u64,
     identity: CatalogIdentity,
     file: &File,
-    remaining_metadata_entries: &mut u64,
+    budgets: &mut ScanBudgets,
     diagnostics: &mut Vec<CatalogDiagnostic>,
 ) -> Result<ScannedModel, CatalogDiagnostic> {
     let fallback = path
@@ -755,9 +761,19 @@ fn read_model(
         .expect("constant regex")
         .replace(fallback, "")
         .into_owned();
-    if let Some(message) = catalog_header_limit(file, remaining_metadata_entries) {
+    if let Some(limit) = catalog_header_limit(file, budgets) {
+        let (kind, message) = match limit {
+            CatalogHeaderLimit::Metadata(message) => (CatalogDiagnosticKind::Metadata, message),
+            CatalogHeaderLimit::Incomplete(message) => {
+                return Err(CatalogDiagnostic {
+                    kind: CatalogDiagnosticKind::Scan,
+                    path: path.to_path_buf(),
+                    message,
+                });
+            }
+        };
         diagnostics.push(CatalogDiagnostic {
-            kind: CatalogDiagnosticKind::Metadata,
+            kind,
             path: path.to_path_buf(),
             message,
         });
@@ -867,7 +883,17 @@ fn read_model(
     })
 }
 
-fn catalog_header_limit(file: &File, remaining_metadata_entries: &mut u64) -> Option<String> {
+enum CatalogHeaderLimit {
+    Metadata(String),
+    Incomplete(String),
+}
+
+struct ScanBudgets {
+    remaining_metadata_entries: u64,
+    remaining_tensors: u64,
+}
+
+fn catalog_header_limit(file: &File, budgets: &mut ScanBudgets) -> Option<CatalogHeaderLimit> {
     let mut reader = file;
     let mut header = [0_u8; 24];
     reader.seek(SeekFrom::Start(0)).ok()?;
@@ -878,21 +904,28 @@ fn catalog_header_limit(file: &File, remaining_metadata_entries: &mut u64) -> Op
     }
     let tensor_count = u64::from_le_bytes(header[8..16].try_into().ok()?);
     let metadata_count = u64::from_le_bytes(header[16..24].try_into().ok()?);
-    if metadata_count > MAX_CATALOG_METADATA_ENTRIES {
-        Some(format!(
-            "catalog metadata entry limit {MAX_CATALOG_METADATA_ENTRIES} exceeded by {metadata_count}"
-        ))
-    } else if tensor_count > MAX_CATALOG_TENSORS {
-        Some(format!(
+    if tensor_count > MAX_CATALOG_TENSORS {
+        Some(CatalogHeaderLimit::Metadata(format!(
             "catalog tensor count limit {MAX_CATALOG_TENSORS} exceeded by {tensor_count}"
-        ))
-    } else if metadata_count > *remaining_metadata_entries {
-        Some(format!(
-            "catalog total metadata entry budget {MAX_TOTAL_CATALOG_METADATA_ENTRIES} exhausted"
-        ))
+        )))
+    } else if tensor_count > budgets.remaining_tensors {
+        Some(CatalogHeaderLimit::Incomplete(format!(
+            "catalog total tensor descriptor budget {MAX_TOTAL_CATALOG_TENSORS} exhausted"
+        )))
     } else {
-        *remaining_metadata_entries -= metadata_count;
-        None
+        budgets.remaining_tensors -= tensor_count;
+        if metadata_count > MAX_CATALOG_METADATA_ENTRIES {
+            Some(CatalogHeaderLimit::Metadata(format!(
+                "catalog metadata entry limit {MAX_CATALOG_METADATA_ENTRIES} exceeded by {metadata_count}"
+            )))
+        } else if metadata_count > budgets.remaining_metadata_entries {
+            Some(CatalogHeaderLimit::Metadata(format!(
+                "catalog total metadata entry budget {MAX_TOTAL_CATALOG_METADATA_ENTRIES} exhausted"
+            )))
+        } else {
+            budgets.remaining_metadata_entries -= metadata_count;
+            None
+        }
     }
 }
 
