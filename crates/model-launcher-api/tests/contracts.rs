@@ -7,6 +7,7 @@ use axum::{
     routing::post,
 };
 use fake_llama_server::FakeServer;
+use futures_util::StreamExt as _;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
     ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest, TokenStore,
@@ -440,6 +441,9 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
         .await
         .unwrap();
     assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/models/not-found.json")).unwrap();
+    assert_eq!(unknown.json::<Value>().await.unwrap(), expected);
     let invalid = client
         .post(format!("{base}/api/v1/models/load"))
         .json(&json!({"model":"acme/tiny","context_length":0}))
@@ -486,6 +490,9 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
         .await
         .unwrap();
     assert_eq!(mismatch.status(), StatusCode::NOT_FOUND);
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/unload/not-found.json")).unwrap();
+    assert_eq!(mismatch.json::<Value>().await.unwrap(), expected);
     let unloaded = client
         .post(format!("{base}/api/v1/models/unload"))
         .json(&json!({"instance_id":"00000000-0000-0000-0000-000000000001"}))
@@ -649,14 +656,60 @@ async fn controllable_fake_upstream_preserves_split_non_utf8_sse_bytes() {
         .await
         .unwrap();
     assert_eq!(response.headers()["content-type"], "text/event-stream");
+    let chunks = response
+        .bytes_stream()
+        .map(|value| value.unwrap())
+        .collect::<Vec<_>>()
+        .await;
     assert_eq!(
-        response.bytes().await.unwrap(),
-        Bytes::from_static(b"data: a\xff\x00\n\n")
+        chunks,
+        vec![
+            Bytes::from_static(b"data: a"),
+            Bytes::from_static(b"\xff\x00\n"),
+            Bytes::from_static(b"\n")
+        ]
     );
     assert_eq!(upstream.control.requests(), 1);
     assert_eq!(upstream.control.stream_drops(), 1);
     stop(lifecycle, server).await;
     upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn bounded_request_spool_preserves_incoming_data_frame_sequence() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let (lifecycle, server) = start(Authentication::Disabled, upstream.base_url()).await;
+    let frames = vec![
+        Bytes::from_static(b"{\"model\":"),
+        Bytes::from_static(b"\"acme/tiny\","),
+        Bytes::from_static(b"\"prompt\":\"x\"}"),
+    ];
+    let expected = frames.iter().map(Bytes::len).collect::<Vec<_>>();
+    let body = reqwest::Body::wrap_stream(futures_util::stream::iter(
+        frames.into_iter().map(Ok::<_, std::io::Error>),
+    ));
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/completions", server.local_addr()))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(upstream.control.request_chunks(), expected);
+    stop(lifecycle, server).await;
+    upstream.stop().await.unwrap();
+}
+
+#[test]
+fn nullable_lm_metadata_is_present_as_null_not_omitted() {
+    let mut model = api_model();
+    model.architecture = None;
+    model.quantization = None;
+    model.params_string = None;
+    let value = serde_json::to_value(model_launcher_api::LmModel::from(&model)).unwrap();
+    assert!(value.get("architecture").is_some_and(Value::is_null));
+    assert!(value.get("quantization").is_some_and(Value::is_null));
+    assert!(value.get("params_string").is_some_and(Value::is_null));
 }
 
 #[tokio::test]
@@ -695,10 +748,9 @@ async fn lifecycle_http_matrix_jit_same_running_busy_and_unknown() {
         .await
         .unwrap();
     assert_eq!(busy.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        busy.json::<Value>().await.unwrap()["error"]["code"],
-        "model_busy"
-    );
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/load/model-busy.json")).unwrap();
+    assert_eq!(busy.json::<Value>().await.unwrap(), expected);
     let unknown = client
         .post(&url)
         .body(r#"{"model":"missing"}"#)
@@ -740,10 +792,9 @@ async fn zero_startup_budget_returns_model_starting_with_retry_after() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(response.headers()["retry-after"], "1");
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["error"]["code"],
-        "model_starting"
-    );
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/load/model-starting.json")).unwrap();
+    assert_eq!(response.json::<Value>().await.unwrap(), expected);
     stop(lifecycle, server).await;
 }
 
