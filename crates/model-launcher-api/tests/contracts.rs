@@ -489,3 +489,152 @@ async fn active_response_holds_connection_permit_and_overload_is_stable() {
     stop(lifecycle, server).await;
     upstream_task.abort();
 }
+
+struct DropSignal(Arc<tokio::sync::Notify>);
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn eject_active_stream_cancels_upstream_and_releases_lease_once() {
+    let stream_started = Arc::new(tokio::sync::Notify::new());
+    let upstream_dropped = Arc::new(tokio::sync::Notify::new());
+    let upstream = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let stream_started = stream_started.clone();
+            let upstream_dropped = upstream_dropped.clone();
+            move || {
+                let stream_started = stream_started.clone();
+                let guard = DropSignal(upstream_dropped.clone());
+                async move {
+                    let output =
+                        futures_util::stream::unfold((Some(guard), false), move |(guard, sent)| {
+                            let stream_started = stream_started.clone();
+                            async move {
+                                if !sent {
+                                    stream_started.notify_one();
+                                    Some((
+                                        Ok::<_, std::io::Error>(Bytes::from_static(
+                                            b"data: first\n\n",
+                                        )),
+                                        (guard, true),
+                                    ))
+                                } else {
+                                    std::future::pending().await
+                                }
+                            }
+                        });
+                    let mut response = Response::new(Body::from_stream(output));
+                    response.headers_mut().insert(
+                        "content-type",
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let endpoint = format!("http://{addr}");
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let mut response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/chat/completions",
+            server.local_addr()
+        ))
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    stream_started.notified().await;
+    assert_eq!(
+        response.chunk().await.unwrap().unwrap(),
+        Bytes::from_static(b"data: first\n\n")
+    );
+    assert_eq!(lifecycle.handle().snapshot().in_flight, 1);
+    lifecycle.handle().eject().await.unwrap();
+    let termination = response.chunk().await;
+    assert!(termination.is_err() || termination.unwrap().is_none());
+    upstream_dropped.notified().await;
+    assert_eq!(lifecycle.handle().snapshot().in_flight, 0);
+    drop(response);
+    tokio::task::yield_now().await;
+    assert_eq!(lifecycle.handle().snapshot().in_flight, 0);
+    stop(lifecycle, server).await;
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn client_disconnect_cancels_upstream_and_decrements_in_flight() {
+    let dropped = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let upstream = Router::new().route(
+        "/v1/completions",
+        post({
+            let dropped = dropped.clone();
+            let entered = entered.clone();
+            move || {
+                let guard = DropSignal(dropped.clone());
+                let entered = entered.clone();
+                async move {
+                    entered.notify_one();
+                    let stream = futures_util::stream::unfold(Some(guard), |guard| async move {
+                        let _keep_alive = &guard;
+                        std::future::pending::<
+                            Option<(Result<Bytes, std::io::Error>, Option<DropSignal>)>,
+                        >()
+                        .await
+                    });
+                    Response::new(Body::from_stream(stream))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let endpoint = format!("http://{address}");
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let request = tokio::spawn({
+        let url = format!("http://{}/v1/completions", server.local_addr());
+        async move {
+            reqwest::Client::new()
+                .post(url)
+                .body(r#"{"model":"acme/tiny"}"#)
+                .send()
+                .await
+        }
+    });
+    entered.notified().await;
+    assert_eq!(lifecycle.handle().snapshot().in_flight, 1);
+    request.abort();
+    dropped.notified().await;
+    let mut snapshots = lifecycle.subscribe();
+    while snapshots.borrow().in_flight != 0 {
+        snapshots.changed().await.unwrap();
+    }
+    assert_eq!(snapshots.borrow().in_flight, 0);
+    stop(lifecycle, server).await;
+    upstream_task.abort();
+}
