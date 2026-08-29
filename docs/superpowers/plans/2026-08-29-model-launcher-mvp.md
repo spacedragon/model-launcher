@@ -138,27 +138,27 @@ git commit -m "feat: persist versioned launcher configuration"
 - Modify: `crates/model-launcher-core/src/lib.rs`
 - Test: `crates/model-launcher-core/tests/lifecycle.rs`
 
-- [ ] **Step 1: Write paused-time lifecycle tests**
+- [x] **Step 1: Write paused-time lifecycle tests**
 
 Use `tokio::time::pause` and a scripted fake `InferenceEngine`. Cover stopped→starting→running, load readiness, replacement, replacement rejected while busy, explicit eject cancellation, crash backoff 1/2/4/8/16/30 seconds, five-minute reset, stale-generation suppression, and shared same-model JIT load.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-core --test lifecycle`
 
 Expected: fails because the lifecycle actor is missing.
 
-- [ ] **Step 3: Implement the actor**
+- [x] **Step 3: Implement the actor**
 
 Use one Tokio task receiving typed commands over `mpsc`; publish immutable snapshots through `watch`. Track desired model, generation, in-flight count, process handle, and restart attempt. Never hold a mutex across engine awaits.
 
-- [ ] **Step 4: Verify deterministic transitions**
+- [x] **Step 4: Verify deterministic transitions**
 
 Run: `cargo test -p model-launcher-core --test lifecycle -- --nocapture`
 
 Expected: all transition and paused-time tests pass without wall-clock sleeps.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/model-launcher-core
