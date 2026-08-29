@@ -195,6 +195,81 @@ async fn lists_match_pinned_semantics() {
 }
 
 #[tokio::test]
+async fn management_load_echo_unload_and_errors_match_contracts() {
+    let (lifecycle, server) = start(Authentication::Disabled, "http://127.0.0.1:1".into()).await;
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", server.local_addr());
+    let loaded = client
+        .post(format!("{base}/api/v1/models/load"))
+        .json(&json!({"model":"acme/tiny"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(loaded.status(), StatusCode::OK);
+    let mut loaded: Value = loaded.json().await.unwrap();
+    assert!(loaded.get("config").is_none());
+    loaded["load_time_seconds"] = json!(0.0);
+    let expected: Value = serde_json::from_str(include_str!("fixtures/load/success.json")).unwrap();
+    assert_eq!(loaded, expected);
+
+    let echoed = client
+        .post(format!("{base}/api/v1/models/load"))
+        .json(&json!({"model":"acme/tiny","context_length":4096,"flash_attention":true,"echo_load_config":true}))
+        .send().await.unwrap();
+    assert_eq!(echoed.status(), StatusCode::OK);
+    let mut echoed: Value = echoed.json().await.unwrap();
+    echoed["load_time_seconds"] = json!(0.0);
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/load/success-echo.json")).unwrap();
+    assert_eq!(echoed, expected);
+
+    let unknown = client
+        .post(format!("{base}/api/v1/models/load"))
+        .json(&json!({"model":"missing"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    let invalid = client
+        .post(format!("{base}/api/v1/models/load"))
+        .json(&json!({"model":"acme/tiny","context_length":0}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_setting"
+    );
+    let extra = client
+        .post(format!("{base}/api/v1/models/load"))
+        .json(&json!({"model":"acme/tiny","gpu":1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(extra.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let mismatch = client
+        .post(format!("{base}/api/v1/models/unload"))
+        .json(&json!({"instance_id":"wrong"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::NOT_FOUND);
+    let unloaded = client
+        .post(format!("{base}/api/v1/models/unload"))
+        .json(&json!({"instance_id":"00000000-0000-0000-0000-000000000001"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unloaded.status(), StatusCode::OK);
+    let expected: Value =
+        serde_json::from_str(include_str!("fixtures/unload/success.json")).unwrap();
+    assert_eq!(unloaded.json::<Value>().await.unwrap(), expected);
+    stop(lifecycle, server).await;
+}
+
+#[tokio::test]
 async fn authentication_failure_is_uniform() {
     let mut tokens = TokenStore::default();
     let plaintext = tokens.create().unwrap().plaintext;
