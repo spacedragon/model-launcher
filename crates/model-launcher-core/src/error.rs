@@ -18,6 +18,8 @@ pub enum AppError {
     EngineUnavailable,
     #[error("invalid setting: {0}")]
     InvalidSetting(&'static str),
+    #[error("invalid log limit: {0}")]
+    InvalidLogLimit(&'static str),
     #[error("engine process failed")]
     EngineProcess(#[source] BoxError),
     #[error("configuration I/O failed")]
@@ -37,6 +39,7 @@ impl AppError {
             Self::ModelLoadFailed(_) => "model_load_failed",
             Self::EngineUnavailable => "engine_unavailable",
             Self::InvalidSetting(_) => "invalid_setting",
+            Self::InvalidLogLimit(_) => "invalid_log_limit",
             Self::EngineProcess(_) => "engine_process",
             Self::ConfigIo(_) => "config_io",
             Self::ConfigFormat(_) => "config_format",
@@ -89,6 +92,10 @@ mod tests {
             (
                 AppError::InvalidSetting("context_length"),
                 "invalid_setting",
+            ),
+            (
+                AppError::InvalidLogLimit("broadcast_capacity"),
+                "invalid_log_limit",
             ),
             (
                 AppError::EngineProcess(Box::new(io::Error::other("process diagnostic"))),

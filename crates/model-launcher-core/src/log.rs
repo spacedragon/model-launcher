@@ -5,7 +5,7 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::ModelId;
+use crate::{AppError, ModelId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,10 +89,12 @@ pub struct LogStore {
 }
 
 impl LogStore {
-    #[must_use]
-    pub fn new(limits: LogStoreLimits) -> Self {
-        let (sender, _) = broadcast::channel(limits.broadcast_capacity.max(1));
-        Self {
+    pub fn new(limits: LogStoreLimits) -> Result<Self, AppError> {
+        if limits.broadcast_capacity == 0 {
+            return Err(AppError::InvalidLogLimit("broadcast_capacity"));
+        }
+        let (sender, _) = broadcast::channel(limits.broadcast_capacity);
+        Ok(Self {
             limits,
             records: Arc::new(Mutex::new(StoredRecords::default())),
             sender,
@@ -103,7 +105,7 @@ impl LogStore {
             bearer: Arc::new(
                 Regex::new(r"(?i)\bbearer\s+([^\s,;]+)").expect("bearer redaction regex is valid"),
             ),
-        }
+        })
     }
 
     pub fn append(&self, mut record: LogRecord) {
@@ -209,6 +211,7 @@ pub struct EngineLogFramer {
     model_id: Option<ModelId>,
     max_line_bytes: usize,
     pending: Vec<u8>,
+    pending_cr: bool,
     discarding_oversized: bool,
 }
 
@@ -230,6 +233,7 @@ impl EngineLogFramer {
             model_id,
             max_line_bytes,
             pending: Vec::with_capacity(max_line_bytes),
+            pending_cr: false,
             discarding_oversized: false,
         }
     }
@@ -242,18 +246,34 @@ impl EngineLogFramer {
                 }
                 continue;
             }
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    self.emit(timestamp_ms, false);
+                    continue;
+                }
+                if !self.push_content(b'\r', timestamp_ms) {
+                    if byte != b'\n' {
+                        self.discarding_oversized = true;
+                    }
+                    continue;
+                }
+            }
             if byte == b'\n' {
                 self.emit(timestamp_ms, false);
-            } else if self.pending.len() < self.max_line_bytes {
-                self.pending.push(byte);
+            } else if byte == b'\r' {
+                self.pending_cr = true;
             } else {
-                self.emit(timestamp_ms, true);
-                self.discarding_oversized = true;
+                self.push_content(byte, timestamp_ms);
             }
         }
     }
 
     pub fn finish(&mut self, timestamp_ms: u64) {
+        if self.pending_cr {
+            self.pending_cr = false;
+            self.push_content(b'\r', timestamp_ms);
+        }
         if !self.pending.is_empty() {
             self.emit(timestamp_ms, false);
         }
@@ -266,9 +286,6 @@ impl EngineLogFramer {
     }
 
     fn emit(&mut self, timestamp_ms: u64, truncated: bool) {
-        if self.pending.last() == Some(&b'\r') {
-            self.pending.pop();
-        }
         let message = String::from_utf8_lossy(&self.pending).into_owned();
         self.pending.clear();
         self.store.append(LogRecord {
@@ -280,5 +297,16 @@ impl EngineLogFramer {
             message,
             truncated,
         });
+    }
+
+    fn push_content(&mut self, byte: u8, timestamp_ms: u64) -> bool {
+        if self.pending.len() < self.max_line_bytes {
+            self.pending.push(byte);
+            true
+        } else {
+            self.emit(timestamp_ms, true);
+            self.discarding_oversized = true;
+            false
+        }
     }
 }
