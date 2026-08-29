@@ -37,37 +37,43 @@ pub enum CatalogIdentity {
 impl CatalogIdentity {
     #[must_use]
     pub fn for_path(path: &Path) -> Self {
-        let Ok(_metadata) = fs::metadata(path) else {
+        let Ok(file) = File::open(path) else {
             return Self::Unavailable;
         };
+        Self::for_file(&file)
+    }
+
+    fn for_file(file: &File) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let Ok(metadata) = file.metadata() else {
+                return Self::Unavailable;
+            };
             Self::Unix {
-                device: _metadata.dev(),
-                inode: _metadata.ino(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
             }
         }
         #[cfg(windows)]
         {
-            windows_identity(path).unwrap_or(Self::Unavailable)
+            windows_identity(file).unwrap_or(Self::Unavailable)
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = _metadata;
+            let _ = file;
             Self::Unavailable
         }
     }
 }
 
 #[cfg(windows)]
-fn windows_identity(path: &Path) -> Option<CatalogIdentity> {
+fn windows_identity(file: &File) -> Option<CatalogIdentity> {
     use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
     };
 
-    let file = File::open(path).ok()?;
     let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
     // SAFETY: the handle remains open for the call and Windows initializes the output on success.
     let success =
@@ -127,6 +133,14 @@ pub struct ScanResult {
 /// traversal through a link outside the configured root. Entry failures are retained as diagnostics.
 #[must_use]
 pub fn scan(root: &Path) -> ScanResult {
+    scan_with_hook(root, &|_| {})
+}
+
+/// Scans with a hook after each logical model's shard handles are opened and snapshotted.
+/// The hook is an injection seam for deterministic filesystem replacement tests.
+#[doc(hidden)]
+#[must_use]
+pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResult {
     let mut result = ScanResult::default();
     let root_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
@@ -218,53 +232,108 @@ pub fn scan(root: &Path) -> ScanResult {
             }
         }
         consumed.extend(logical_files.iter().cloned());
-        let mut size_bytes = 0_u64;
-        let mut launch_size_bytes = None;
-        let mut size_error = None;
+        let mut opened = Vec::with_capacity(logical_files.len());
+        let mut open_error = None;
         for shard_path in &logical_files {
-            match fs::metadata(shard_path) {
-                Ok(metadata) => {
-                    if let Err(error) = File::open(shard_path) {
-                        size_error = Some(scan_diagnostic(shard_path, error));
-                        break;
-                    }
-                    if shard_path == path {
-                        launch_size_bytes = Some(metadata.len());
-                    }
-                    size_bytes = size_bytes.saturating_add(metadata.len());
-                }
+            match OpenedShard::open(shard_path) {
+                Ok(shard) => opened.push(shard),
                 Err(error) => {
-                    size_error = Some(scan_diagnostic(shard_path, error));
+                    open_error = Some(error);
                     break;
                 }
             }
         }
-        if let Some(diagnostic) = size_error {
+        if let Some(diagnostic) = open_error {
             result.complete = false;
             result.diagnostics.push(diagnostic);
             continue;
         }
-        match File::open(path) {
-            Ok(file) => match read_model(
-                path,
-                size_bytes,
-                launch_size_bytes.unwrap_or_default(),
-                file,
-                &mut result.diagnostics,
-            ) {
-                Ok(model) => result.models.push(model),
-                Err(diagnostic) => {
-                    result.complete = false;
-                    result.diagnostics.push(diagnostic);
-                }
-            },
-            Err(error) => {
+        after_open(&logical_files);
+        let size_bytes = opened.iter().map(|shard| shard.before.size).sum();
+        let launch = &opened[0];
+        let parsed = read_model(
+            path,
+            size_bytes,
+            launch.before.size,
+            launch.before.identity.clone(),
+            &launch.file,
+            &mut result.diagnostics,
+        );
+        let validation_error = opened.iter().find_map(OpenedShard::validate_unchanged);
+        if let Some(diagnostic) = validation_error {
+            result.complete = false;
+            result.diagnostics.push(diagnostic);
+            continue;
+        }
+        match parsed {
+            Ok(model) => result.models.push(model),
+            Err(diagnostic) => {
                 result.complete = false;
-                result.diagnostics.push(scan_diagnostic(path, error));
+                result.diagnostics.push(diagnostic);
             }
         }
     }
     result
+}
+
+struct FileSnapshot {
+    size: u64,
+    modified: std::time::SystemTime,
+    identity: CatalogIdentity,
+}
+
+struct OpenedShard {
+    path: PathBuf,
+    file: File,
+    before: FileSnapshot,
+}
+
+impl OpenedShard {
+    fn open(path: &Path) -> Result<Self, CatalogDiagnostic> {
+        let file = File::open(path).map_err(|error| scan_diagnostic(path, error))?;
+        let before = snapshot(&file, path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            before,
+        })
+    }
+
+    fn validate_unchanged(&self) -> Option<CatalogDiagnostic> {
+        let after = match snapshot(&self.file, &self.path) {
+            Ok(snapshot) => snapshot,
+            Err(diagnostic) => return Some(diagnostic),
+        };
+        let path_identity = CatalogIdentity::for_path(&self.path);
+        if after.size != self.before.size
+            || after.modified != self.before.modified
+            || after.identity != self.before.identity
+            || (self.before.identity != CatalogIdentity::Unavailable
+                && path_identity != self.before.identity)
+        {
+            Some(CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: self.path.clone(),
+                message: "model shard changed while it was being scanned".into(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn snapshot(file: &File, path: &Path) -> Result<FileSnapshot, CatalogDiagnostic> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| scan_diagnostic(path, error))?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| scan_diagnostic(path, error))?;
+    Ok(FileSnapshot {
+        size: metadata.len(),
+        modified,
+        identity: CatalogIdentity::for_file(file),
+    })
 }
 
 fn scan_diagnostic(path: &Path, error: std::io::Error) -> CatalogDiagnostic {
@@ -285,7 +354,8 @@ fn read_model(
     path: &Path,
     size_bytes: u64,
     expected_launch_size: u64,
-    file: File,
+    identity: CatalogIdentity,
+    file: &File,
     diagnostics: &mut Vec<CatalogDiagnostic>,
 ) -> Result<ScannedModel, CatalogDiagnostic> {
     let fallback = path
@@ -323,7 +393,7 @@ fn read_model(
                 .and_then(|arch| integer(&format!("{arch}.context_length")));
             let quantization = match integer("general.file_type") {
                 Some(value) => {
-                    let (display, known) = ggml_file_type(value);
+                    let (display, known) = llama_file_type(value);
                     if !known {
                         diagnostics.push(CatalogDiagnostic {
                             kind: CatalogDiagnosticKind::Metadata,
@@ -380,23 +450,24 @@ fn read_model(
         display_name,
         path: path.to_path_buf(),
         size_bytes,
-        identity: CatalogIdentity::for_path(path),
+        identity,
         metadata,
     })
 }
 
-fn ggml_file_type(value: u64) -> (String, bool) {
+fn llama_file_type(value: u64) -> (String, bool) {
+    // Compatibility snapshot: llama.cpp include/llama.h `enum llama_ftype` at
+    // cc83d7b4824f73cfdda4dfbb47ee39804f71b328 (captured 2026-08-29).
+    // These are model file types, not ggml tensor type enum values.
     let display = match value {
         0 => "F32",
         1 => "F16",
         2 => "Q4_0",
         3 => "Q4_1",
-        4 => "Q4_2",
-        5 => "Q4_3",
-        6 => "Q5_0",
-        7 => "Q5_1",
-        8 => "Q8_0",
-        9 => "Q8_1",
+        4 => "Q4_1_SOME_F16",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
         10 => "Q2_K",
         11 => "Q3_K_S",
         12 => "Q3_K_M",
@@ -408,17 +479,24 @@ fn ggml_file_type(value: u64) -> (String, bool) {
         18 => "Q6_K",
         19 => "IQ2_XXS",
         20 => "IQ2_XS",
-        21 => "IQ3_XXS",
-        22 => "IQ1_S",
-        23 => "IQ4_NL",
-        24 => "IQ3_S",
-        25 => "IQ2_S",
-        26 => "IQ4_XS",
-        27 => "IQ1_M",
-        28 => "BF16",
-        29 => "TQ1_0",
-        30 => "TQ2_0",
-        31 => "MXFP4",
+        21 => "Q2_K_S",
+        22 => "IQ3_XS",
+        23 => "IQ3_XXS",
+        24 => "IQ1_S",
+        25 => "IQ4_NL",
+        26 => "IQ3_S",
+        27 => "IQ3_M",
+        28 => "IQ2_S",
+        29 => "IQ2_M",
+        30 => "IQ4_XS",
+        31 => "IQ1_M",
+        32 => "BF16",
+        36 => "TQ1_0",
+        37 => "TQ2_0",
+        38 => "MXFP4_MOE",
+        39 => "NVFP4",
+        40 => "Q1_0",
+        41 => "Q2_0",
         _ => return (format!("FILE_TYPE_{value}"), false),
     };
     (display.into(), true)
@@ -608,8 +686,12 @@ impl CatalogService {
     }
 
     pub fn reconcile_now(&self) -> Result<ReconcileResult, AppError> {
-        let saved = self.store.load()?;
         let scanned = scan(&self.root);
+        self.reconcile_scan(scanned)
+    }
+
+    pub fn reconcile_scan(&self, scanned: ScanResult) -> Result<ReconcileResult, AppError> {
+        let saved = self.store.load()?;
         let complete = scanned.complete;
         let output = reconcile_catalog(&saved, scanned, ReconcileOptions::default());
         if complete {

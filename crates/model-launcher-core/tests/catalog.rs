@@ -168,17 +168,22 @@ fn standard_file_types_have_stable_display_names() {
         (1, "F16"),
         (2, "Q4_0"),
         (3, "Q4_1"),
-        (6, "Q5_0"),
-        (7, "Q5_1"),
-        (8, "Q8_0"),
+        (4, "Q4_1_SOME_F16"),
+        (7, "Q8_0"),
+        (8, "Q5_0"),
+        (9, "Q5_1"),
         (10, "Q2_K"),
         (12, "Q3_K_M"),
         (15, "Q4_K_M"),
         (17, "Q5_K_M"),
         (18, "Q6_K"),
         (19, "IQ2_XXS"),
-        (23, "IQ4_NL"),
-        (27, "IQ1_M"),
+        (23, "IQ3_XXS"),
+        (31, "IQ1_M"),
+        (32, "BF16"),
+        (36, "TQ1_0"),
+        (37, "TQ2_0"),
+        (38, "MXFP4_MOE"),
     ];
     for (value, expected) in cases {
         let bytes = GGUFBuilder::new()
@@ -283,6 +288,31 @@ fn unreadable_discovered_file_makes_scan_incomplete_without_partial_model() {
         assert!(result.models.is_empty());
         assert!(result.diagnostics.iter().any(|item| item.path == path));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_replacement_after_open_is_incomplete_and_never_saved() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let models = TestDir::new();
+    let path = models.file("model.gguf", &tiny_gguf("Original"));
+    let config = TestDir::new();
+    let store = ConfigStore::new(config.path());
+    let service = CatalogService::new(models.path(), store.clone());
+    let initial = service.reconcile_now().unwrap();
+    let replacement = models.file("replacement.tmp", &tiny_gguf("Replacement"));
+    let replaced = AtomicBool::new(false);
+
+    let scanned = model_launcher_core::scan_with_hook(models.path(), &|opened| {
+        if opened.contains(&path) && !replaced.swap(true, Ordering::SeqCst) {
+            fs::rename(&replacement, &path).unwrap();
+        }
+    });
+    assert!(!scanned.complete);
+    assert!(scanned.models.is_empty());
+    let output = service.reconcile_scan(scanned).unwrap();
+    assert_eq!(output.config, initial.config);
+    assert_eq!(store.load().unwrap(), initial.config);
 }
 
 #[cfg(unix)]
