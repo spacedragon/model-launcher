@@ -203,6 +203,7 @@ enum StartOutcome {
     ValidationFailed(AppError),
     LoadFailed(AppError),
     Cancelled,
+    CleanupFailed(String),
 }
 
 enum ReadinessOutcome {
@@ -255,34 +256,46 @@ async fn launch_process(
     // is instead cleaned up below before the task exits.
     let mut process = match engine.spawn(&model, &model.launch_profile.settings).await {
         Ok(process) => process,
+        Err(_error) if *cancelled.borrow() => return StartOutcome::Cancelled,
         Err(error) => return StartOutcome::LoadFailed(error),
     };
     if *cancelled.borrow() {
-        stop_owned_process(&mut *process).await;
-        return StartOutcome::Cancelled;
+        return match stop_owned_process(&mut *process).await {
+            Ok(()) => StartOutcome::Cancelled,
+            Err(error) => StartOutcome::CleanupFailed(error.to_string()),
+        };
     }
 
     match await_readiness(&mut *process, &mut cancelled).await {
         ReadinessOutcome::Ready => StartOutcome::Ready(process),
-        ReadinessOutcome::Failed(error) => {
-            stop_owned_process(&mut *process).await;
-            StartOutcome::LoadFailed(error)
-        }
-        ReadinessOutcome::TimedOut => {
-            stop_owned_process(&mut *process).await;
-            StartOutcome::LoadFailed(load_error("engine readiness timed out"))
-        }
-        ReadinessOutcome::Cancelled => {
-            stop_owned_process(&mut *process).await;
-            StartOutcome::Cancelled
-        }
+        ReadinessOutcome::Failed(error) => match stop_owned_process(&mut *process).await {
+            Ok(()) => StartOutcome::LoadFailed(error),
+            Err(stop) => StartOutcome::CleanupFailed(stop.to_string()),
+        },
+        ReadinessOutcome::TimedOut => match stop_owned_process(&mut *process).await {
+            Ok(()) => StartOutcome::LoadFailed(load_error("engine readiness timed out")),
+            Err(stop) => StartOutcome::CleanupFailed(stop.to_string()),
+        },
+        ReadinessOutcome::Cancelled => match stop_owned_process(&mut *process).await {
+            Ok(()) => StartOutcome::Cancelled,
+            Err(error) => StartOutcome::CleanupFailed(error.to_string()),
+        },
     }
 }
 
-async fn stop_owned_process(process: &mut dyn EngineProcess) {
+async fn stop_owned_process(process: &mut dyn EngineProcess) -> Result<(), AppError> {
     if graceful_result(process).await.is_err() {
-        let _ = process.force_shutdown().await;
+        match tokio::time::timeout(STOP_TIMEOUT, process.force_shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(AppError::EngineProcess(Box::new(io::Error::other(
+                    "force shutdown timed out",
+                ))));
+            }
+        }
     }
+    Ok(())
 }
 
 async fn select_exit(
@@ -385,9 +398,27 @@ impl Actor {
             model.clone(),
             cancelled,
         ));
+        let mut cancelling = false;
+        let mut shutdown_after_cancel = false;
+        let mut stop_waiters = Vec::new();
         loop {
             tokio::select! {
                 outcome = &mut launch => match outcome.unwrap_or_else(|error| StartOutcome::LoadFailed(load_error(&error.to_string()))) {
+                    StartOutcome::Ready(mut process) if cancelling => {
+                        launch = tokio::spawn(async move {
+                            match stop_owned_process(&mut *process).await {
+                                Ok(()) => StartOutcome::Cancelled,
+                                Err(error) => StartOutcome::CleanupFailed(error.to_string()),
+                            }
+                        });
+                        continue;
+                    }
+                    StartOutcome::ValidationFailed(_) | StartOutcome::LoadFailed(_) if cancelling => {
+                        fail_cancelled(loads, acquires);
+                        self.clear_desired();
+                        send_stop_waiters(stop_waiters, None);
+                        return !shutdown_after_cancel;
+                    }
                     StartOutcome::Ready(process) => {
                         self.snapshot.process = Some(ProcessContext { model_id: model.id, generation });
                         self.set_state(LifecycleState::Running);
@@ -411,10 +442,25 @@ impl Actor {
                     }
                     StartOutcome::Cancelled => {
                         fail_cancelled(loads, acquires);
-                        return true;
+                        self.clear_desired();
+                        send_stop_waiters(stop_waiters, None);
+                        return !shutdown_after_cancel;
+                    }
+                    StartOutcome::CleanupFailed(diagnostic) => {
+                        fail_cancelled(loads, acquires);
+                        send_stop_waiters(stop_waiters, Some(&diagnostic));
+                        self.snapshot.diagnostic = Some(diagnostic);
+                        self.set_state(LifecycleState::Stopping);
+                        return self.failed_stop().await;
                     }
                 },
                 command = self.commands.recv() => match command {
+                    Some(Command::Load { reply, .. }) if cancelling => {
+                        let _ = reply.send(Err(AppError::ModelStarting));
+                    }
+                    Some(Command::Acquire { reply, .. }) if cancelling => {
+                        let _ = reply.send(Err(AppError::ModelStarting));
+                    }
                     Some(Command::Load { model: same, reply }) if same.id == model.id => {
                         loads.push(reply)
                     }
@@ -423,17 +469,16 @@ impl Actor {
                     }
                     Some(Command::Eject { reply }) => {
                         cancel.send_replace(true);
-                        self.clear_desired();
-                        fail_cancelled(loads, acquires);
-                        let _ = reply.send(Ok(()));
-                        return true;
+                        cancelling = true;
+                        self.set_state(LifecycleState::Stopping);
+                        stop_waiters.push(reply);
                     }
                     Some(Command::Shutdown { reply }) => {
                         cancel.send_replace(true);
-                        self.clear_desired();
-                        fail_cancelled(loads, acquires);
-                        let _ = reply.send(Ok(()));
-                        return false;
+                        cancelling = true;
+                        shutdown_after_cancel = true;
+                        self.set_state(LifecycleState::Stopping);
+                        stop_waiters.push(reply);
                     }
                     Some(Command::Load { reply, .. }) => {
                         let _ = reply.send(Err(AppError::ModelStarting));
@@ -487,8 +532,14 @@ impl Actor {
                         if self.snapshot.in_flight > 0 {
                             let _ = reply.send(Err(AppError::ModelBusy));
                         } else {
-                            let directive = self.stop_process(&mut *process).await;
+                            let (directive, failure) = self.stop_process(&mut *process).await;
                             self.failures = 0;
+                            if let Some(diagnostic) = failure {
+                                let _ = reply.send(Err(stop_error(&diagnostic)));
+                                self.snapshot.diagnostic = Some(diagnostic);
+                                self.set_state(LifecycleState::Stopping);
+                                return self.failed_stop().await;
+                            }
                             if directive != StopDirective::Continue {
                                 let _ = reply.send(Err(load_error("replacement cancelled")));
                                 self.clear_desired();
@@ -511,14 +562,26 @@ impl Actor {
                     Some(Command::Release { .. }) => {}
                     Some(Command::Eject { reply }) => {
                         self.cancel_leases();
-                        let directive = self.stop_process(&mut *process).await;
+                        let (directive, failure) = self.stop_process(&mut *process).await;
+                        if let Some(diagnostic) = failure {
+                            let _ = reply.send(Err(stop_error(&diagnostic)));
+                            self.snapshot.diagnostic = Some(diagnostic);
+                            self.set_state(LifecycleState::Stopping);
+                            return self.failed_stop().await;
+                        }
                         self.clear_desired();
                         let _ = reply.send(Ok(()));
                         return directive != StopDirective::Shutdown;
                     }
                     Some(Command::Shutdown { reply }) => {
                         self.cancel_leases();
-                        self.stop_process(&mut *process).await;
+                        let (_, failure) = self.stop_process(&mut *process).await;
+                        if let Some(diagnostic) = failure {
+                            let _ = reply.send(Err(stop_error(&diagnostic)));
+                            self.snapshot.diagnostic = Some(diagnostic);
+                            self.set_state(LifecycleState::Stopping);
+                            return self.failed_stop().await;
+                        }
                         self.clear_desired();
                         let _ = reply.send(Ok(()));
                         return false;
@@ -575,6 +638,33 @@ impl Actor {
         }
     }
 
+    async fn failed_stop(&mut self) -> bool {
+        let diagnostic = self
+            .snapshot
+            .diagnostic
+            .clone()
+            .unwrap_or_else(|| "process stop was not confirmed".to_owned());
+        while let Some(command) = self.commands.recv().await {
+            match command {
+                Command::Load { reply, .. } => {
+                    let _ = reply.send(Err(AppError::ModelStarting));
+                }
+                Command::Acquire { reply, .. } => {
+                    let _ = reply.send(Err(AppError::ModelStarting));
+                }
+                Command::Release { id, .. } => {
+                    if self.active_leases.remove(&id) {
+                        self.sync_in_flight();
+                    }
+                }
+                Command::Eject { reply } | Command::Shutdown { reply } => {
+                    let _ = reply.send(Err(stop_error(&diagnostic)));
+                }
+            }
+        }
+        false
+    }
+
     fn grant_acquires(
         &mut self,
         acquires: &mut Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
@@ -614,9 +704,13 @@ impl Actor {
         self.sync_in_flight();
     }
 
-    async fn stop_process(&mut self, process: &mut dyn EngineProcess) -> StopDirective {
+    async fn stop_process(
+        &mut self,
+        process: &mut dyn EngineProcess,
+    ) -> (StopDirective, Option<String>) {
         self.set_state(LifecycleState::Stopping);
         let mut directive = StopDirective::Continue;
+        let mut waiters = Vec::new();
         let force = {
             let graceful = process.graceful_shutdown();
             tokio::pin!(graceful);
@@ -631,42 +725,79 @@ impl Actor {
                 match event {
                     StopEvent::Graceful(result) => break result.is_err(),
                     StopEvent::Timeout => break true,
-                    StopEvent::Command(Some(Command::Release { id, .. })) => {
-                        if self.active_leases.remove(&id) {
-                            self.sync_in_flight();
-                        }
-                    }
-                    StopEvent::Command(Some(Command::Eject { reply })) => {
-                        if directive != StopDirective::Shutdown {
-                            directive = StopDirective::Cancel;
-                        }
-                        self.desired = None;
-                        self.publish();
-                        let _ = reply.send(Ok(()));
-                    }
-                    StopEvent::Command(Some(Command::Shutdown { reply })) => {
-                        directive = StopDirective::Shutdown;
-                        self.desired = None;
-                        self.publish();
-                        let _ = reply.send(Ok(()));
-                    }
-                    StopEvent::Command(Some(Command::Load { reply, .. })) => {
-                        let _ = reply.send(Err(AppError::ModelStarting));
-                    }
-                    StopEvent::Command(Some(Command::Acquire { reply, .. })) => {
-                        let _ = reply.send(Err(AppError::ModelStarting));
-                    }
-                    StopEvent::Command(None) => {
-                        directive = StopDirective::Shutdown;
+                    StopEvent::Command(command) => {
+                        self.handle_stop_command(command, &mut directive, &mut waiters)
                     }
                 }
             }
         };
+        let mut failure = None;
         if force {
-            let _ = process.force_shutdown().await;
+            let forced = {
+                let force = process.force_shutdown();
+                tokio::pin!(force);
+                let timeout = tokio::time::sleep(STOP_TIMEOUT);
+                tokio::pin!(timeout);
+                loop {
+                    let event = tokio::select! {
+                        result = &mut force => StopEvent::Graceful(result),
+                        () = &mut timeout => StopEvent::Timeout,
+                        command = self.commands.recv() => StopEvent::Command(command),
+                    };
+                    match event {
+                        StopEvent::Graceful(result) => {
+                            break result.map_err(|error| error.to_string());
+                        }
+                        StopEvent::Timeout => break Err("force shutdown timed out".to_owned()),
+                        StopEvent::Command(command) => {
+                            self.handle_stop_command(command, &mut directive, &mut waiters)
+                        }
+                    }
+                }
+            };
+            failure = forced.err();
         }
-        self.snapshot.process = None;
-        directive
+        if failure.is_none() {
+            self.snapshot.process = None;
+        }
+        send_stop_waiters(waiters, failure.as_deref());
+        (directive, failure)
+    }
+
+    fn handle_stop_command(
+        &mut self,
+        command: Option<Command>,
+        directive: &mut StopDirective,
+        waiters: &mut Vec<oneshot::Sender<Result<(), AppError>>>,
+    ) {
+        match command {
+            Some(Command::Release { id, .. }) => {
+                if self.active_leases.remove(&id) {
+                    self.sync_in_flight();
+                }
+            }
+            Some(Command::Eject { reply }) => {
+                if *directive != StopDirective::Shutdown {
+                    *directive = StopDirective::Cancel;
+                }
+                self.desired = None;
+                self.publish();
+                waiters.push(reply);
+            }
+            Some(Command::Shutdown { reply }) => {
+                *directive = StopDirective::Shutdown;
+                self.desired = None;
+                self.publish();
+                waiters.push(reply);
+            }
+            Some(Command::Load { reply, .. }) => {
+                let _ = reply.send(Err(AppError::ModelStarting));
+            }
+            Some(Command::Acquire { reply, .. }) => {
+                let _ = reply.send(Err(AppError::ModelStarting));
+            }
+            None => *directive = StopDirective::Shutdown,
+        }
     }
 
     fn clear_desired(&mut self) {
@@ -703,6 +834,20 @@ fn fail_waiters_shared(
     for reply in acquires {
         let _ = reply.send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
     }
+}
+
+fn send_stop_waiters(
+    waiters: Vec<oneshot::Sender<Result<(), AppError>>>,
+    diagnostic: Option<&str>,
+) {
+    for reply in waiters {
+        let result = diagnostic.map_or_else(|| Ok(()), |message| Err(stop_error(message)));
+        let _ = reply.send(result);
+    }
+}
+
+fn stop_error(diagnostic: &str) -> AppError {
+    AppError::EngineProcess(Box::new(io::Error::other(diagnostic.to_owned())))
 }
 
 fn fail_waiters(
