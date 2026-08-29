@@ -466,6 +466,7 @@ async fn run_server(
     mut stop: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
+    let (connection_stop, _) = tokio::sync::watch::channel(false);
     loop {
         let accepted = tokio::select! {
             _ = &mut stop => break,
@@ -485,6 +486,7 @@ async fn run_server(
             Err(error) => return Err(error),
         };
         let app = router.clone();
+        let mut connection_stop = connection_stop.subscribe();
         connections.spawn(async move {
             let service = hyper::service::service_fn(
                 move |request: hyper::Request<hyper::body::Incoming>| {
@@ -492,12 +494,17 @@ async fn run_server(
                     async move { app.oneshot(request.map(Body::new)).await }
                 },
             );
-            let _ = hyper::server::conn::http1::Builder::new()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                .await;
+            let connection = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            tokio::pin!(connection);
+            tokio::select! {
+                _ = &mut connection => {},
+                _ = connection_stop.changed() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; }
+            }
             drop(permit);
         });
     }
+    let _ = connection_stop.send(true);
     while connections.join_next().await.is_some() {}
     Ok(())
 }
