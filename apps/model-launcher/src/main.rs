@@ -2,7 +2,7 @@ use model_launcher::{EngineSettingsManager, Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
-use model_launcher_wsl::{LlamaCppWslEngine, TokioCommandRunner};
+use model_launcher_wsl::{LlamaCppWslEngine, ProbeCache, TokioCommandRunner, WslProber};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,13 +25,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shutdown_timeout: Duration::from_secs(10),
     };
     let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
+    let runner = Arc::new(TokioCommandRunner::with_log_store(logs.clone(), None, None));
     let engine = Arc::new(LlamaCppWslEngine::new(
         std::env::var("MODEL_LAUNCHER_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu".into()),
         std::env::var("MODEL_LAUNCHER_LLAMA_SERVER")
             .unwrap_or_else(|_| "/usr/local/bin/llama-server".into()),
-        Arc::new(TokioCommandRunner::with_log_store(logs.clone(), None, None)),
+        runner.clone(),
     ));
-    let settings_manager = Arc::new(ProductionEngineSettings(engine.clone()));
+    let settings_manager = Arc::new(ProductionEngineSettings {
+        engine: engine.clone(),
+        probe: ProbeCache::new(
+            base.join("config/engine-probe.json"),
+            WslProber::new(runner),
+        ),
+    });
     let service = runtime.block_on(Service::start_with_desktop_dependencies(
         options.clone(),
         engine,
@@ -164,7 +171,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-struct ProductionEngineSettings(Arc<LlamaCppWslEngine>);
+struct ProductionEngineSettings {
+    engine: Arc<LlamaCppWslEngine>,
+    probe: ProbeCache,
+}
 
 #[async_trait::async_trait]
 impl EngineSettingsManager for ProductionEngineSettings {
@@ -173,15 +183,15 @@ impl EngineSettingsManager for ProductionEngineSettings {
         distribution: &str,
         executable: &str,
     ) -> Result<model_launcher_core::EngineCapabilities, String> {
-        self.0
-            .validate_settings(distribution, executable)
+        self.probe
+            .refresh(distribution, executable)
             .await
             .map(|snapshot| snapshot.capabilities)
             .map_err(|error| error.to_string())
     }
 
     fn apply(&self, distribution: String, executable: String) {
-        self.0.apply_settings(distribution, executable);
+        self.engine.apply_settings(distribution, executable);
     }
 }
 
