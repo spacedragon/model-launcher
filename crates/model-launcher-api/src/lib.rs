@@ -100,6 +100,8 @@ pub struct GatewayLimits {
     pub max_in_flight_requests: usize,
     pub startup_timeout: Duration,
     pub shutdown_grace: Duration,
+    pub upstream_connect_timeout: Duration,
+    pub upstream_header_timeout: Duration,
 }
 
 impl Default for GatewayLimits {
@@ -112,6 +114,8 @@ impl Default for GatewayLimits {
             max_in_flight_requests: 128,
             startup_timeout: Duration::from_secs(30),
             shutdown_grace: Duration::from_secs(5),
+            upstream_connect_timeout: Duration::from_secs(5),
+            upstream_header_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -209,6 +213,8 @@ impl Gateway {
     ) -> Result<Self, GatewayConfigError> {
         let _warnings = config.validate();
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(config.limits.upstream_connect_timeout)
             .build()
             .expect("reqwest client configuration is valid");
         Ok(Self {
@@ -312,18 +318,29 @@ impl Drop for GatewayServer {
 async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let allowed = match &state.authentication {
         Authentication::Disabled => true,
-        Authentication::Tokens(tokens) => request
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|token| tokens.verify(token)),
+        Authentication::Tokens(tokens) => {
+            match bearer_token(request.headers().get(header::AUTHORIZATION)) {
+                Some(token) => tokens.verify(token).await,
+                None => false,
+            }
+        }
     };
     if allowed {
         next.run(request).await
     } else {
         ApiError::unauthorized().into_response()
     }
+}
+
+fn bearer_token(value: Option<&axum::http::HeaderValue>) -> Option<&str> {
+    let value = value?.to_str().ok()?;
+    let mut parts = value.split_ascii_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some(token)
 }
 
 async fn limit_headers(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -335,7 +352,11 @@ async fn limit_headers(State(state): State<AppState>, request: Request, next: Ne
     if request.headers().len() > state.limits.max_headers
         || header_bytes.is_none_or(|bytes| bytes > state.limits.max_header_bytes)
     {
-        ApiError::headers("too_many_headers", "too many request headers").into_response()
+        ApiError::headers(
+            "header_limits_exceeded",
+            "request headers exceed configured limits",
+        )
+        .into_response()
     } else {
         next.run(request).await
     }

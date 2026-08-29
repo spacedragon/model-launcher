@@ -15,11 +15,15 @@ pub(crate) async fn proxy(
 ) -> Result<Response<Body>, ApiError> {
     let (parts, body) = request.into_parts();
     if parts.headers.len() > state.limits.max_headers {
-        return Err(ApiError::payload(
-            "too_many_headers",
+        return Err(ApiError::headers(
+            "header_limits_exceeded",
             "too many request headers",
         ));
     }
+    let permit =
+        state.connections.clone().try_acquire_owned().map_err(|_| {
+            ApiError::unavailable("connection_limit", "too many active connections")
+        })?;
     let mut incoming = body.into_data_stream();
     let mut chunks = Vec::new();
     let mut total = 0_usize;
@@ -37,11 +41,7 @@ pub(crate) async fn proxy(
         }
         chunks.push(chunk);
     }
-    let mut spool = Vec::with_capacity(total);
-    for chunk in &chunks {
-        spool.extend_from_slice(chunk);
-    }
-    let parsed: Value = serde_json::from_slice(&spool)
+    let parsed: Value = serde_json::from_reader(ChunkReader::new(&chunks))
         .map_err(|_| ApiError::bad_request("invalid_request", "request body is not valid JSON"))?;
     let model_key = parsed
         .get("model")
@@ -58,10 +58,7 @@ pub(crate) async fn proxy(
     let upstream = (state.upstream)(&model).ok_or_else(|| {
         ApiError::unavailable("engine_unavailable", "engine endpoint is unavailable")
     })?;
-    let permit =
-        state.connections.clone().try_acquire_owned().map_err(|_| {
-            ApiError::unavailable("connection_limit", "too many active connections")
-        })?;
+    validate_upstream(&upstream)?;
     let url = format!(
         "{upstream}{}",
         parts.uri.path_and_query().map_or("/", |v| v.as_str())
@@ -77,9 +74,11 @@ pub(crate) async fn proxy(
             outgoing = outgoing.header(name, value);
         }
     }
-    let response = outgoing
-        .send()
+    let response = tokio::time::timeout(state.limits.upstream_header_timeout, outgoing.send())
         .await
+        .map_err(|_| {
+            ApiError::unavailable("upstream_timeout", "upstream response headers timed out")
+        })?
         .map_err(|_| ApiError::unavailable("upstream_unavailable", "upstream request failed"))?;
     let status = response.status();
     let headers = response.headers().clone();
@@ -102,6 +101,62 @@ pub(crate) async fn proxy(
         .map_err(|_| ApiError::unavailable("proxy_error", "failed to construct response"))?;
     copy_response_headers(&headers, result.headers_mut());
     Ok(result)
+}
+
+fn validate_upstream(value: &str) -> Result<(), ApiError> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| ApiError::unavailable("invalid_upstream", "engine endpoint is invalid"))?;
+    let loopback = url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if url.scheme() != "http"
+        || !loopback
+        || url.port().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ApiError::unavailable(
+            "invalid_upstream",
+            "engine endpoint is invalid",
+        ));
+    }
+    Ok(())
+}
+
+struct ChunkReader<'a> {
+    chunks: &'a [bytes::Bytes],
+    index: usize,
+    offset: usize,
+}
+impl<'a> ChunkReader<'a> {
+    fn new(chunks: &'a [bytes::Bytes]) -> Self {
+        Self {
+            chunks,
+            index: 0,
+            offset: 0,
+        }
+    }
+}
+impl std::io::Read for ChunkReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        while self.index < self.chunks.len() {
+            let remaining = &self.chunks[self.index][self.offset..];
+            if remaining.is_empty() {
+                self.index += 1;
+                self.offset = 0;
+                continue;
+            }
+            let count = remaining.len().min(output.len());
+            output[..count].copy_from_slice(&remaining[..count]);
+            self.offset += count;
+            return Ok(count);
+        }
+        Ok(0)
+    }
 }
 
 fn safe_request_header(name: &HeaderName) -> bool {

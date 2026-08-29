@@ -222,6 +222,8 @@ fn config(authentication: Authentication) -> GatewayConfig {
             max_in_flight_requests: 2,
             startup_timeout: Duration::from_secs(1),
             shutdown_grace: Duration::from_secs(1),
+            upstream_connect_timeout: Duration::from_secs(1),
+            upstream_header_timeout: Duration::from_secs(1),
         },
     }
 }
@@ -255,20 +257,33 @@ fn load_contract_rejects_unknown_fields_and_distinguishes_omitted_and_null() {
     assert_eq!(omitted.context_length, null.context_length);
     assert!(serde_json::from_value::<LoadRequest>(json!({"model":"x","gpu":99})).is_err());
 }
-#[test]
-fn generated_tokens_persist_only_argon2_phc_hashes() {
+#[tokio::test]
+async fn generated_tokens_persist_only_argon2_phc_hashes() {
     let mut store = TokenStore::default();
     let created = store.create().unwrap();
-    assert!(store.verify(&created.plaintext));
-    assert!(!store.verify("wrong"));
+    assert!(store.verify(&created.plaintext).await);
+    assert!(!store.verify("wrong").await);
     assert!(store.phc_hashes()[0].starts_with("$argon2"));
     assert!(!store.phc_hashes()[0].contains(&created.plaintext));
     assert!(
         TokenStore::from_phc_hashes(store.phc_hashes().to_vec())
             .unwrap()
             .verify(&created.plaintext)
+            .await
     );
     assert!(!format!("{store:?}").contains(&created.plaintext));
+}
+
+#[test]
+fn token_store_rejects_malicious_phc_inputs_and_excessive_counts() {
+    let mut store = TokenStore::default();
+    let token = store.create().unwrap();
+    let valid = store.phc_hashes()[0].clone();
+    drop(token);
+    assert!(TokenStore::from_phc_hashes(vec![valid.replacen("argon2id", "argon2i", 1)]).is_err());
+    assert!(TokenStore::from_phc_hashes(vec![valid.replacen("v=19", "v=16", 1)]).is_err());
+    assert!(TokenStore::from_phc_hashes(vec![valid.replacen("m=19456", "m=999999", 1)]).is_err());
+    assert!(TokenStore::from_phc_hashes(vec![valid; 17]).is_err());
 }
 #[test]
 fn lan_without_auth_is_allowed_with_typed_warning() {
@@ -556,12 +571,32 @@ async fn authentication_failure_is_uniform() {
     assert_eq!(
         client
             .get(&url)
-            .bearer_auth(plaintext)
+            .bearer_auth(&plaintext)
             .send()
             .await
             .unwrap()
             .status(),
         StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .header("authorization", format!("bEaReR {plaintext}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .header("authorization", format!("Bearer {plaintext} extra"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
     );
     stop(lifecycle, server).await;
 }
@@ -697,6 +732,109 @@ async fn bounded_request_spool_preserves_incoming_data_frame_sequence() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(upstream.control.request_chunks(), expected);
     stop(lifecycle, server).await;
+    upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn upstream_redirect_is_returned_without_following_or_forwarding_again() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let route_hits = hits.clone();
+    let upstream = Router::new().route(
+        "/{*path}",
+        post(move || {
+            let route_hits = route_hits.clone();
+            async move {
+                route_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header("location", "/redirected")
+                    .body(Body::empty())
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, upstream).await });
+    let (lifecycle, server) = start(Authentication::Disabled, format!("http://{address}")).await;
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .post(format!("http://{}/v1/completions", server.local_addr()))
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    stop(lifecycle, server).await;
+    task.abort();
+}
+
+#[tokio::test]
+async fn invalid_upstream_authorities_are_rejected_before_network_access() {
+    for endpoint in [
+        "https://127.0.0.1:9",
+        "http://example.com:80",
+        "http://u:p@127.0.0.1:9",
+        "http://127.0.0.1",
+        "http://127.0.0.1:9/#fragment",
+    ] {
+        let (lifecycle, server) = start(Authentication::Disabled, endpoint.into()).await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{}/v1/completions", server.local_addr()))
+            .body(r#"{"model":"acme/tiny"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_upstream"
+        );
+        stop(lifecycle, server).await;
+    }
+}
+
+#[tokio::test]
+async fn stalled_upstream_headers_timeout_releases_lease_and_request_permit() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let mut limits = config(Authentication::Disabled);
+    limits.limits.upstream_header_timeout = Duration::ZERO;
+    limits.limits.max_in_flight_requests = 1;
+    let endpoint = upstream.base_url();
+    let gateway = Gateway::new(
+        limits,
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let url = format!("http://{}/v1/completions", server.local_addr());
+    for _ in 0..2 {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .header("x-fake-mode", "gate")
+            .body(r#"{"model":"acme/tiny"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "upstream_timeout"
+        );
+    }
+    let mut snapshots = lifecycle.subscribe();
+    while snapshots.borrow().in_flight != 0 {
+        snapshots.changed().await.unwrap();
+    }
+    assert_eq!(snapshots.borrow().in_flight, 0);
+    stop(lifecycle, server).await;
+    upstream.control.release_gate();
     upstream.stop().await.unwrap();
 }
 
