@@ -290,7 +290,7 @@ fn load_contract_rejects_unknown_fields_and_distinguishes_omitted_and_null() {
 }
 #[tokio::test]
 async fn generated_tokens_persist_only_argon2_phc_hashes() {
-    let mut store = TokenStore::default();
+    let store = TokenStore::default();
     let created = store.create().unwrap();
     assert!(store.verify(&created.plaintext).await);
     assert!(!store.verify("wrong").await);
@@ -307,7 +307,7 @@ async fn generated_tokens_persist_only_argon2_phc_hashes() {
 
 #[test]
 fn token_store_rejects_malicious_phc_inputs_and_excessive_counts() {
-    let mut store = TokenStore::default();
+    let store = TokenStore::default();
     let token = store.create().unwrap();
     let valid = store.phc_hashes()[0].clone();
     drop(token);
@@ -320,7 +320,7 @@ fn token_store_rejects_malicious_phc_inputs_and_excessive_counts() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blocking_token_verification_keeps_async_worker_responsive() {
-    let mut store = TokenStore::default();
+    let store = TokenStore::default();
     let token = store.create().unwrap().plaintext;
     let store = Arc::new(store);
     let checks = (0..8)
@@ -718,7 +718,7 @@ async fn supported_management_overrides_are_typed_and_applied_before_load() {
 
 #[tokio::test]
 async fn authentication_failure_is_uniform() {
-    let mut tokens = TokenStore::default();
+    let tokens = TokenStore::default();
     let plaintext = tokens.create().unwrap().plaintext;
     let (lifecycle, server) = start(
         Authentication::Tokens(Arc::new(tokens)),
@@ -810,7 +810,7 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move { axum::serve(listener, upstream).await });
-    let mut tokens = TokenStore::default();
+    let tokens = TokenStore::default();
     let token = tokens.create().unwrap().plaintext;
     let (lifecycle, server) = start(
         Authentication::Tokens(Arc::new(tokens)),

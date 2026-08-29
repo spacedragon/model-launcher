@@ -18,6 +18,12 @@ const BACKUP_FILE: &str = "config.json.backup";
 pub struct LauncherConfig {
     #[serde(default)]
     pub models: Vec<ModelRecord>,
+    #[serde(default)]
+    pub auth_token_hashes: Vec<String>,
+    #[serde(default)]
+    pub engine_distribution: Option<String>,
+    #[serde(default)]
+    pub engine_executable: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,7 +296,13 @@ impl ConfigStore {
             0 => {
                 let old: VersionZero = serde_json::from_slice(&bytes).map_err(config_format)?;
                 debug_assert_eq!(old.version, 0);
-                Ok((LauncherConfig { models: old.models }, true))
+                Ok((
+                    LauncherConfig {
+                        models: old.models,
+                        ..LauncherConfig::default()
+                    },
+                    true,
+                ))
             }
             version => Err(config_format(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -10,6 +10,7 @@ model-launcher-core = { path = "../model-launcher-core" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+copypasta = "0.10"
 slint.workspace = true
 
 [build-dependencies]

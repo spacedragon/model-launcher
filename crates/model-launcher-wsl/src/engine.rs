@@ -681,8 +681,7 @@ fn replace_file(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> 
 }
 
 pub struct LlamaCppWslEngine {
-    distribution: String,
-    executable: String,
+    settings: std::sync::RwLock<(String, String)>,
     runner: Arc<dyn CommandRunner>,
     allocator: Arc<dyn PortAllocator>,
     cleanup_observer: Arc<CleanupObserver>,
@@ -695,8 +694,7 @@ impl LlamaCppWslEngine {
         runner: Arc<dyn CommandRunner>,
     ) -> Self {
         Self {
-            distribution: distribution.into(),
-            executable: executable.into(),
+            settings: std::sync::RwLock::new((distribution.into(), executable.into())),
             runner,
             allocator: Arc::new(crate::InternalPortAllocator),
             cleanup_observer: Arc::new(CleanupObserver::default()),
@@ -713,9 +711,27 @@ impl LlamaCppWslEngine {
         self
     }
     async fn probe(&self) -> Result<ProbeSnapshot, WslError> {
+        let (distribution, executable) =
+            self.settings.read().expect("engine settings lock").clone();
         WslProber::new(self.runner.clone())
-            .probe(&self.distribution, &self.executable, None)
+            .probe(&distribution, &executable, None)
             .await
+    }
+    pub async fn validate_settings(
+        &self,
+        distribution: &str,
+        executable: &str,
+    ) -> Result<ProbeSnapshot, WslError> {
+        WslProber::new(self.runner.clone())
+            .probe(distribution, executable, None)
+            .await
+    }
+    pub fn apply_settings(&self, distribution: String, executable: String) {
+        *self.settings.write().expect("engine settings lock") = (distribution, executable);
+    }
+    #[must_use]
+    pub fn settings(&self) -> (String, String) {
+        self.settings.read().expect("engine settings lock").clone()
     }
 }
 fn app_error(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
@@ -795,19 +811,21 @@ impl InferenceEngine for LlamaCppWslEngine {
                 port.to_string(),
             ];
             args.extend(rendered.args);
-            let argv = launch_argv(&self.distribution, &self.executable, &model_path, &args);
+            let (distribution, executable) =
+                self.settings.read().expect("engine settings lock").clone();
+            let argv = launch_argv(&distribution, &executable, &model_path, &args);
             let mut child = spawn_after_release(&*self.runner, reservation, &argv)
                 .await
                 .map_err(app_error)?;
             let owned_pid = establish_pid(&mut *child).await.map_err(app_error)?;
             Ok(Box::new(WslEngineProcess {
-                distribution: self.distribution.clone(),
+                distribution,
                 pid: owned_pid.pid,
                 owned_pid,
                 runner: self.runner.clone(),
                 child: Some(child),
                 retry: Some(RetryContext {
-                    executable: self.executable.clone(),
+                    executable,
                     model_path,
                     args,
                     allocator: self.allocator.clone(),

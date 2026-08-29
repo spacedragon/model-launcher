@@ -1070,8 +1070,10 @@ pub fn reconcile_catalog(
             });
         }
     }
+    let mut config = saved.clone();
+    config.models = records;
     ReconcileResult {
-        config: LauncherConfig { models: records },
+        config,
         diagnostics: scanned.diagnostics,
     }
 }

@@ -110,6 +110,7 @@ fn configuration_round_trips() {
     let store = ConfigStore::new(&dir.0);
     let config = LauncherConfig {
         models: vec![model(ModelState::Available)],
+        ..LauncherConfig::default()
     };
 
     store.save(&config).expect("save config");
@@ -124,6 +125,7 @@ fn update_loads_latest_mutates_and_saves_under_one_transaction() {
     store
         .save(&LauncherConfig {
             models: vec![model(ModelState::Available)],
+            ..LauncherConfig::default()
         })
         .unwrap();
 
@@ -144,6 +146,7 @@ fn update_propagates_mutator_error_without_saving() {
     let store = ConfigStore::new(&dir.0);
     let initial = LauncherConfig {
         models: vec![model(ModelState::Available)],
+        ..LauncherConfig::default()
     };
     store.save(&initial).unwrap();
 
@@ -168,6 +171,7 @@ fn save_atomically_replaces_the_main_file() {
         .expect("initial save");
     let updated = LauncherConfig {
         models: vec![model(ModelState::Available)],
+        ..LauncherConfig::default()
     };
 
     store.save(&updated).expect("replacement save");
@@ -186,6 +190,7 @@ fn replacement_failure_preserves_main_and_cleans_temporary_file() {
     let store = ConfigStore::with_replacer(&dir.0, replacer);
     let previous = LauncherConfig {
         models: vec![model(ModelState::Missing)],
+        ..LauncherConfig::default()
     };
     store.save(&previous).expect("initial save");
     let original_bytes = fs::read(store.config_path()).expect("read original config");
@@ -230,6 +235,7 @@ fn write_sync_copy_and_replace_failures_clean_unique_temps_and_preserve_main() {
         let initial_store = ConfigStore::new(&dir.0);
         let previous = LauncherConfig {
             models: vec![model(ModelState::Missing)],
+            ..LauncherConfig::default()
         };
         initial_store.save(&previous).unwrap();
         let original = fs::read(initial_store.config_path()).unwrap();
@@ -284,6 +290,7 @@ fn cloned_store_serializes_concurrent_saves_into_complete_versions() {
             record.display_name = format!("model-{index}");
             LauncherConfig {
                 models: vec![record],
+                ..LauncherConfig::default()
             }
         })
         .collect::<Vec<_>>();
@@ -350,6 +357,7 @@ fn replacement_retains_the_last_valid_backup() {
     let store = ConfigStore::new(&dir.0);
     let previous = LauncherConfig {
         models: vec![model(ModelState::Missing)],
+        ..LauncherConfig::default()
     };
     store.save(&previous).expect("initial save");
 
@@ -425,6 +433,7 @@ fn model_uuid_and_key_survive_persistence() {
     store
         .save(&LauncherConfig {
             models: vec![expected.clone()],
+            ..LauncherConfig::default()
         })
         .expect("save model");
 
@@ -443,6 +452,7 @@ fn missing_models_are_not_discarded() {
     store
         .save(&LauncherConfig {
             models: vec![missing.clone()],
+            ..LauncherConfig::default()
         })
         .expect("save missing model");
 

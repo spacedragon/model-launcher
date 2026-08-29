@@ -7,12 +7,13 @@ use std::{
 
 use futures_util::FutureExt as _;
 use model_launcher_api::{
-    ApiModel, Gateway, GatewayConfig, GatewayConfigError, GatewayServer, ManagementModel,
-    ManagementModelResolver, ProfileUpdater, UpstreamResolver,
+    ApiModel, Authentication, CreatedToken, Gateway, GatewayConfig, GatewayConfigError,
+    GatewayServer, ManagementModel, ManagementModelResolver, ProfileUpdater, UpstreamResolver,
 };
 use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigStore, EngineCapabilities, InferenceEngine,
-    LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, ModelRecord, ReconcileResult,
+    LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter, LogRecord, LogStore,
+    LogStoreLimits, ModelRecord, ReconcileResult,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -40,6 +41,8 @@ pub enum ServiceError {
     ShuttingDown,
     #[error("service shutdown: {0}")]
     Shutdown(ShutdownFailure),
+    #[error("authentication token: {0}")]
+    Authentication(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +61,16 @@ pub struct ServiceSnapshot {
 
 pub struct Service {
     handle: ServiceHandle,
+}
+
+#[async_trait::async_trait]
+pub trait EngineSettingsManager: Send + Sync {
+    async fn validate(
+        &self,
+        distribution: &str,
+        executable: &str,
+    ) -> Result<EngineCapabilities, String>;
+    fn apply(&self, distribution: String, executable: String);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +122,25 @@ impl Service {
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, ServiceError> {
-        Self::start_inner(options, engine, None, None).await
+        let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
+        Self::start_inner(options, engine, logs, None, None, None).await
+    }
+
+    pub async fn start_with_log_store(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        logs: LogStore,
+    ) -> Result<Self, ServiceError> {
+        Self::start_inner(options, engine, logs, None, None, None).await
+    }
+
+    pub async fn start_with_desktop_dependencies(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        logs: LogStore,
+        settings: Arc<dyn EngineSettingsManager>,
+    ) -> Result<Self, ServiceError> {
+        Self::start_inner(options, engine, logs, Some(settings), None, None).await
     }
 
     #[doc(hidden)]
@@ -118,7 +149,8 @@ impl Service {
         engine: Arc<dyn InferenceEngine>,
         injected_background: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self, ServiceError> {
-        Self::start_inner(options, engine, injected_background, None).await
+        let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
+        Self::start_inner(options, engine, logs, None, injected_background, None).await
     }
 
     #[doc(hidden)]
@@ -127,18 +159,37 @@ impl Service {
         engine: Arc<dyn InferenceEngine>,
         barrier: Arc<WatcherBarrier>,
     ) -> Result<Self, ServiceError> {
-        Self::start_inner(options, engine, None, Some(barrier)).await
+        let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
+        Self::start_inner(options, engine, logs, None, None, Some(barrier)).await
     }
 
     async fn start_inner(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
+        logs: LogStore,
+        settings: Option<Arc<dyn EngineSettingsManager>>,
         injected_background: Option<tokio::task::JoinHandle<()>>,
         watcher_barrier: Option<Arc<WatcherBarrier>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
         let catalog = CatalogService::new(&options.catalog_dir, store.clone());
         let initial = catalog.reconcile_now()?;
+        if let (Some(manager), Some(distribution), Some(executable)) = (
+            settings.as_ref(),
+            initial.config.engine_distribution.clone(),
+            initial.config.engine_executable.clone(),
+        ) {
+            manager.apply(distribution, executable);
+        }
+        let tokens = match &options.gateway.authentication {
+            Authentication::Tokens(tokens) => {
+                tokens
+                    .replace_phc_hashes(initial.config.auth_token_hashes.clone())
+                    .map_err(|error| ServiceError::Authentication(error.to_string()))?;
+                Some(tokens.clone())
+            }
+            Authentication::Disabled => None,
+        };
         let watcher = options
             .watch_catalog
             .then(|| CatalogWatcher::watch(&options.catalog_dir, Duration::from_millis(250)))
@@ -219,6 +270,9 @@ impl Service {
             address,
             lifecycle: lifecycle_handle,
             capabilities: resolver.capabilities.clone(),
+            logs,
+            tokens,
+            settings,
             models,
             store,
             shutdown_timeout: options.shutdown_timeout,
@@ -281,6 +335,75 @@ impl ServiceHandle {
     }
     pub fn capabilities(&self) -> EngineCapabilities {
         self.inner.capabilities.clone()
+    }
+    pub fn engine_settings(&self) -> (Option<String>, Option<String>) {
+        let config = self.inner.models.read().expect("model lock poisoned");
+        (
+            config.engine_distribution.clone(),
+            config.engine_executable.clone(),
+        )
+    }
+    pub fn log_store(&self) -> LogStore {
+        self.inner.logs.clone()
+    }
+    pub fn logs(&self, filter: LogFilter) -> Vec<LogRecord> {
+        self.inner.logs.filtered_snapshot(filter)
+    }
+    pub fn export_logs(&self, path: impl AsRef<std::path::Path>) -> Result<(), ServiceError> {
+        let file = std::fs::File::create(path)?;
+        self.inner.logs.export_json_lines(file)?;
+        Ok(())
+    }
+    pub fn generate_token(&self) -> Result<CreatedToken, ServiceError> {
+        let tokens = self
+            .inner
+            .tokens
+            .as_ref()
+            .ok_or_else(|| ServiceError::Authentication("authentication is disabled".into()))?;
+        let prior = tokens.phc_hashes();
+        let created = tokens
+            .create()
+            .map_err(|error| ServiceError::Authentication(error.to_string()))?;
+        let hashes = tokens.phc_hashes();
+        let latest = match self.inner.store.update(|config| {
+            config.auth_token_hashes = hashes.clone();
+            Ok(())
+        }) {
+            Ok(latest) => latest,
+            Err(error) => {
+                let _ = tokens.replace_phc_hashes(prior);
+                return Err(error.into());
+            }
+        };
+        self.inner
+            .models
+            .write()
+            .expect("model lock poisoned")
+            .auth_token_hashes = latest.auth_token_hashes;
+        Ok(created)
+    }
+    pub async fn save_engine_settings(
+        &self,
+        distribution: String,
+        executable: String,
+    ) -> Result<EngineCapabilities, ServiceError> {
+        let manager = self.inner.settings.as_ref().ok_or_else(|| {
+            ServiceError::Authentication("engine settings are not configurable".into())
+        })?;
+        let caps = manager
+            .validate(&distribution, &executable)
+            .await
+            .map_err(ServiceError::Authentication)?;
+        let latest = self.inner.store.update(|config| {
+            config.engine_distribution = Some(distribution.clone());
+            config.engine_executable = Some(executable.clone());
+            Ok(())
+        })?;
+        let mut config = self.inner.models.write().expect("model lock poisoned");
+        config.engine_distribution = latest.engine_distribution;
+        config.engine_executable = latest.engine_executable;
+        manager.apply(distribution, executable);
+        Ok(caps)
     }
     pub async fn load(&self, id: model_launcher_core::ModelId) -> Result<(), ServiceError> {
         let model = self
@@ -363,6 +486,9 @@ struct Inner {
     address: SocketAddr,
     lifecycle: LifecycleHandle,
     capabilities: EngineCapabilities,
+    logs: LogStore,
+    tokens: Option<Arc<model_launcher_api::TokenStore>>,
+    settings: Option<Arc<dyn EngineSettingsManager>>,
     models: Arc<RwLock<LauncherConfig>>,
     store: ConfigStore,
     shutdown_timeout: Duration,

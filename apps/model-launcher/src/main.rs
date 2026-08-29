@@ -1,6 +1,6 @@
-use model_launcher::{Service, ServiceOptions};
-use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
-use model_launcher_core::InferenceEngine as _;
+use model_launcher::{EngineSettingsManager, Service, ServiceOptions};
+use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
+use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
 use model_launcher_wsl::{LlamaCppWslEngine, TokioCommandRunner};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -10,12 +10,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let base = platform_data_dir();
+    let token_store = Arc::new(TokenStore::default());
     let options = ServiceOptions {
         config_dir: base.join("config"),
         catalog_dir: base.join("models"),
         gateway: GatewayConfig {
             bind: "127.0.0.1:1234".parse()?,
-            authentication: Authentication::Disabled,
+            authentication: Authentication::Tokens(token_store),
             limits: GatewayLimits::default(),
         },
         upstream: std::env::var("MODEL_LAUNCHER_UPSTREAM")
@@ -23,14 +24,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         watch_catalog: true,
         shutdown_timeout: Duration::from_secs(10),
     };
+    let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
     let engine = Arc::new(LlamaCppWslEngine::new(
         std::env::var("MODEL_LAUNCHER_WSL_DISTRO").unwrap_or_else(|_| "Ubuntu".into()),
         std::env::var("MODEL_LAUNCHER_LLAMA_SERVER")
             .unwrap_or_else(|_| "/usr/local/bin/llama-server".into()),
-        Arc::new(TokioCommandRunner::default()),
+        Arc::new(TokioCommandRunner::with_log_store(logs.clone(), None, None)),
     ));
-    let reprobe_engine = engine.clone();
-    let service = runtime.block_on(Service::start(options.clone(), engine))?;
+    let settings_manager = Arc::new(ProductionEngineSettings(engine.clone()));
+    let service = runtime.block_on(Service::start_with_desktop_dependencies(
+        options.clone(),
+        engine,
+        logs,
+        settings_manager,
+    ))?;
     let handle = service.handle();
     let snapshot = handle.snapshot();
     let runtime_handle = runtime.handle().clone();
@@ -106,11 +113,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         save_settings: Arc::new({
             let runtime_handle = runtime_handle.clone();
-            move |_| {
-                let engine = reprobe_engine.clone();
+            let handle = handle.clone();
+            move |settings| {
+                let handle = handle.clone();
                 runtime_handle.spawn(async move {
-                    let _ = engine.probe_capabilities().await;
+                    let _ = handle
+                        .save_engine_settings(settings.distribution, settings.executable)
+                        .await;
                 });
+            }
+        }),
+        logs: Arc::new({
+            let handle = handle.clone();
+            move |filter: LogFilter| handle.logs(filter)
+        }),
+        export_logs: Arc::new({
+            let handle = handle.clone();
+            let path = base.join("model-launcher-logs.jsonl");
+            move || {
+                let _ = handle.export_logs(&path);
+            }
+        }),
+        generate_token: Arc::new({
+            let handle = handle.clone();
+            move || handle.generate_token().ok().map(|token| token.plaintext)
+        }),
+        engine_settings: Arc::new({
+            let handle = handle.clone();
+            let directory = options.catalog_dir.display().to_string();
+            move || {
+                let (distribution, executable) = handle.engine_settings();
+                model_launcher_ui::EngineSettings {
+                    model_directory: directory.clone(),
+                    distribution: distribution.unwrap_or_else(|| "Ubuntu".into()),
+                    executable: executable.unwrap_or_else(|| "/usr/local/bin/llama-server".into()),
+                }
             }
         }),
     };
@@ -125,6 +162,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     runtime.block_on(handle.shutdown())?;
     Ok(())
+}
+
+struct ProductionEngineSettings(Arc<LlamaCppWslEngine>);
+
+#[async_trait::async_trait]
+impl EngineSettingsManager for ProductionEngineSettings {
+    async fn validate(
+        &self,
+        distribution: &str,
+        executable: &str,
+    ) -> Result<model_launcher_core::EngineCapabilities, String> {
+        self.0
+            .validate_settings(distribution, executable)
+            .await
+            .map(|snapshot| snapshot.capabilities)
+            .map_err(|error| error.to_string())
+    }
+
+    fn apply(&self, distribution: String, executable: String) {
+        self.0.apply_settings(distribution, executable);
+    }
 }
 
 fn platform_data_dir() -> PathBuf {

@@ -19,6 +19,10 @@ pub struct UiActions {
     pub quit: Arc<dyn Fn() + Send + Sync>,
     pub close_notice: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     pub save_settings: Arc<dyn Fn(EngineSettings) + Send + Sync>,
+    pub logs: Arc<dyn Fn(LogFilter) -> Vec<LogRecord> + Send + Sync>,
+    pub export_logs: Arc<dyn Fn() + Send + Sync>,
+    pub generate_token: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    pub engine_settings: Arc<dyn Fn() -> EngineSettings + Send + Sync>,
 }
 
 #[cfg(not(windows))]
@@ -55,6 +59,8 @@ pub fn run_desktop(
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+    window.set_logs(log_lines((actions.logs)(LogFilter::default())));
+    hydrate_engine_settings(&window, (actions.engine_settings)());
     window.on_load_model({
         let actions = actions.clone();
         move |raw: SharedString| {
@@ -81,6 +87,28 @@ pub fn run_desktop(
             })
         }
     });
+    window.on_export_logs({
+        let actions = actions.clone();
+        move || (actions.export_logs)()
+    });
+    let weak = window.as_weak();
+    window.on_generate_token({
+        let actions = actions.clone();
+        move || {
+            if let Some(token) = (actions.generate_token)()
+                && let Some(window) = weak.upgrade()
+            {
+                window.set_generated_token(token.into());
+            }
+        }
+    });
+    window.on_copy_text(|text| {
+        use copypasta::{ClipboardContext, ClipboardProvider as _};
+        if let Ok(mut clipboard) = ClipboardContext::new() {
+            let _ = clipboard.set_contents(text.into());
+        }
+    });
+    install_log_filter(&window, actions.clone());
     window.run()
 }
 
@@ -154,7 +182,7 @@ fn create_window(
     address: String,
     actions: UiActions,
 ) -> Result<MainWindow, slint::PlatformError> {
-    use slint::{ModelRc, SharedString, VecModel};
+    use slint::{ComponentHandle as _, ModelRc, SharedString, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
     let rows: Vec<ModelDisplay> = view_model
         .rows()
@@ -182,6 +210,8 @@ fn create_window(
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+    window.set_logs(log_lines((actions.logs)(LogFilter::default())));
+    hydrate_engine_settings(&window, (actions.engine_settings)());
     window.on_load_model({
         let actions = actions.clone();
         move |raw: SharedString| {
@@ -208,7 +238,77 @@ fn create_window(
             })
         }
     });
+    window.on_export_logs({
+        let actions = actions.clone();
+        move || (actions.export_logs)()
+    });
+    let weak = window.as_weak();
+    window.on_generate_token({
+        let actions = actions.clone();
+        move || {
+            if let Some(token) = (actions.generate_token)()
+                && let Some(window) = weak.upgrade()
+            {
+                window.set_generated_token(token.into());
+            }
+        }
+    });
+    window.on_copy_text(|text| {
+        use copypasta::{ClipboardContext, ClipboardProvider as _};
+        if let Ok(mut clipboard) = ClipboardContext::new() {
+            let _ = clipboard.set_contents(text.into());
+        }
+    });
+    install_log_filter(&window, actions.clone());
     Ok(window)
+}
+
+fn log_lines(records: Vec<LogRecord>) -> slint::ModelRc<slint::SharedString> {
+    use slint::{ModelRc, SharedString, VecModel};
+    let lines: Vec<SharedString> = records
+        .into_iter()
+        .map(|record| {
+            format!(
+                "{} {:?} {:?}  {}",
+                record.timestamp_ms, record.source, record.level, record.message
+            )
+            .into()
+        })
+        .collect();
+    ModelRc::from(Rc::new(VecModel::from(lines)))
+}
+
+fn install_log_filter(window: &MainWindow, actions: UiActions) {
+    use slint::ComponentHandle as _;
+    let weak = window.as_weak();
+    window.on_filter_logs(move |source, level| {
+        let source = match source.as_str() {
+            "Application" => Some(model_launcher_core::LogSource::Application),
+            "Engine stdout" => Some(model_launcher_core::LogSource::EngineStdout),
+            "Engine stderr" => Some(model_launcher_core::LogSource::EngineStderr),
+            _ => None,
+        };
+        let minimum_level = match level.as_str() {
+            "Trace" => Some(model_launcher_core::LogLevel::Trace),
+            "Debug" => Some(model_launcher_core::LogLevel::Debug),
+            "Info" => Some(model_launcher_core::LogLevel::Info),
+            "Warn" => Some(model_launcher_core::LogLevel::Warn),
+            "Error" => Some(model_launcher_core::LogLevel::Error),
+            _ => None,
+        };
+        if let Some(window) = weak.upgrade() {
+            window.set_logs(log_lines((actions.logs)(LogFilter {
+                source,
+                minimum_level,
+            })));
+        }
+    });
+}
+
+fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
+    window.set_model_directory(settings.model_directory.into());
+    window.set_engine_distribution(settings.distribution.into());
+    window.set_engine_executable(settings.executable.into());
 }
 
 #[cfg(windows)]

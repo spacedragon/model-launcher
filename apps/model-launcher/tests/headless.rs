@@ -1,11 +1,12 @@
 use model_launcher::{
-    Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase, WatcherBarrier,
-    WatcherBarrierPoint,
+    EngineSettingsManager, Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase,
+    WatcherBarrier, WatcherBarrierPoint,
 };
-use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
+use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{
     ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
-    LaunchSettings, LifecycleState, ModelRecord,
+    LaunchSettings, LifecycleState, LogFilter, LogLevel, LogRecord, LogSource, LogStore,
+    LogStoreLimits, ModelRecord,
 };
 use std::{
     sync::{
@@ -18,6 +19,110 @@ use std::{
 struct Engine {
     starts: Arc<AtomicUsize>,
     stops: Arc<AtomicUsize>,
+}
+
+struct RecordingSettings(Arc<std::sync::Mutex<Vec<String>>>);
+#[async_trait::async_trait]
+impl EngineSettingsManager for RecordingSettings {
+    async fn validate(
+        &self,
+        distribution: &str,
+        executable: &str,
+    ) -> Result<EngineCapabilities, String> {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("validate:{distribution}:{executable}"));
+        Ok(EngineCapabilities {
+            context_length: true,
+            ..Default::default()
+        })
+    }
+    fn apply(&self, distribution: String, executable: String) {
+        self.0
+            .lock()
+            .unwrap()
+            .push(format!("apply:{distribution}:{executable}"));
+    }
+}
+
+#[tokio::test]
+async fn engine_settings_validate_persist_then_apply_exact_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        Arc::new(RecordingSettings(order.clone())),
+    )
+    .await
+    .unwrap();
+    let caps = service
+        .handle()
+        .save_engine_settings("Ubuntu 24.04".into(), "/opt/llama server".into())
+        .await
+        .unwrap();
+    assert!(caps.context_length);
+    assert_eq!(
+        *order.lock().unwrap(),
+        [
+            "validate:Ubuntu 24.04:/opt/llama server",
+            "apply:Ubuntu 24.04:/opt/llama server"
+        ]
+    );
+    let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    assert_eq!(saved.engine_distribution.as_deref(), Some("Ubuntu 24.04"));
+    assert_eq!(
+        saved.engine_executable.as_deref(),
+        Some("/opt/llama server")
+    );
+    service.handle().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn service_persists_live_tokens_and_exposes_redacted_logs() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let upstream = fake_llama_server::FakeServer::spawn().await.unwrap();
+    let tokens = Arc::new(TokenStore::default());
+    let mut first_options = options(temp.path(), upstream.base_url());
+    first_options.gateway.authentication = Authentication::Tokens(tokens.clone());
+    let engine = || {
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        })
+    };
+    let service = Service::start(first_options, engine()).await.unwrap();
+    let handle = service.handle();
+    let plaintext = handle.generate_token().unwrap().plaintext;
+    handle.log_store().append(LogRecord {
+        timestamp_ms: 1,
+        source: LogSource::Application,
+        level: LogLevel::Warn,
+        generation: None,
+        model_id: None,
+        message: format!("Authorization: Bearer {plaintext}"),
+        truncated: false,
+    });
+    assert!(
+        !handle.logs(LogFilter::default())[0]
+            .message
+            .contains(&plaintext)
+    );
+    handle.shutdown().await.unwrap();
+
+    let restarted_tokens = Arc::new(TokenStore::default());
+    let mut second_options = options(temp.path(), upstream.base_url());
+    second_options.gateway.authentication = Authentication::Tokens(restarted_tokens.clone());
+    let restarted = Service::start(second_options, engine()).await.unwrap();
+    assert!(restarted_tokens.verify(&plaintext).await);
+    restarted.handle().shutdown().await.unwrap();
 }
 impl InferenceEngine for Engine {
     fn spec(&self) -> EngineFuture<'_, EngineSpec> {

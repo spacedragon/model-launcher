@@ -1,6 +1,6 @@
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
 use rand::{RngCore, rngs::OsRng};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::Semaphore;
 
 const MAX_TOKENS: usize = 16;
@@ -8,7 +8,7 @@ const AUTH_JOBS: usize = 4;
 
 #[derive(Clone)]
 pub struct TokenStore {
-    hashes: Vec<String>,
+    hashes: Arc<RwLock<Vec<String>>>,
     dummy_hash: String,
     admission: Arc<Semaphore>,
 }
@@ -16,7 +16,10 @@ pub struct TokenStore {
 impl std::fmt::Debug for TokenStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TokenStore")
-            .field("token_count", &self.hashes.len())
+            .field(
+                "token_count",
+                &self.hashes.read().expect("token lock").len(),
+            )
             .finish()
     }
 }
@@ -28,7 +31,7 @@ pub struct CreatedToken {
 impl Default for TokenStore {
     fn default() -> Self {
         Self {
-            hashes: Vec::new(),
+            hashes: Arc::new(RwLock::new(Vec::new())),
             dummy_hash: hash("invalid-token").expect("static token hashes"),
             admission: Arc::new(Semaphore::new(AUTH_JOBS)),
         }
@@ -44,36 +47,52 @@ impl TokenStore {
             validate_phc(encoded)?;
         }
         Ok(Self {
-            hashes,
+            hashes: Arc::new(RwLock::new(hashes)),
             dummy_hash: hash("invalid-token")?,
             admission: Arc::new(Semaphore::new(AUTH_JOBS)),
         })
     }
 
     #[must_use]
-    pub fn phc_hashes(&self) -> &[String] {
-        &self.hashes
+    pub fn phc_hashes(&self) -> Vec<String> {
+        self.hashes.read().expect("token lock").clone()
     }
 
-    pub fn create(&mut self) -> Result<CreatedToken, argon2::password_hash::Error> {
-        if self.hashes.len() >= MAX_TOKENS {
+    pub fn create(&self) -> Result<CreatedToken, argon2::password_hash::Error> {
+        let mut hashes = self.hashes.write().expect("token lock");
+        if hashes.len() >= MAX_TOKENS {
             return Err(argon2::password_hash::Error::ParamsMaxExceeded);
         }
         let mut bytes = [0_u8; 24];
         OsRng.fill_bytes(&mut bytes);
         let plaintext = format!("ml_{}", hex(&bytes));
-        self.hashes.push(hash(&plaintext)?);
+        hashes.push(hash(&plaintext)?);
         Ok(CreatedToken { plaintext })
+    }
+
+    pub fn replace_phc_hashes(
+        &self,
+        hashes: Vec<String>,
+    ) -> Result<(), argon2::password_hash::Error> {
+        if hashes.len() > MAX_TOKENS {
+            return Err(argon2::password_hash::Error::ParamsMaxExceeded);
+        }
+        for encoded in &hashes {
+            validate_phc(encoded)?;
+        }
+        *self.hashes.write().expect("token lock") = hashes;
+        Ok(())
     }
 
     pub async fn verify(&self, candidate: &str) -> bool {
         let Ok(_permit) = self.admission.clone().acquire_owned().await else {
             return false;
         };
-        let hashes = if self.hashes.is_empty() {
+        let stored = self.hashes.read().expect("token lock").clone();
+        let hashes = if stored.is_empty() {
             vec![self.dummy_hash.clone()]
         } else {
-            self.hashes.clone()
+            stored
         };
         let candidate = candidate.to_owned();
         tokio::task::spawn_blocking(move || {
