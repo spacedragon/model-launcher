@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
-use crate::{LaunchProfile, LauncherConfig, ModelId, ModelKey, ModelRecord, ModelState};
+use crate::{
+    AppError, ConfigStore, LaunchProfile, LauncherConfig, ModelId, ModelKey, ModelRecord,
+    ModelState,
+};
 
 /// Stable when the host filesystem exposes an identity, otherwise deliberately unavailable.
 /// No model contents are hashed: even multi-gigabyte files have O(1) identity cost.
@@ -34,15 +37,15 @@ pub enum CatalogIdentity {
 impl CatalogIdentity {
     #[must_use]
     pub fn for_path(path: &Path) -> Self {
-        let Ok(metadata) = fs::metadata(path) else {
+        let Ok(_metadata) = fs::metadata(path) else {
             return Self::Unavailable;
         };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             Self::Unix {
-                device: metadata.dev(),
-                inode: metadata.ino(),
+                device: _metadata.dev(),
+                inode: _metadata.ino(),
             }
         }
         #[cfg(windows)]
@@ -51,7 +54,7 @@ impl CatalogIdentity {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = metadata;
+            let _ = _metadata;
             Self::Unavailable
         }
     }
@@ -115,6 +118,8 @@ pub struct CatalogDiagnostic {
 pub struct ScanResult {
     pub models: Vec<ScannedModel>,
     pub diagnostics: Vec<CatalogDiagnostic>,
+    /// True only when the entire configured root was traversed reliably.
+    pub complete: bool,
 }
 
 /// Recursively scans `root` without following symlinks. This prevents both directory loops and
@@ -122,6 +127,30 @@ pub struct ScanResult {
 #[must_use]
 pub fn scan(root: &Path) -> ScanResult {
     let mut result = ScanResult::default();
+    let root_metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            result.diagnostics.push(scan_diagnostic(root, error));
+            return result;
+        }
+    };
+    if root_metadata.file_type().is_symlink() {
+        result.diagnostics.push(CatalogDiagnostic {
+            kind: CatalogDiagnosticKind::Scan,
+            path: root.to_path_buf(),
+            message: "catalog root must not be a symbolic link".into(),
+        });
+        return result;
+    }
+    if !root_metadata.is_dir() {
+        result.diagnostics.push(CatalogDiagnostic {
+            kind: CatalogDiagnosticKind::Scan,
+            path: root.to_path_buf(),
+            message: "catalog root is not a directory".into(),
+        });
+        return result;
+    }
+    result.complete = true;
     let mut files = Vec::new();
     for entry in WalkDir::new(root).follow_links(false).into_iter() {
         match entry {
@@ -129,17 +158,31 @@ pub fn scan(root: &Path) -> ScanResult {
                 files.push(entry.into_path())
             }
             Ok(_) => {}
-            Err(error) => result.diagnostics.push(CatalogDiagnostic {
-                kind: CatalogDiagnosticKind::Scan,
-                path: error.path().unwrap_or(root).to_path_buf(),
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                result.complete = false;
+                result.diagnostics.push(CatalogDiagnostic {
+                    kind: CatalogDiagnosticKind::Scan,
+                    path: error.path().unwrap_or(root).to_path_buf(),
+                    message: error.to_string(),
+                });
+            }
         }
     }
     files.sort();
 
     let shard = Regex::new(r"(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$").expect("constant regex");
-    let file_set = files.iter().cloned().collect::<HashSet<_>>();
+    let actual_files = files
+        .iter()
+        .filter_map(|path| {
+            Some((
+                (
+                    path.parent()?.to_path_buf(),
+                    path.file_name()?.to_str()?.to_ascii_lowercase(),
+                ),
+                path.clone(),
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let mut consumed = HashSet::new();
     for path in &files {
         if consumed.contains(path) {
@@ -155,16 +198,21 @@ pub fn scan(root: &Path) -> ScanResult {
             let total = captures[3].parse::<usize>().unwrap_or(0);
             if index == 1 && total > 1 {
                 let prefix = &captures[1];
-                let candidates = (1..=total)
+                let candidate_names = (1..=total)
                     .map(|part| {
-                        path.with_file_name(format!("{prefix}-{part:05}-of-{total:05}.gguf"))
+                        format!("{prefix}-{part:05}-of-{total:05}.gguf").to_ascii_lowercase()
                     })
                     .collect::<Vec<_>>();
-                if candidates
+                let parent = path.parent().unwrap_or_else(|| Path::new(""));
+                if candidate_names
                     .iter()
-                    .all(|candidate| file_set.contains(candidate))
+                    .all(|name| actual_files.contains_key(&(parent.to_path_buf(), name.clone())))
                 {
-                    logical_files = candidates;
+                    logical_files = candidate_names
+                        .iter()
+                        .filter_map(|name| actual_files.get(&(parent.to_path_buf(), name.clone())))
+                        .cloned()
+                        .collect();
                 }
             }
         }
@@ -174,6 +222,14 @@ pub fn scan(root: &Path) -> ScanResult {
             .push(read_model(path, &logical_files, &mut result.diagnostics));
     }
     result
+}
+
+fn scan_diagnostic(path: &Path, error: std::io::Error) -> CatalogDiagnostic {
+    CatalogDiagnostic {
+        kind: CatalogDiagnosticKind::Scan,
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    }
 }
 
 fn is_gguf(path: &Path) -> bool {
@@ -214,6 +270,15 @@ fn read_model(
                 _ => None,
             };
             let architecture = string("general.architecture");
+            if values.get("general.name").is_some()
+                && !matches!(values.get("general.name"), Some(MetadataValue::String(_)))
+            {
+                diagnostics.push(CatalogDiagnostic {
+                    kind: CatalogDiagnosticKind::Metadata,
+                    path: path.to_path_buf(),
+                    message: "general.name has the wrong metadata type".into(),
+                });
+            }
             let context_length = architecture
                 .as_deref()
                 .and_then(|arch| integer(&format!("{arch}.context_length")));
@@ -262,6 +327,12 @@ pub fn reconcile_catalog(
     scanned: ScanResult,
     options: ReconcileOptions,
 ) -> ReconcileResult {
+    if !scanned.complete {
+        return ReconcileResult {
+            config: saved.clone(),
+            diagnostics: scanned.diagnostics,
+        };
+    }
     let removed = options.remove_missing.into_iter().collect::<HashSet<_>>();
     let mut records = saved
         .models
@@ -363,43 +434,128 @@ impl CatalogDebouncer {
     }
 }
 
-/// `notify` adapter. It reports a stable, sorted batch after the filesystem has been quiet for the
-/// configured interval; callers decide when to invoke pure `scan` and persist through ConfigStore.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogWatchEvent {
+    Changed(PathBuf),
+    Rescan,
+    Error(String),
+}
+
+#[derive(Clone)]
+pub struct CatalogWatchSender(mpsc::UnboundedSender<CatalogWatchEvent>);
+
+impl CatalogWatchSender {
+    pub fn emit(&self, event: CatalogWatchEvent) {
+        let _ = self.0.send(event);
+    }
+}
+
+pub struct CatalogWatchReceiver {
+    events: mpsc::UnboundedReceiver<CatalogWatchEvent>,
+    delay: Duration,
+}
+
+#[must_use]
+pub fn catalog_watch_channel(delay: Duration) -> (CatalogWatchSender, CatalogWatchReceiver) {
+    let (sender, events) = mpsc::unbounded_channel();
+    (
+        CatalogWatchSender(sender),
+        CatalogWatchReceiver { events, delay },
+    )
+}
+
+impl CatalogWatchReceiver {
+    async fn next_batch(&mut self) -> Option<Vec<CatalogWatchEvent>> {
+        let first = self.events.recv().await?;
+        let mut batch = vec![first];
+        loop {
+            match tokio::time::timeout(self.delay, self.events.recv()).await {
+                Ok(Some(event)) => batch.push(event),
+                Ok(None) | Err(_) => return Some(batch),
+            }
+        }
+    }
+}
+
+/// Reconciliation pipeline. Loading, scanning, and saving are separate calls, so the ConfigStore's
+/// internal transaction lock is never held across directory traversal or metadata I/O.
+#[derive(Clone)]
+pub struct CatalogService {
+    root: PathBuf,
+    store: ConfigStore,
+}
+
+impl CatalogService {
+    pub fn new(root: impl Into<PathBuf>, store: ConfigStore) -> Self {
+        Self {
+            root: root.into(),
+            store,
+        }
+    }
+
+    pub fn reconcile_now(&self) -> Result<ReconcileResult, AppError> {
+        let saved = self.store.load()?;
+        let scanned = scan(&self.root);
+        let complete = scanned.complete;
+        let output = reconcile_catalog(&saved, scanned, ReconcileOptions::default());
+        if complete {
+            self.store.save(&output.config)?;
+        }
+        Ok(output)
+    }
+
+    pub async fn process_next(
+        &self,
+        receiver: &mut CatalogWatchReceiver,
+    ) -> Result<Option<ReconcileResult>, AppError> {
+        let Some(batch) = receiver.next_batch().await else {
+            return Ok(None);
+        };
+        let mut watch_diagnostics = batch
+            .into_iter()
+            .filter_map(|event| match event {
+                CatalogWatchEvent::Error(message) => Some(CatalogDiagnostic {
+                    kind: CatalogDiagnosticKind::Scan,
+                    path: self.root.clone(),
+                    message,
+                }),
+                CatalogWatchEvent::Changed(_) | CatalogWatchEvent::Rescan => None,
+            })
+            .collect::<Vec<_>>();
+        let mut output = self.reconcile_now()?;
+        watch_diagnostics.append(&mut output.diagnostics);
+        output.diagnostics = watch_diagnostics;
+        Ok(Some(output))
+    }
+}
+
+/// `notify` adapter. It reports typed events after the filesystem has been quiet for the configured
+/// interval; callback failures remain visible rather than being silently dropped.
 pub struct CatalogWatcher {
     _watcher: RecommendedWatcher,
-    events: mpsc::UnboundedReceiver<PathBuf>,
-    delay: Duration,
+    events: CatalogWatchReceiver,
 }
 
 impl CatalogWatcher {
     pub fn watch(root: &Path, delay: Duration) -> notify::Result<Self> {
-        let (sender, events) = mpsc::unbounded_channel();
+        let (sender, events) = catalog_watch_channel(delay);
         let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                if let Ok(event) = event {
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+                Ok(event) => {
                     for path in event.paths {
-                        let _ = sender.send(path);
+                        sender.emit(CatalogWatchEvent::Changed(path));
                     }
                 }
+                Err(error) => sender.emit(CatalogWatchEvent::Error(error.to_string())),
             })?;
         watcher.watch(root, RecursiveMode::Recursive)?;
         Ok(Self {
             _watcher: watcher,
             events,
-            delay,
         })
     }
 
-    pub async fn next(&mut self) -> Option<Vec<PathBuf>> {
-        let first = self.events.recv().await?;
-        let mut paths = BTreeSet::from([first]);
-        loop {
-            match tokio::time::timeout(self.delay, self.events.recv()).await {
-                Ok(Some(path)) => {
-                    paths.insert(path);
-                }
-                Ok(None) | Err(_) => return Some(paths.into_iter().collect()),
-            }
-        }
+    pub async fn next(&mut self) -> Option<Vec<CatalogWatchEvent>> {
+        self.events.next_batch().await
     }
 }

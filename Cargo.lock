@@ -207,6 +207,7 @@ name = "model-launcher-core"
 version = "0.1.0"
 dependencies = [
  "gguf-rs-lib",
+ "libc",
  "notify",
  "parking_lot",
  "regex",
