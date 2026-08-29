@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use uuid::Uuid;
 
 use crate::{AppError, LaunchSettings};
@@ -32,7 +32,7 @@ impl Default for ModelId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ModelKey(String);
 
@@ -62,6 +62,15 @@ impl ModelKey {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 
@@ -109,5 +118,21 @@ mod tests {
     #[test]
     fn model_key_rejects_parent_traversal() {
         assert!(ModelKey::parse("../escape").is_err());
+    }
+
+    #[test]
+    fn model_key_deserialization_rejects_invalid_values() {
+        assert!(serde_json::from_str::<ModelKey>(r#""../escape""#).is_err());
+    }
+
+    #[test]
+    fn model_key_serialization_round_trips_valid_values() {
+        let key = ModelKey::parse("Qwen/qwen3-8b-q4").expect("valid model key");
+        let json = serde_json::to_string(&key).expect("serialize model key");
+
+        assert_eq!(
+            serde_json::from_str::<ModelKey>(&json).expect("deserialize model key"),
+            key
+        );
     }
 }

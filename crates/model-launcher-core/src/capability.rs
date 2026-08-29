@@ -75,55 +75,108 @@ pub struct LaunchSettings {
     pub kv_cache_type: Option<KvCacheType>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingId {
+    ContextLength,
+    GpuLayers,
+    CpuThreads,
+    BatchSize,
+    ParallelSlots,
+    FlashAttention,
+    KvCacheType,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderedLaunchSettings {
+    pub args: Vec<String>,
+    pub unsupported: Vec<SettingId>,
+}
+
 impl LaunchSettings {
     #[must_use]
     pub fn to_args(&self, capabilities: &EngineCapabilities) -> Vec<String> {
+        self.render(capabilities).args
+    }
+
+    #[must_use]
+    pub fn render(&self, capabilities: &EngineCapabilities) -> RenderedLaunchSettings {
         let mut args = Vec::new();
-        push_numeric(
+        let mut unsupported = Vec::new();
+        render_numeric(
             &mut args,
+            &mut unsupported,
             capabilities.context_length,
+            SettingId::ContextLength,
             "--ctx-size",
             self.context_length.map(ContextLength::get),
         );
-        push_numeric(
+        render_numeric(
             &mut args,
+            &mut unsupported,
             capabilities.gpu_layers,
+            SettingId::GpuLayers,
             "--gpu-layers",
             self.gpu_layers.map(GpuLayers::get),
         );
-        push_numeric(
+        render_numeric(
             &mut args,
+            &mut unsupported,
             capabilities.cpu_threads,
+            SettingId::CpuThreads,
             "--threads",
             self.cpu_threads.map(CpuThreads::get),
         );
-        push_numeric(
+        render_numeric(
             &mut args,
+            &mut unsupported,
             capabilities.batch_size,
+            SettingId::BatchSize,
             "--batch-size",
             self.batch_size.map(BatchSize::get),
         );
-        push_numeric(
+        render_numeric(
             &mut args,
+            &mut unsupported,
             capabilities.parallel_slots,
+            SettingId::ParallelSlots,
             "--parallel",
             self.parallel_slots.map(ParallelSlots::get),
         );
-        if capabilities.flash_attention && self.flash_attention == Some(true) {
-            args.push("--flash-attn".into());
+        if let Some(enabled) = self.flash_attention {
+            if capabilities.flash_attention {
+                if enabled {
+                    args.push("--flash-attn".into());
+                }
+            } else {
+                unsupported.push(SettingId::FlashAttention);
+            }
         }
-        if capabilities.kv_cache_type
-            && let Some(value) = self.kv_cache_type
-        {
-            args.extend(["--cache-type-k".into(), value.as_arg().into()]);
+        if let Some(value) = self.kv_cache_type {
+            if capabilities.kv_cache_type {
+                args.extend(["--cache-type-k".into(), value.as_arg().into()]);
+            } else {
+                unsupported.push(SettingId::KvCacheType);
+            }
         }
-        args
+        RenderedLaunchSettings { args, unsupported }
     }
 }
 
-fn push_numeric(args: &mut Vec<String>, supported: bool, flag: &str, value: Option<u32>) {
-    if supported && let Some(value) = value {
-        args.extend([flag.into(), value.to_string()]);
+fn render_numeric(
+    args: &mut Vec<String>,
+    unsupported: &mut Vec<SettingId>,
+    supported: bool,
+    id: SettingId,
+    flag: &str,
+    value: Option<u32>,
+) {
+    if let Some(value) = value {
+        if supported {
+            args.extend([flag.into(), value.to_string()]);
+        } else {
+            unsupported.push(id);
+        }
     }
 }
 
@@ -155,5 +208,25 @@ mod tests {
         };
 
         assert_eq!(settings.to_args(&caps), vec!["--ctx-size", "8192"]);
+    }
+
+    #[test]
+    fn launch_render_reports_retained_unsupported_settings() {
+        let gpu_layers = GpuLayers::new(32);
+        let settings = LaunchSettings {
+            context_length: Some(ContextLength::new(8192).expect("valid context length")),
+            gpu_layers: Some(gpu_layers),
+            ..LaunchSettings::default()
+        };
+        let caps = EngineCapabilities {
+            context_length: true,
+            ..EngineCapabilities::default()
+        };
+
+        let rendered = settings.render(&caps);
+
+        assert_eq!(settings.gpu_layers, Some(gpu_layers));
+        assert_eq!(rendered.args, vec!["--ctx-size", "8192"]);
+        assert_eq!(rendered.unsupported, vec![SettingId::GpuLayers]);
     }
 }
