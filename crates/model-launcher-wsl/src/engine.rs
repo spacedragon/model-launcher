@@ -42,18 +42,48 @@ pub enum WslError {
     NonOwnedEndpoint,
 }
 
-#[derive(Default)]
 pub struct CleanupObserver {
     failures: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
     notify: tokio::sync::Notify,
     logs: Option<LogStore>,
+    spawner: Arc<dyn CleanupThreadSpawner>,
+}
+pub trait CleanupThreadSpawner: Send + Sync {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send>) -> io::Result<()>;
+}
+struct StdCleanupThreadSpawner;
+impl CleanupThreadSpawner for StdCleanupThreadSpawner {
+    fn spawn(&self, job: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+        std::thread::Builder::new()
+            .name("wsl-owned-cleanup".into())
+            .spawn(job)
+            .map(|_| ())
+    }
+}
+impl Default for CleanupObserver {
+    fn default() -> Self {
+        Self {
+            failures: std::sync::atomic::AtomicU64::new(0),
+            completed: std::sync::atomic::AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+            logs: None,
+            spawner: Arc::new(StdCleanupThreadSpawner),
+        }
+    }
 }
 impl CleanupObserver {
     #[must_use]
     pub fn with_logs(logs: LogStore) -> Self {
         Self {
             logs: Some(logs),
+            ..Self::default()
+        }
+    }
+    #[must_use]
+    pub fn with_spawner(spawner: Arc<dyn CleanupThreadSpawner>) -> Self {
+        Self {
+            spawner,
             ..Self::default()
         }
     }
@@ -1007,25 +1037,23 @@ impl Drop for WslEngineProcess {
             ));
         } else {
             let spawn_observer = observer.clone();
-            if let Err(error) = std::thread::Builder::new()
-                .name("wsl-owned-cleanup".into())
-                .spawn(move || {
-                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                        .enable_time()
-                        .build()
-                    {
-                        runtime.block_on(supervise_owned_cleanup(
-                            runner,
-                            distribution,
-                            owned_pid,
-                            child,
-                            observer,
-                        ));
-                    } else {
-                        observer.finish(Some("cleanup runtime build failed".into()));
-                    }
-                })
-            {
+            let spawner = observer.spawner.clone();
+            if let Err(error) = spawner.spawn(Box::new(move || {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                {
+                    runtime.block_on(supervise_owned_cleanup(
+                        runner,
+                        distribution,
+                        owned_pid,
+                        child,
+                        observer,
+                    ));
+                } else {
+                    observer.finish(Some("cleanup runtime build failed".into()));
+                }
+            })) {
                 spawn_observer.finish(Some(format!("cleanup thread spawn failed: {error}")));
             }
         }
@@ -1149,6 +1177,76 @@ mod tests {
         assert_eq!(error.prior.as_ref(), Some(&saved));
         assert_eq!(ProbeSnapshot::load(&cache_path).unwrap(), saved);
     }
+    struct BarrierProbeRunner {
+        stat_count: std::sync::atomic::AtomicUsize,
+        first_entered: tokio::sync::Notify,
+        release_first: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl CommandRunner for BarrierProbeRunner {
+        async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
+            if argv.contains(&"stat".into()) {
+                let call = self.stat_count.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    self.first_entered.notify_one();
+                    self.release_first.notified().await;
+                }
+                let device = call + 1;
+                return Ok(CommandOutput {
+                    success: true,
+                    stdout: format!("{device}\t2\t3\t4\n"),
+                    stderr: String::new(),
+                });
+            }
+            let latest = self.stat_count.load(Ordering::SeqCst);
+            Ok(CommandOutput {
+                success: true,
+                stdout: if argv.last().is_some_and(|arg| arg == "--version") {
+                    format!("v{latest}\n")
+                } else {
+                    "--ctx-size\n".into()
+                },
+                stderr: String::new(),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn cache_refresh_is_serialized_across_instances_and_latest_wins() {
+        let runner = Arc::new(BarrierProbeRunner {
+            stat_count: std::sync::atomic::AtomicUsize::new(0),
+            first_entered: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+        });
+        let path = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .to_path_buf();
+        let first = Arc::new(ProbeCache::new(
+            path.clone(),
+            WslProber::new(runner.clone()),
+        ));
+        let second = Arc::new(ProbeCache::new(
+            path.clone(),
+            WslProber::new(runner.clone()),
+        ));
+        let first_task =
+            tokio::spawn(async move { first.refresh("Ubuntu", "/llama").await.unwrap() });
+        runner.first_entered.notified().await;
+        let second_task =
+            tokio::spawn(async move { second.refresh("Ubuntu", "/llama").await.unwrap() });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            runner.stat_count.load(Ordering::SeqCst),
+            1,
+            "second instance must not enter validation while first owns async refresh lock"
+        );
+        runner.release_first.notify_one();
+        assert_eq!(first_task.await.unwrap().executable_identity.device, 1);
+        assert_eq!(second_task.await.unwrap().executable_identity.device, 2);
+        let final_snapshot = ProbeSnapshot::load(&path).unwrap();
+        assert_eq!(final_snapshot.executable_identity.device, 2);
+        assert_eq!(final_snapshot.version_raw, "v2\n");
+    }
 
     #[test]
     fn inference_engine_is_object_safe() {
@@ -1156,6 +1254,45 @@ mod tests {
         let engine =
             LlamaCppWslEngine::new("Ubuntu", "/bin/llama", Arc::new(FakeRunner::default()));
         accepts(&engine);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_flood_before_handshake_is_drained_without_pipe_deadlock() {
+        let mut host = Command::new("/bin/sh").arg("-c").arg("dd if=/dev/zero bs=1048576 count=2 2>/dev/null | cat >&2; printf 'MODEL_LAUNCHER_PID=42\nMODEL_LAUNCHER_START_TIME=99\n'").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let stdout = host.stdout.take().unwrap();
+        let stderr = host.stderr.take().unwrap();
+        let logs = LogStore::new(model_launcher_core::LogStoreLimits::new(
+            8,
+            4 * 1024 * 1024,
+            2,
+        ))
+        .unwrap();
+        let mut child = TokioWslChild {
+            child: host,
+            stdout: Some(BufReader::new(stdout)),
+            stderr: Some(stderr),
+            addr: SocketAddr::from(([127, 0, 0, 1], 1)),
+            logs: Some((logs.clone(), None, None)),
+            drains: Vec::new(),
+            distribution: "unused".into(),
+            linux_pid: None,
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            inspector: Arc::new(FakeRunner::default()),
+        };
+        let handshake = tokio::time::timeout(Duration::from_secs(3), child.pid_control_line())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            parse_ownership_handshake(&handshake).unwrap(),
+            OwnedPid {
+                pid: 42,
+                start_time: 99
+            }
+        );
+        child.wait_for_exit().await.unwrap();
+        assert!(child.stderr_tail.lock().unwrap().len() <= STDERR_TAIL_LIMIT);
+        assert!(!logs.snapshot().is_empty());
     }
 
     #[test]
@@ -1451,6 +1588,49 @@ mod tests {
         assert_eq!(&signals[0][7..], &["TERM", "79", "109"]);
         assert_eq!(observer.completed(), 1);
         assert_eq!(observer.failures(), 0);
+    }
+    struct FailingCleanupSpawner;
+    impl CleanupThreadSpawner for FailingCleanupSpawner {
+        fn spawn(&self, _: Box<dyn FnOnce() + Send>) -> io::Result<()> {
+            Err(io::Error::other("injected spawn failure bearer secret"))
+        }
+    }
+    #[test]
+    fn cleanup_thread_spawn_failure_is_observable_and_logged() {
+        let logs = LogStore::new(model_launcher_core::LogStoreLimits::new(8, 4096, 2)).unwrap();
+        let observer = Arc::new(CleanupObserver {
+            logs: Some(logs.clone()),
+            spawner: Arc::new(FailingCleanupSpawner),
+            ..CleanupObserver::default()
+        });
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        drop(WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 80,
+            owned_pid: OwnedPid {
+                pid: 80,
+                start_time: 110,
+            },
+            runner,
+            child: Some(Box::new(AttemptChild {
+                pid: 80,
+                ready: Some(Ok(())),
+            })),
+            retry: None,
+            owned_active: true,
+            cleanup_observer: observer.clone(),
+        });
+        assert_eq!(observer.completed(), 1);
+        assert_eq!(observer.failures(), 1);
+        let record = logs.snapshot().pop().unwrap();
+        assert_eq!(record.level, LogLevel::Error);
+        assert!(
+            !record.message.contains("secret"),
+            "LogStore must redact cleanup diagnostics"
+        );
     }
     struct HangingChild;
     #[async_trait]
