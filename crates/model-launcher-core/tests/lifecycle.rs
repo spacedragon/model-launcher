@@ -239,8 +239,15 @@ fn model(name: &str) -> ModelRecord {
 }
 
 async fn settle() {
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::ZERO).await;
+    tokio::task::yield_now().await;
+}
+
+async fn wait_for_state(handle: &model_launcher_core::LifecycleHandle, state: LifecycleState) {
+    let mut snapshots = handle.subscribe();
+    while snapshots.borrow().state != state {
+        snapshots.changed().await.unwrap();
     }
 }
 
@@ -248,7 +255,7 @@ async fn settle() {
 async fn load_transitions_stopped_starting_running_and_waits_for_readiness() {
     let engine = Arc::new(ScriptedEngine::new());
     let control = engine.script();
-    let lifecycle = Lifecycle::spawn(engine);
+    let lifecycle = Lifecycle::spawn(engine.clone());
     let mut snapshots = lifecycle.subscribe();
     let target = model("alpha");
 
@@ -645,7 +652,7 @@ async fn eject_responds_while_spawn_is_pending() {
     let engine = Arc::new(ScriptedEngine::new());
     let gate = engine.block_spawn();
     let _control = engine.script();
-    let lifecycle = Lifecycle::spawn(engine);
+    let lifecycle = Lifecycle::spawn(engine.clone());
     let handle = lifecycle.handle();
     let load = tokio::spawn({
         let handle = handle.clone();
@@ -654,11 +661,10 @@ async fn eject_responds_while_spawn_is_pending() {
     settle().await;
     let eject = tokio::spawn(async move { handle.eject().await });
     settle().await;
-    assert!(!eject.is_finished());
-    gate.notify_waiters();
-    settle().await;
     assert!(eject.is_finished());
     eject.await.unwrap().unwrap();
+    gate.notify_waiters();
+    assert_eq!(engine.spawn_count(), 0);
     load.abort();
 }
 
@@ -712,7 +718,6 @@ async fn shutdown_is_accepted_while_graceful_stop_is_pending() {
     let engine = Arc::new(ScriptedEngine::new());
     let a_control = engine.script();
     let _gate = a_control.block_graceful();
-    let _b_control = engine.script();
     let lifecycle = Lifecycle::spawn(engine.clone());
     let handle = lifecycle.handle();
     let load_a = tokio::spawn({
@@ -780,7 +785,7 @@ async fn readiness_cancellation_blocks_new_launch_until_cleanup_finishes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn late_spawn_after_cancellation_is_cleaned_before_new_launch() {
+async fn cancelled_spawn_future_cannot_create_a_late_process() {
     let engine = Arc::new(ScriptedEngine::new());
     let spawn_gate = engine.block_spawn();
     let _a_control = engine.script();
@@ -797,17 +802,14 @@ async fn late_spawn_after_cancellation_is_cleaned_before_new_launch() {
         async move { handle.eject().await }
     });
     settle().await;
-    let load_b = tokio::spawn(async move { handle.load(model("b")).await });
-    settle().await;
     assert_eq!(engine.spawn_count(), 0);
-    assert!(!eject.is_finished());
-    assert_eq!(load_b.await.unwrap().unwrap_err().code(), "model_starting");
+    assert!(eject.is_finished());
 
+    eject.await.unwrap().unwrap();
     spawn_gate.notify_waiters();
     settle().await;
-    eject.await.unwrap().unwrap();
-    assert_eq!(engine.spawn_count(), 1);
-    assert_eq!(engine.shutdown_counts().0, 1);
+    assert_eq!(engine.spawn_count(), 0);
+    assert_eq!(engine.shutdown_counts().0, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -853,6 +855,98 @@ async fn force_timeout_aggregates_stop_requests_and_blocks_replacement() {
         lifecycle.handle().snapshot().state,
         LifecycleState::Stopping
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_all_command_owners_terminates_stopped_actor() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let weak = Arc::downgrade(&engine);
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    drop(engine);
+
+    lifecycle.wait_for_termination().await;
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_all_command_owners_stops_running_process_before_actor_exit() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    wait_for_state(&handle, LifecycleState::Starting).await;
+    control.ready();
+    load.await.unwrap().unwrap();
+    drop(handle);
+
+    lifecycle.wait_for_termination().await;
+    assert_eq!(engine.shutdown_counts(), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn validation_and_spawn_have_actor_enforced_timeouts() {
+    let validating = Arc::new(ScriptedEngine::new());
+    let _validation_gate = validating.block_validation();
+    let _validation_process = validating.script();
+    let validation_lifecycle = Lifecycle::spawn(validating);
+    let validation_handle = validation_lifecycle.handle();
+    let validation = tokio::spawn(async move { validation_handle.load(model("a")).await });
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(
+        validation.await.unwrap().unwrap_err().code(),
+        "model_load_failed"
+    );
+
+    let spawning = Arc::new(ScriptedEngine::new());
+    let _spawn_gate = spawning.block_spawn();
+    let _spawn_process = spawning.script();
+    let spawn_lifecycle = Lifecycle::spawn(spawning);
+    let spawn_handle = spawn_lifecycle.handle();
+    let spawn = tokio::spawn(async move { spawn_handle.load(model("a")).await });
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(
+        spawn.await.unwrap().unwrap_err().code(),
+        "model_load_failed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_model_start_waiters_are_capped_without_duplicate_spawn() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let target = model("a");
+    let mut loads = Vec::new();
+    for _ in 0..160 {
+        loads.push(tokio::spawn({
+            let handle = handle.clone();
+            let target = target.clone();
+            async move { handle.load(target).await }
+        }));
+    }
+    wait_for_state(&handle, LifecycleState::Starting).await;
+    while loads.iter().filter(|load| load.is_finished()).count() < 32 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(engine.spawn_count(), 1);
+    control.ready();
+
+    let mut busy = 0;
+    let mut success = 0;
+    for load in loads {
+        match load.await.unwrap() {
+            Ok(()) => success += 1,
+            Err(error) if error.code() == "model_busy" => busy += 1,
+            Err(error) => panic!("unexpected load error: {}", error.code()),
+        }
+    }
+    assert_eq!(success, 128);
+    assert_eq!(busy, 32);
 }
 
 #[test]

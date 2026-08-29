@@ -5,8 +5,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{AppError, EngineProcess, InferenceEngine, ModelId, ModelRecord};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const START_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTHY_RESET: Duration = Duration::from_secs(300);
+const COMMAND_CAPACITY: usize = 64;
+const MAX_START_WAITERS: usize = 128;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -49,24 +52,22 @@ impl Default for LifecycleSnapshot {
 
 pub struct Lifecycle {
     handle: LifecycleHandle,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Lifecycle {
     #[must_use]
     pub fn spawn(engine: Arc<dyn InferenceEngine>) -> Self {
-        let (commands, receiver) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+        let (releases, release_receiver) = mpsc::unbounded_channel();
         let (snapshots, _) = watch::channel(LifecycleSnapshot::default());
         let handle = LifecycleHandle {
             commands,
+            releases,
             snapshots: snapshots.clone(),
         };
-        tokio::spawn(run_actor(
-            engine,
-            handle.commands.clone(),
-            receiver,
-            snapshots,
-        ));
-        Self { handle }
+        let task = tokio::spawn(run_actor(engine, receiver, release_receiver, snapshots));
+        Self { handle, task }
     }
 
     #[must_use]
@@ -78,11 +79,18 @@ impl Lifecycle {
     pub fn subscribe(&self) -> watch::Receiver<LifecycleSnapshot> {
         self.handle.subscribe()
     }
+
+    pub async fn wait_for_termination(self) {
+        let Self { handle, task } = self;
+        drop(handle);
+        let _ = task.await;
+    }
 }
 
 #[derive(Clone)]
 pub struct LifecycleHandle {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::Sender<Command>,
+    releases: mpsc::UnboundedSender<LeaseRelease>,
     snapshots: watch::Sender<LifecycleSnapshot>,
 }
 
@@ -91,6 +99,7 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Load { model, reply })
+            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -98,7 +107,12 @@ impl LifecycleHandle {
     pub async fn acquire(&self, model: ModelRecord) -> Result<InferenceLease, AppError> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(Command::Acquire { model, reply })
+            .send(Command::Acquire {
+                model,
+                releases: self.releases.clone(),
+                reply,
+            })
+            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -107,6 +121,7 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Eject { reply })
+            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -115,6 +130,7 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Shutdown { reply })
+            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -131,7 +147,7 @@ impl LifecycleHandle {
 }
 
 pub struct InferenceLease {
-    commands: mpsc::UnboundedSender<Command>,
+    releases: mpsc::UnboundedSender<LeaseRelease>,
     generation: u64,
     id: u64,
     cancelled: watch::Receiver<bool>,
@@ -152,7 +168,7 @@ impl InferenceLease {
 
 impl Drop for InferenceLease {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Release {
+        let _ = self.releases.send(LeaseRelease {
             generation: self.generation,
             id: self.id,
         });
@@ -166,11 +182,8 @@ enum Command {
     },
     Acquire {
         model: ModelRecord,
+        releases: mpsc::UnboundedSender<LeaseRelease>,
         reply: oneshot::Sender<Result<InferenceLease, AppError>>,
-    },
-    Release {
-        generation: u64,
-        id: u64,
     },
     Eject {
         reply: oneshot::Sender<Result<(), AppError>>,
@@ -180,9 +193,20 @@ enum Command {
     },
 }
 
+struct LeaseRelease {
+    generation: u64,
+    id: u64,
+}
+
+struct AcquireWaiter {
+    releases: mpsc::UnboundedSender<LeaseRelease>,
+    reply: oneshot::Sender<Result<InferenceLease, AppError>>,
+}
+
 enum ProcessEvent<T> {
     Process(Result<T, AppError>),
     Command(Option<Command>),
+    Release(LeaseRelease),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -196,6 +220,7 @@ enum StopEvent {
     Graceful(Result<(), AppError>),
     Timeout,
     Command(Option<Command>),
+    Release(LeaseRelease),
 }
 
 enum StartOutcome {
@@ -246,15 +271,24 @@ async fn launch_process(
             return StartOutcome::ValidationFailed(error);
         },
         _ = cancelled.changed() => return StartOutcome::Cancelled,
+        () = tokio::time::sleep(START_OPERATION_TIMEOUT) => {
+            return StartOutcome::LoadFailed(load_error("engine validation timed out"));
+        }
     }
     if *cancelled.borrow() {
         return StartOutcome::Cancelled;
     }
 
-    // Spawn is deliberately allowed to finish after cancellation. Dropping an arbitrary engine's
-    // spawn future is not guaranteed to undo a child it already created; a stale returned process
-    // is instead cleaned up below before the task exits.
-    let mut process = match engine.spawn(&model, &model.launch_profile.settings).await {
+    let spawn = engine.spawn(&model, &model.launch_profile.settings);
+    tokio::pin!(spawn);
+    let spawned = tokio::select! {
+        result = &mut spawn => result,
+        _ = cancelled.changed() => return StartOutcome::Cancelled,
+        () = tokio::time::sleep(START_OPERATION_TIMEOUT) => {
+            return StartOutcome::LoadFailed(load_error("engine spawn timed out"));
+        }
+    };
+    let mut process = match spawned {
         Ok(process) => process,
         Err(_error) if *cancelled.borrow() => return StartOutcome::Cancelled,
         Err(error) => return StartOutcome::LoadFailed(error),
@@ -300,18 +334,20 @@ async fn stop_owned_process(process: &mut dyn EngineProcess) -> Result<(), AppEr
 
 async fn select_exit(
     process: &mut dyn EngineProcess,
-    commands: &mut mpsc::UnboundedReceiver<Command>,
+    commands: &mut mpsc::Receiver<Command>,
+    releases: &mut mpsc::UnboundedReceiver<LeaseRelease>,
 ) -> ProcessEvent<i32> {
     tokio::select! {
         result = process.wait_for_exit() => ProcessEvent::Process(result),
         command = commands.recv() => ProcessEvent::Command(command),
+        Some(release) = releases.recv() => ProcessEvent::Release(release),
     }
 }
 
 struct Actor {
     engine: Arc<dyn InferenceEngine>,
-    commands_tx: mpsc::UnboundedSender<Command>,
-    commands: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::Receiver<Command>,
+    releases: mpsc::UnboundedReceiver<LeaseRelease>,
     snapshots: watch::Sender<LifecycleSnapshot>,
     snapshot: LifecycleSnapshot,
     desired: Option<ModelRecord>,
@@ -323,15 +359,15 @@ struct Actor {
 
 async fn run_actor(
     engine: Arc<dyn InferenceEngine>,
-    commands_tx: mpsc::UnboundedSender<Command>,
-    commands: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::Receiver<Command>,
+    releases: mpsc::UnboundedReceiver<LeaseRelease>,
     snapshots: watch::Sender<LifecycleSnapshot>,
 ) {
     let (lease_cancel, _) = watch::channel(false);
     let mut actor = Actor {
         engine,
-        commands_tx,
         commands,
+        releases,
         snapshots,
         snapshot: LifecycleSnapshot::default(),
         desired: None,
@@ -355,19 +391,35 @@ impl Actor {
     }
 
     async fn stopped(&mut self) {
-        while let Some(command) = self.commands.recv().await {
+        loop {
+            let command = tokio::select! {
+                command = self.commands.recv() => command,
+                Some(release) = self.releases.recv() => {
+                    self.handle_release(release);
+                    continue;
+                }
+            };
+            let Some(command) = command else {
+                return;
+            };
             match command {
                 Command::Load { model, reply } => {
                     if !self.start(model, vec![reply], Vec::new()).await {
                         return;
                     }
                 }
-                Command::Acquire { model, reply } => {
-                    if !self.start(model, Vec::new(), vec![reply]).await {
+                Command::Acquire {
+                    model,
+                    releases,
+                    reply,
+                } => {
+                    if !self
+                        .start(model, Vec::new(), vec![AcquireWaiter { releases, reply }])
+                        .await
+                    {
                         return;
                     }
                 }
-                Command::Release { .. } => {}
                 Command::Eject { reply } => {
                     self.clear_desired();
                     let _ = reply.send(Ok(()));
@@ -385,7 +437,7 @@ impl Actor {
         &mut self,
         model: ModelRecord,
         mut loads: Vec<oneshot::Sender<Result<(), AppError>>>,
-        mut acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
+        mut acquires: Vec<AcquireWaiter>,
     ) -> bool {
         self.snapshot.generation += 1;
         let generation = self.snapshot.generation;
@@ -402,6 +454,8 @@ impl Actor {
         let mut shutdown_after_cancel = false;
         let mut stop_waiters = Vec::new();
         loop {
+            loads.retain(|reply| !reply.is_closed());
+            acquires.retain(|waiter| !waiter.reply.is_closed());
             tokio::select! {
                 outcome = &mut launch => match outcome.unwrap_or_else(|error| StartOutcome::LoadFailed(load_error(&error.to_string()))) {
                     StartOutcome::Ready(mut process) if cancelling => {
@@ -462,10 +516,18 @@ impl Actor {
                         let _ = reply.send(Err(AppError::ModelStarting));
                     }
                     Some(Command::Load { model: same, reply }) if same.id == model.id => {
-                        loads.push(reply)
+                        if loads.len() + acquires.len() >= MAX_START_WAITERS {
+                            let _ = reply.send(Err(AppError::ModelBusy));
+                        } else {
+                            loads.push(reply)
+                        }
                     }
-                    Some(Command::Acquire { model: same, reply }) if same.id == model.id => {
-                        acquires.push(reply)
+                    Some(Command::Acquire { model: same, releases, reply }) if same.id == model.id => {
+                        if loads.len() + acquires.len() >= MAX_START_WAITERS {
+                            let _ = reply.send(Err(AppError::ModelBusy));
+                        } else {
+                            acquires.push(AcquireWaiter { releases, reply })
+                        }
                     }
                     Some(Command::Eject { reply }) => {
                         cancel.send_replace(true);
@@ -486,9 +548,14 @@ impl Actor {
                     Some(Command::Acquire { reply, .. }) => {
                         let _ = reply.send(Err(AppError::ModelStarting));
                     }
-                    Some(Command::Release { .. }) => {}
-                    None => return false,
+                    None => {
+                        cancel.send_replace(true);
+                        cancelling = true;
+                        shutdown_after_cancel = true;
+                        self.set_state(LifecycleState::Stopping);
+                    }
                 },
+                Some(release) = self.releases.recv() => self.handle_release(release),
             }
         }
     }
@@ -501,7 +568,7 @@ impl Actor {
     ) -> bool {
         let started = tokio::time::Instant::now();
         loop {
-            match select_exit(&mut *process, &mut self.commands).await {
+            match select_exit(&mut *process, &mut self.commands, &mut self.releases).await {
                 ProcessEvent::Process(result) => {
                     let diagnostic = match result {
                         Ok(code) => format!("engine exited with code {code}"),
@@ -517,8 +584,12 @@ impl Actor {
                     return Box::pin(self.backoff(model, generation)).await;
                 }
                 ProcessEvent::Command(command) => match command {
-                    Some(Command::Acquire { model: same, reply }) if same.id == model.id => {
-                        let lease = self.new_lease(generation);
+                    Some(Command::Acquire {
+                        model: same,
+                        releases,
+                        reply,
+                    }) if same.id == model.id => {
+                        let lease = self.new_lease(generation, releases);
                         let id = lease.id;
                         if reply.send(Ok(lease)).is_ok() {
                             self.active_leases.insert(id);
@@ -551,15 +622,6 @@ impl Actor {
                     Some(Command::Acquire { reply, .. }) => {
                         let _ = reply.send(Err(AppError::ModelBusy));
                     }
-                    Some(Command::Release {
-                        generation: released,
-                        id,
-                    }) if released == generation => {
-                        if self.active_leases.remove(&id) {
-                            self.sync_in_flight();
-                        }
-                    }
-                    Some(Command::Release { .. }) => {}
                     Some(Command::Eject { reply }) => {
                         self.cancel_leases();
                         let (directive, failure) = self.stop_process(&mut *process).await;
@@ -586,8 +648,17 @@ impl Actor {
                         let _ = reply.send(Ok(()));
                         return false;
                     }
-                    None => return false,
+                    None => {
+                        self.cancel_leases();
+                        let (_, failure) = self.stop_process(&mut *process).await;
+                        if let Some(diagnostic) = failure {
+                            self.snapshot.diagnostic = Some(diagnostic);
+                            self.set_state(LifecycleState::Stopping);
+                        }
+                        return false;
+                    }
                 },
+                ProcessEvent::Release(release) => self.handle_release(release),
             }
         }
     }
@@ -610,18 +681,17 @@ impl Actor {
                     Some(Command::Load { model: same, reply }) if same.id == model.id => {
                         let _ = reply.send(Err(AppError::ModelStarting));
                     }
-                    Some(Command::Acquire { model: same, reply }) if same.id == model.id => {
+                    Some(Command::Acquire { model: same, reply, .. }) if same.id == model.id => {
                         let _ = reply.send(Err(AppError::ModelStarting));
                     }
                     Some(Command::Load { model: next, reply }) => {
                         self.failures = 0;
                         return Box::pin(self.start(next, vec![reply], Vec::new())).await;
                     }
-                    Some(Command::Acquire { model: next, reply }) => {
+                    Some(Command::Acquire { model: next, releases, reply }) => {
                         self.failures = 0;
-                        return Box::pin(self.start(next, Vec::new(), vec![reply])).await;
+                        return Box::pin(self.start(next, Vec::new(), vec![AcquireWaiter { releases, reply }])).await;
                     }
-                    Some(Command::Release { .. }) => {}
                     Some(Command::Eject { reply }) => {
                         self.clear_desired();
                         let _ = reply.send(Ok(()));
@@ -633,7 +703,8 @@ impl Actor {
                         return false;
                     }
                     None => return false,
-                }
+                },
+                Some(release) = self.releases.recv() => self.handle_release(release),
             }
         }
     }
@@ -644,7 +715,17 @@ impl Actor {
             .diagnostic
             .clone()
             .unwrap_or_else(|| "process stop was not confirmed".to_owned());
-        while let Some(command) = self.commands.recv().await {
+        loop {
+            let command = tokio::select! {
+                command = self.commands.recv() => command,
+                Some(release) = self.releases.recv() => {
+                    self.handle_release(release);
+                    continue;
+                }
+            };
+            let Some(command) = command else {
+                return false;
+            };
             match command {
                 Command::Load { reply, .. } => {
                     let _ = reply.send(Err(AppError::ModelStarting));
@@ -652,39 +733,40 @@ impl Actor {
                 Command::Acquire { reply, .. } => {
                     let _ = reply.send(Err(AppError::ModelStarting));
                 }
-                Command::Release { id, .. } => {
-                    if self.active_leases.remove(&id) {
-                        self.sync_in_flight();
-                    }
-                }
                 Command::Eject { reply } | Command::Shutdown { reply } => {
                     let _ = reply.send(Err(stop_error(&diagnostic)));
                 }
             }
         }
-        false
     }
 
-    fn grant_acquires(
-        &mut self,
-        acquires: &mut Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
-        generation: u64,
-    ) {
-        for reply in acquires.drain(..) {
-            let lease = self.new_lease(generation);
+    fn handle_release(&mut self, release: LeaseRelease) {
+        if release.generation == self.snapshot.generation && self.active_leases.remove(&release.id)
+        {
+            self.sync_in_flight();
+        }
+    }
+
+    fn grant_acquires(&mut self, acquires: &mut Vec<AcquireWaiter>, generation: u64) {
+        for waiter in acquires.drain(..) {
+            let lease = self.new_lease(generation, waiter.releases);
             let id = lease.id;
-            if reply.send(Ok(lease)).is_ok() {
+            if waiter.reply.send(Ok(lease)).is_ok() {
                 self.active_leases.insert(id);
             }
         }
         self.sync_in_flight();
     }
 
-    fn new_lease(&mut self, generation: u64) -> InferenceLease {
+    fn new_lease(
+        &mut self,
+        generation: u64,
+        releases: mpsc::UnboundedSender<LeaseRelease>,
+    ) -> InferenceLease {
         let id = self.next_lease_id;
         self.next_lease_id = self.next_lease_id.wrapping_add(1);
         InferenceLease {
-            commands: self.commands_tx.clone(),
+            releases,
             generation,
             id,
             cancelled: self.lease_cancel.subscribe(),
@@ -721,6 +803,7 @@ impl Actor {
                     result = &mut graceful => StopEvent::Graceful(result),
                     () = &mut timeout => StopEvent::Timeout,
                     command = self.commands.recv() => StopEvent::Command(command),
+                    Some(release) = self.releases.recv() => StopEvent::Release(release),
                 };
                 match event {
                     StopEvent::Graceful(result) => break result.is_err(),
@@ -728,6 +811,7 @@ impl Actor {
                     StopEvent::Command(command) => {
                         self.handle_stop_command(command, &mut directive, &mut waiters)
                     }
+                    StopEvent::Release(release) => self.handle_release(release),
                 }
             }
         };
@@ -743,6 +827,7 @@ impl Actor {
                         result = &mut force => StopEvent::Graceful(result),
                         () = &mut timeout => StopEvent::Timeout,
                         command = self.commands.recv() => StopEvent::Command(command),
+                        Some(release) = self.releases.recv() => StopEvent::Release(release),
                     };
                     match event {
                         StopEvent::Graceful(result) => {
@@ -752,6 +837,7 @@ impl Actor {
                         StopEvent::Command(command) => {
                             self.handle_stop_command(command, &mut directive, &mut waiters)
                         }
+                        StopEvent::Release(release) => self.handle_release(release),
                     }
                 }
             };
@@ -771,11 +857,6 @@ impl Actor {
         waiters: &mut Vec<oneshot::Sender<Result<(), AppError>>>,
     ) {
         match command {
-            Some(Command::Release { id, .. }) => {
-                if self.active_leases.remove(&id) {
-                    self.sync_in_flight();
-                }
-            }
             Some(Command::Eject { reply }) => {
                 if *directive != StopDirective::Shutdown {
                     *directive = StopDirective::Cancel;
@@ -811,7 +892,7 @@ impl Actor {
     fn load_failed(
         &mut self,
         loads: Vec<oneshot::Sender<Result<(), AppError>>>,
-        acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
+        acquires: Vec<AcquireWaiter>,
         error: AppError,
     ) {
         let diagnostic = error.to_string();
@@ -825,14 +906,16 @@ impl Actor {
 
 fn fail_waiters_shared(
     loads: Vec<oneshot::Sender<Result<(), AppError>>>,
-    acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
+    acquires: Vec<AcquireWaiter>,
     source: Arc<AppError>,
 ) {
     for reply in loads {
         let _ = reply.send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
     }
-    for reply in acquires {
-        let _ = reply.send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
+    for waiter in acquires {
+        let _ = waiter
+            .reply
+            .send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
     }
 }
 
@@ -852,7 +935,7 @@ fn stop_error(diagnostic: &str) -> AppError {
 
 fn fail_waiters(
     loads: Vec<oneshot::Sender<Result<(), AppError>>>,
-    acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
+    acquires: Vec<AcquireWaiter>,
     error: AppError,
 ) {
     let diagnostic = error.to_string();
@@ -861,16 +944,13 @@ fn fail_waiters(
         let error = first.take().unwrap_or_else(|| load_error(&diagnostic));
         let _ = reply.send(Err(error));
     }
-    for reply in acquires {
+    for waiter in acquires {
         let error = first.take().unwrap_or_else(|| load_error(&diagnostic));
-        let _ = reply.send(Err(error));
+        let _ = waiter.reply.send(Err(error));
     }
 }
 
-fn fail_cancelled(
-    loads: Vec<oneshot::Sender<Result<(), AppError>>>,
-    acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
-) {
+fn fail_cancelled(loads: Vec<oneshot::Sender<Result<(), AppError>>>, acquires: Vec<AcquireWaiter>) {
     fail_waiters(loads, acquires, load_error("load cancelled"));
 }
 
