@@ -1,7 +1,14 @@
-use std::{collections::VecDeque, io, sync::Arc};
+use std::{
+    collections::VecDeque,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
-use regex::{Captures, Regex};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -84,8 +91,8 @@ pub struct LogStore {
     limits: LogStoreLimits,
     records: Arc<Mutex<StoredRecords>>,
     sender: broadcast::Sender<LogRecord>,
-    authorization: Arc<Regex>,
     bearer: Arc<Regex>,
+    total_delivery_drops: Arc<AtomicU64>,
 }
 
 impl LogStore {
@@ -98,13 +105,10 @@ impl LogStore {
             limits,
             records: Arc::new(Mutex::new(StoredRecords::default())),
             sender,
-            authorization: Arc::new(
-                Regex::new(r"(?im)(authorization\s*:\s*)([^\r\n]*)")
-                    .expect("authorization redaction regex is valid"),
-            ),
             bearer: Arc::new(
                 Regex::new(r"(?i)\bbearer\s+([^\s,;]+)").expect("bearer redaction regex is valid"),
             ),
+            total_delivery_drops: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -125,7 +129,9 @@ impl LogStore {
                 }
             }
         }
-        let _ = self.sender.send(record);
+        if self.sender.send(record).is_err() {
+            saturating_add(&self.total_delivery_drops, 1);
+        }
     }
 
     #[must_use]
@@ -146,7 +152,18 @@ impl LogStore {
 
     #[must_use]
     pub fn subscribe(&self) -> LogSubscriber {
-        LogSubscriber(self.sender.subscribe())
+        LogSubscriber {
+            receiver: self.sender.subscribe(),
+            total_delivery_drops: Arc::clone(&self.total_delivery_drops),
+            local_delivery_drops: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns observed delivery losses. A lagged record is counted once per subscriber that
+    /// observes it, while a send with no subscribers is counted once.
+    #[must_use]
+    pub fn total_delivery_drops(&self) -> u64 {
+        self.total_delivery_drops.load(Ordering::Relaxed)
     }
 
     pub fn export_json_lines(&self, mut writer: impl io::Write) -> io::Result<()> {
@@ -159,35 +176,83 @@ impl LogStore {
     }
 
     fn redact(&self, message: &str) -> String {
-        let message = self
-            .authorization
-            .replace_all(message, |captures: &Captures<'_>| {
-                let prefix = captures
-                    .get(1)
-                    .map_or("Authorization: ", |value| value.as_str());
-                let credential = captures.get(2).map_or("", |value| value.as_str());
-                if credential
-                    .trim_start()
-                    .to_ascii_lowercase()
-                    .starts_with("bearer")
-                {
-                    format!("{prefix}Bearer [REDACTED]")
-                } else {
-                    format!("{prefix}[REDACTED]")
-                }
-            });
+        let message = redact_authorization_headers(message);
         self.bearer
             .replace_all(&message, "Bearer [REDACTED]")
             .into_owned()
     }
 }
 
-pub struct LogSubscriber(broadcast::Receiver<LogRecord>);
+pub struct LogSubscriber {
+    receiver: broadcast::Receiver<LogRecord>,
+    total_delivery_drops: Arc<AtomicU64>,
+    local_delivery_drops: AtomicU64,
+}
 
 impl LogSubscriber {
     pub fn try_recv(&mut self) -> Result<LogRecord, LogRecvError> {
-        self.0.try_recv().map_err(LogRecvError)
+        self.receiver.try_recv().map_err(|error| {
+            if let broadcast::error::TryRecvError::Lagged(count) = error {
+                saturating_add(&self.local_delivery_drops, count);
+                saturating_add(&self.total_delivery_drops, count);
+            }
+            LogRecvError(error)
+        })
     }
+
+    #[must_use]
+    pub fn local_delivery_drops(&self) -> u64 {
+        self.local_delivery_drops.load(Ordering::Relaxed)
+    }
+}
+
+fn saturating_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
+fn redact_authorization_headers(message: &str) -> String {
+    let mut output = String::with_capacity(message.len());
+    let mut authorization_continuation = false;
+    for line in message.split_inclusive('\n') {
+        let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
+            (content, "\r\n")
+        } else if let Some(content) = line.strip_suffix('\n') {
+            (content, "\n")
+        } else {
+            (line, "")
+        };
+        if authorization_continuation && content.starts_with([' ', '\t']) {
+            let whitespace_len = content.len() - content.trim_start_matches([' ', '\t']).len();
+            output.push_str(&content[..whitespace_len]);
+            output.push_str("[REDACTED]");
+            output.push_str(ending);
+            continue;
+        }
+        authorization_continuation = false;
+        if let Some((name, value)) = content.split_once(':')
+            && name.trim().eq_ignore_ascii_case("authorization")
+        {
+            output.push_str(&content[..name.len()]);
+            output.push(':');
+            if value
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("bearer")
+            {
+                output.push_str(" Bearer [REDACTED]");
+            } else {
+                output.push_str(" [REDACTED]");
+            }
+            output.push_str(ending);
+            authorization_continuation = true;
+        } else {
+            output.push_str(content);
+            output.push_str(ending);
+        }
+    }
+    output
 }
 
 #[derive(Debug)]
@@ -215,8 +280,9 @@ pub struct EngineLogFramer {
     discarding_oversized: bool,
 }
 
+pub const MAX_ENGINE_LOG_LINE_BYTES: usize = 1024 * 1024;
+
 impl EngineLogFramer {
-    #[must_use]
     pub fn new(
         store: LogStore,
         source: LogSource,
@@ -224,18 +290,25 @@ impl EngineLogFramer {
         generation: Option<u64>,
         model_id: Option<ModelId>,
         max_line_bytes: usize,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AppError> {
+        if max_line_bytes == 0 || max_line_bytes > MAX_ENGINE_LOG_LINE_BYTES {
+            return Err(AppError::InvalidLogLimit("max_line_bytes"));
+        }
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(max_line_bytes)
+            .map_err(|error| AppError::LogBufferAllocation(Box::new(error)))?;
+        Ok(Self {
             store,
             source,
             level,
             generation,
             model_id,
             max_line_bytes,
-            pending: Vec::with_capacity(max_line_bytes),
+            pending,
             pending_cr: false,
             discarding_oversized: false,
-        }
+        })
     }
 
     pub fn push(&mut self, timestamp_ms: u64, bytes: &[u8]) {

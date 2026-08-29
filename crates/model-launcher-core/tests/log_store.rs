@@ -1,5 +1,6 @@
 use model_launcher_core::{
-    EngineLogFramer, LogFilter, LogLevel, LogRecord, LogSource, LogStore, LogStoreLimits, ModelId,
+    EngineLogFramer, LogFilter, LogLevel, LogRecord, LogSource, LogStore, LogStoreLimits,
+    MAX_ENGINE_LOG_LINE_BYTES, ModelId,
 };
 use uuid::Uuid;
 
@@ -126,6 +127,41 @@ fn authorization_and_bearer_secrets_are_redacted_before_storage_and_broadcast() 
 }
 
 #[test]
+fn folded_authorization_credentials_are_redacted_from_every_observation_surface() {
+    let store = store(LogStoreLimits::new(8, 4_096, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = [
+        "basic-folded",
+        "digest-folded",
+        "custom-folded",
+        "continued-secret",
+    ];
+    store.append(record(
+        1,
+        concat!(
+            "Authorization:\r\n Basic basic-folded\r\n",
+            "aUtHoRiZaTiOn:\n\tDigest digest-folded\n",
+            "AUTHORIZATION: Custom custom-folded\r\n",
+            "\tcontinued-secret\r\nsafe: visible"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(snapshot[0].message.contains("safe: visible"));
+}
+
+#[test]
 fn bounded_broadcast_reports_lagged_record_count() {
     let store = store(LogStoreLimits::new(8, 1_024, 2));
     let mut subscriber = store.subscribe();
@@ -146,7 +182,8 @@ fn engine_bytes_frame_crlf_split_chunks_lossy_utf8_and_eof_partial() {
         Some(9),
         Some(model_id()),
         64,
-    );
+    )
+    .expect("valid framer limits");
     stdout.push(10, b"hel");
     stdout.push(11, b"lo\r\nworld\nlossy:\xff");
     stdout.finish(12);
@@ -178,7 +215,8 @@ fn oversized_lines_are_truncated_and_framing_continues_with_bounded_pending_data
         None,
         None,
         5,
-    );
+    )
+    .expect("valid framer limits");
 
     stderr.push(1, b"abcdefghij");
     assert!(stderr.pending_len() <= 5);
@@ -201,7 +239,8 @@ fn crlf_terminator_does_not_consume_the_line_content_limit_across_chunks() {
         None,
         None,
         5,
-    );
+    )
+    .expect("valid framer limits");
 
     stdout.push(1, b"abcde\r");
     stdout.push(2, b"\n");
@@ -220,7 +259,8 @@ fn bare_carriage_return_counts_as_content_and_overflows_only_past_the_limit() {
         None,
         None,
         5,
-    );
+    )
+    .expect("valid framer limits");
 
     stdout.push(1, b"abcd\r");
     stdout.push(2, b"X\n");
@@ -253,4 +293,45 @@ fn zero_record_or_byte_retention_disables_storage_but_keeps_broadcasting() {
         assert!(store.snapshot().is_empty());
         assert_eq!(subscriber.try_recv().unwrap().message, "broadcast only");
     }
+}
+
+#[test]
+fn engine_framer_rejects_zero_and_unbounded_line_limits_but_accepts_the_hard_limit() {
+    let make = |max_line_bytes| {
+        EngineLogFramer::new(
+            store(LogStoreLimits::new(8, 1_024, 2)),
+            LogSource::EngineStdout,
+            LogLevel::Info,
+            None,
+            None,
+            max_line_bytes,
+        )
+    };
+
+    for invalid in [0, MAX_ENGINE_LOG_LINE_BYTES + 1, usize::MAX] {
+        let error = make(invalid).err().expect("invalid line limit must fail");
+        assert_eq!(error.code(), "invalid_log_limit");
+        assert_eq!(error.to_string(), "invalid log limit: max_line_bytes");
+    }
+    assert!(make(MAX_ENGINE_LOG_LINE_BYTES).is_ok());
+}
+
+#[test]
+fn delivery_drop_accounting_covers_no_receivers_lag_and_multiple_receivers() {
+    let store = store(LogStoreLimits::new(16, 4_096, 2));
+    store.append(record(0, "no receivers"));
+    assert_eq!(store.total_delivery_drops(), 1);
+
+    let mut first = store.subscribe();
+    let mut second = store.subscribe();
+    for timestamp in 1..=5 {
+        store.append(record(timestamp, "event"));
+    }
+    assert_eq!(first.try_recv().unwrap_err().lagged(), Some(3));
+    assert_eq!(first.local_delivery_drops(), 3);
+    assert_eq!(store.total_delivery_drops(), 4);
+
+    assert_eq!(second.try_recv().unwrap_err().lagged(), Some(3));
+    assert_eq!(second.local_delivery_drops(), 3);
+    assert_eq!(store.total_delivery_drops(), 7);
 }

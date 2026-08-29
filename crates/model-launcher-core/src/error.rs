@@ -20,6 +20,8 @@ pub enum AppError {
     InvalidSetting(&'static str),
     #[error("invalid log limit: {0}")]
     InvalidLogLimit(&'static str),
+    #[error("log buffer allocation failed")]
+    LogBufferAllocation(#[source] BoxError),
     #[error("engine process failed")]
     EngineProcess(#[source] BoxError),
     #[error("configuration I/O failed")]
@@ -40,6 +42,7 @@ impl AppError {
             Self::EngineUnavailable => "engine_unavailable",
             Self::InvalidSetting(_) => "invalid_setting",
             Self::InvalidLogLimit(_) => "invalid_log_limit",
+            Self::LogBufferAllocation(_) => "log_buffer_allocation",
             Self::EngineProcess(_) => "engine_process",
             Self::ConfigIo(_) => "config_io",
             Self::ConfigFormat(_) => "config_format",
@@ -96,6 +99,10 @@ mod tests {
             (
                 AppError::InvalidLogLimit("broadcast_capacity"),
                 "invalid_log_limit",
+            ),
+            (
+                AppError::LogBufferAllocation(Box::new(io::Error::other("allocation diagnostic"))),
+                "log_buffer_allocation",
             ),
             (
                 AppError::EngineProcess(Box::new(io::Error::other("process diagnostic"))),
