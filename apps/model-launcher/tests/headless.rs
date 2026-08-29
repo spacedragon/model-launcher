@@ -197,6 +197,7 @@ async fn launcher_settings_persist_root_and_defaults_for_new_models() {
     let handle = service.handle();
     let defaults = LaunchSettings {
         context_length: Some(model_launcher_core::ContextLength::new(6144).unwrap()),
+        kv_cache_type: Some(model_launcher_core::KvCacheType::Q4_0),
         ..LaunchSettings::default()
     };
     handle
@@ -217,6 +218,36 @@ async fn launcher_settings_persist_root_and_defaults_for_new_models() {
     let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
     assert_eq!(saved.catalog_directory, Some(replacement));
     handle.shutdown().await.unwrap();
+
+    let restarted = Service::start_with_desktop_dependencies(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        Arc::new(RecordingSettings(Arc::new(std::sync::Mutex::new(
+            Vec::new(),
+        )))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restarted
+            .handle()
+            .launcher_settings()
+            .default_launch_settings
+            .kv_cache_type,
+        Some(model_launcher_core::KvCacheType::Q4_0)
+    );
+    assert_eq!(
+        restarted.handle().snapshot().models[0]
+            .launch_profile
+            .settings
+            .kv_cache_type,
+        Some(model_launcher_core::KvCacheType::Q4_0)
+    );
+    restarted.handle().shutdown().await.unwrap();
 }
 
 #[tokio::test]

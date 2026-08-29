@@ -88,12 +88,13 @@ pub fn run_desktop(
               threads,
               batch,
               parallel,
-              flash| {
+              flash,
+              kv| {
             (actions.save_settings)(EngineSettings {
                 model_directory: model_directory.into(),
                 distribution: distribution.into(),
                 executable: executable.into(),
-                defaults: launch_settings(context, gpu, threads, batch, parallel, flash),
+                defaults: launch_settings(context, gpu, threads, batch, parallel, flash, &kv),
             })
         }
     });
@@ -307,12 +308,13 @@ fn create_window(
               threads,
               batch,
               parallel,
-              flash| {
+              flash,
+              kv| {
             (actions.save_settings)(EngineSettings {
                 model_directory: model_directory.into(),
                 distribution: distribution.into(),
                 executable: executable.into(),
-                defaults: launch_settings(context, gpu, threads, batch, parallel, flash),
+                defaults: launch_settings(context, gpu, threads, batch, parallel, flash, &kv),
             })
         }
     });
@@ -524,6 +526,18 @@ fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
             .map_or(1, |value| value.get()) as i32,
     );
     window.set_default_flash(settings.defaults.flash_attention.unwrap_or(false));
+    window.set_default_kv(
+        match settings
+            .defaults
+            .kv_cache_type
+            .unwrap_or(model_launcher_core::KvCacheType::F16)
+        {
+            model_launcher_core::KvCacheType::F16 => "f16",
+            model_launcher_core::KvCacheType::Q8_0 => "q8_0",
+            model_launcher_core::KvCacheType::Q4_0 => "q4_0",
+        }
+        .into(),
+    );
 }
 
 fn hydrate_server(window: &MainWindow, snapshot: &AppSnapshot) {
@@ -538,6 +552,7 @@ fn launch_settings(
     batch: i32,
     parallel: i32,
     flash: bool,
+    kv: &str,
 ) -> LaunchSettings {
     LaunchSettings {
         context_length: model_launcher_core::ContextLength::new(context.max(1) as u32).ok(),
@@ -546,7 +561,11 @@ fn launch_settings(
         batch_size: model_launcher_core::BatchSize::new(batch.max(1) as u32).ok(),
         parallel_slots: model_launcher_core::ParallelSlots::new(parallel.max(1) as u32).ok(),
         flash_attention: Some(flash),
-        kv_cache_type: None,
+        kv_cache_type: Some(match kv {
+            "q8_0" => model_launcher_core::KvCacheType::Q8_0,
+            "q4_0" => model_launcher_core::KvCacheType::Q4_0,
+            _ => model_launcher_core::KvCacheType::F16,
+        }),
     }
 }
 
