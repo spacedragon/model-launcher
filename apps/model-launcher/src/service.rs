@@ -49,10 +49,47 @@ pub struct Service {
     handle: ServiceHandle,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownPhase {
+    StopGateway,
+    StopLifecycle,
+    PersistConfig,
+    StopWatcher,
+    JoinLifecycle,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownEvent {
+    Started(ShutdownPhase),
+    Completed(ShutdownPhase),
+}
+pub trait ServiceObserver: Send + Sync {
+    fn shutdown_event(&self, _event: ShutdownEvent) {}
+}
+struct NoopObserver;
+impl ServiceObserver for NoopObserver {}
+
 impl Service {
     pub async fn start(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
+    ) -> Result<Self, ServiceError> {
+        Self::start_observed(options, engine, Arc::new(NoopObserver)).await
+    }
+
+    pub async fn start_observed(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        observer: Arc<dyn ServiceObserver>,
+    ) -> Result<Self, ServiceError> {
+        Self::start_with_background_task(options, engine, observer, None).await
+    }
+
+    #[doc(hidden)]
+    pub async fn start_with_background_task(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        observer: Arc<dyn ServiceObserver>,
+        injected_background: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
         let catalog = CatalogService::new(&options.catalog_dir, store.clone());
@@ -73,7 +110,7 @@ impl Service {
         let api_models = api_models(&models.read().expect("model lock poisoned"), &capabilities);
         let upstream = options.upstream.clone();
         let upstream: UpstreamResolver = Arc::new(move |_| Some(upstream.clone()));
-        let gateway = Gateway::new_with_management(
+        let gateway = match Gateway::new_with_management(
             options.gateway,
             api_models.into(),
             lifecycle_handle.clone(),
@@ -84,17 +121,24 @@ impl Service {
                 models: models.clone(),
                 capabilities,
             }),
-        )?;
+        ) {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                cleanup_partial_lifecycle(lifecycle_handle, lifecycle, options.shutdown_timeout)
+                    .await;
+                return Err(error.into());
+            }
+        };
         let gateway = match gateway.start().await {
             Ok(server) => server,
             Err(error) => {
-                let _ = lifecycle_handle.shutdown().await;
-                lifecycle.wait_for_termination().await;
+                cleanup_partial_lifecycle(lifecycle_handle, lifecycle, options.shutdown_timeout)
+                    .await;
                 return Err(error.into());
             }
         };
         let address = gateway.local_addr();
-        let (watch_stop, watcher_task) = if let Some(mut watcher) = watcher {
+        let (watch_stop, mut watcher_task) = if let Some(mut watcher) = watcher {
             let (stop, mut stopped) = watch::channel(false);
             let watcher_models = models.clone();
             let task = tokio::spawn(async move {
@@ -113,12 +157,16 @@ impl Service {
         } else {
             (None, None)
         };
+        if injected_background.is_some() {
+            watcher_task = injected_background;
+        }
         let inner = Arc::new(Inner {
             address,
             lifecycle: lifecycle_handle,
             models,
             store,
             shutdown_timeout: options.shutdown_timeout,
+            observer,
             resources: Mutex::new(Resources {
                 gateway: Some(gateway),
                 lifecycle: Some(lifecycle),
@@ -136,6 +184,16 @@ impl Service {
     pub fn handle(&self) -> ServiceHandle {
         self.handle.clone()
     }
+}
+
+async fn cleanup_partial_lifecycle(
+    handle: LifecycleHandle,
+    lifecycle: Lifecycle,
+    timeout: Duration,
+) {
+    let _ = tokio::time::timeout(timeout, handle.shutdown()).await;
+    drop(handle);
+    let _ = tokio::time::timeout(timeout, lifecycle.wait_for_termination()).await;
 }
 
 #[derive(Clone)]
@@ -204,12 +262,16 @@ struct Inner {
     models: Arc<RwLock<LauncherConfig>>,
     store: ConfigStore,
     shutdown_timeout: Duration,
+    observer: Arc<dyn ServiceObserver>,
     resources: Mutex<Resources>,
     shutdown: Mutex<ShutdownState>,
     shutdown_done: Notify,
 }
 
 impl Inner {
+    fn event(&self, event: ShutdownEvent) {
+        self.observer.shutdown_event(event);
+    }
     async fn perform_shutdown(&self) -> Result<(), ServiceError> {
         let (gateway, lifecycle, watch_stop, watcher_task) = {
             let mut resources = self.resources.lock().await;
@@ -221,28 +283,41 @@ impl Inner {
             )
         };
         let mut errors = Vec::new();
+        self.event(ShutdownEvent::Started(ShutdownPhase::StopGateway));
         if let Some(gateway) = gateway
             && let Err(error) = gateway.stop().await
         {
             errors.push(error.to_string());
         }
-        if let Err(error) = self.lifecycle.shutdown().await {
-            errors.push(error.to_string());
+        self.event(ShutdownEvent::Completed(ShutdownPhase::StopGateway));
+        self.event(ShutdownEvent::Started(ShutdownPhase::StopLifecycle));
+        match tokio::time::timeout(self.shutdown_timeout, self.lifecycle.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => errors.push(error.to_string()),
+            Err(_) => errors.push("lifecycle shutdown timed out".into()),
         }
+        self.event(ShutdownEvent::Completed(ShutdownPhase::StopLifecycle));
+        self.event(ShutdownEvent::Started(ShutdownPhase::PersistConfig));
         let latest = self.models.read().expect("model lock poisoned").clone();
         if let Err(error) = self.store.save(&latest) {
             errors.push(error.to_string());
         }
+        self.event(ShutdownEvent::Completed(ShutdownPhase::PersistConfig));
+        self.event(ShutdownEvent::Started(ShutdownPhase::StopWatcher));
         if let Some(stop) = watch_stop {
             let _ = stop.send(true);
         }
-        if let Some(task) = watcher_task
-            && tokio::time::timeout(self.shutdown_timeout, task)
+        if let Some(mut task) = watcher_task
+            && tokio::time::timeout(self.shutdown_timeout, &mut task)
                 .await
                 .is_err()
         {
+            task.abort();
+            let _ = task.await;
             errors.push("catalog watcher join timed out".into());
         }
+        self.event(ShutdownEvent::Completed(ShutdownPhase::StopWatcher));
+        self.event(ShutdownEvent::Started(ShutdownPhase::JoinLifecycle));
         if let Some(lifecycle) = lifecycle
             && tokio::time::timeout(self.shutdown_timeout, lifecycle.wait_for_termination())
                 .await
@@ -250,6 +325,7 @@ impl Inner {
         {
             errors.push("lifecycle join timed out".into());
         }
+        self.event(ShutdownEvent::Completed(ShutdownPhase::JoinLifecycle));
         if errors.is_empty() {
             Ok(())
         } else {

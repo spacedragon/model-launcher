@@ -756,6 +756,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fake-llama-server",
+ "futures-util",
  "model-launcher-api",
  "model-launcher-core",
  "model-launcher-wsl",
