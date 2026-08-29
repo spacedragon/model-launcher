@@ -1,4 +1,4 @@
-use model_launcher_core::ModelRecord;
+use model_launcher_core::{EngineCapabilities, ModelRecord};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug)]
@@ -8,6 +8,7 @@ pub struct ApiModel {
     pub architecture: Option<String>,
     pub quantization: Option<String>,
     pub params_string: Option<String>,
+    pub capabilities: EngineCapabilities,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]

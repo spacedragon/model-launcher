@@ -154,6 +154,30 @@ impl InferenceEngine for FailureEngine {
         unreachable!()
     }
 }
+struct CaptureEngine(Arc<Mutex<Option<ModelRecord>>>);
+impl InferenceEngine for CaptureEngine {
+    fn spec(&self) -> EngineFuture<'_, EngineSpec> {
+        ReadyEngine.spec()
+    }
+    fn probe_capabilities(&self) -> EngineFuture<'_, EngineCapabilities> {
+        ReadyEngine.probe_capabilities()
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+    fn spawn<'a>(
+        &'a self,
+        model: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
+        *self.0.lock().unwrap() = Some(model.clone());
+        Box::pin(async { Ok(Box::new(ReadyProcess) as Box<dyn EngineProcess>) })
+    }
+}
 fn api_model() -> ApiModel {
     ApiModel {
         record: ModelRecord {
@@ -170,6 +194,12 @@ fn api_model() -> ApiModel {
         architecture: Some("llama".into()),
         quantization: Some("Q4_K_M".into()),
         params_string: Some("1B".into()),
+        capabilities: EngineCapabilities {
+            context_length: true,
+            batch_size: true,
+            flash_attention: true,
+            ..EngineCapabilities::default()
+        },
     }
 }
 fn other_model() -> ApiModel {
@@ -432,6 +462,22 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
         extra.json::<Value>().await.unwrap()["error"]["code"],
         "invalid_request"
     );
+    for unsupported in [
+        json!({"model":"acme/tiny","num_experts":2}),
+        json!({"model":"acme/tiny","offload_kv_cache_to_gpu":true}),
+    ] {
+        let response = client
+            .post(format!("{base}/api/v1/models/load"))
+            .json(&unsupported)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_setting"
+        );
+    }
 
     let mismatch = client
         .post(format!("{base}/api/v1/models/unload"))
@@ -450,6 +496,30 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
     let expected: Value =
         serde_json::from_str(include_str!("fixtures/unload/success.json")).unwrap();
     assert_eq!(unloaded.json::<Value>().await.unwrap(), expected);
+    stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn supported_management_overrides_are_typed_and_applied_before_load() {
+    let captured = Arc::new(Mutex::new(None));
+    let lifecycle = Lifecycle::spawn(Arc::new(CaptureEngine(captured.clone())));
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| None),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let response=reqwest::Client::new().post(format!("http://{}/api/v1/models/load",server.local_addr())).json(&json!({"model":"acme/tiny","context_length":8192,"eval_batch_size":512,"flash_attention":true})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let model = captured.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        model.launch_profile.settings.context_length.unwrap().get(),
+        8192
+    );
+    assert_eq!(model.launch_profile.settings.batch_size.unwrap().get(), 512);
+    assert_eq!(model.launch_profile.settings.flash_attention, Some(true));
     stop(lifecycle, server).await;
 }
 

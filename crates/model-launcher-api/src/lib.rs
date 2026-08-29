@@ -20,7 +20,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use model_launcher_core::{AppError, LifecycleHandle, ModelRecord};
+use model_launcher_core::{
+    AppError, BatchSize, ContextLength, EngineCapabilities, LifecycleHandle, ModelRecord,
+};
 use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -29,6 +31,65 @@ use tokio::{
 };
 
 pub type UpstreamResolver = Arc<dyn Fn(&ModelRecord) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct ManagementModel {
+    pub model: ModelRecord,
+    pub capabilities: EngineCapabilities,
+}
+pub trait ManagementModelResolver: Send + Sync {
+    fn resolve(&self, key: &str) -> Option<ManagementModel>;
+}
+pub trait ProfileUpdater: Send + Sync {
+    fn apply(&self, model: ManagementModel, request: &LoadRequest)
+    -> Result<ModelRecord, AppError>;
+}
+
+struct StaticManagementResolver {
+    models: Arc<[ApiModel]>,
+}
+impl ManagementModelResolver for StaticManagementResolver {
+    fn resolve(&self, key: &str) -> Option<ManagementModel> {
+        self.models
+            .iter()
+            .find(|value| value.record.key.as_str() == key)
+            .map(|value| ManagementModel {
+                model: value.record.clone(),
+                capabilities: value.capabilities.clone(),
+            })
+    }
+}
+struct CapabilityProfileUpdater;
+impl ProfileUpdater for CapabilityProfileUpdater {
+    fn apply(
+        &self,
+        resolved: ManagementModel,
+        request: &LoadRequest,
+    ) -> Result<ModelRecord, AppError> {
+        let mut model = resolved.model;
+        if request.context_length.is_some() && !resolved.capabilities.context_length {
+            return Err(AppError::InvalidSetting("context_length"));
+        }
+        if request.eval_batch_size.is_some() && !resolved.capabilities.batch_size {
+            return Err(AppError::InvalidSetting("eval_batch_size"));
+        }
+        if request.flash_attention.is_some() && !resolved.capabilities.flash_attention {
+            return Err(AppError::InvalidSetting("flash_attention"));
+        }
+        if request.num_experts.is_some() {
+            return Err(AppError::InvalidSetting("num_experts"));
+        }
+        if request.offload_kv_cache_to_gpu.is_some() {
+            return Err(AppError::InvalidSetting("offload_kv_cache_to_gpu"));
+        }
+        model.launch_profile.settings.context_length =
+            request.context_length.map(ContextLength::new).transpose()?;
+        model.launch_profile.settings.batch_size =
+            request.eval_batch_size.map(BatchSize::new).transpose()?;
+        model.launch_profile.settings.flash_attention = request.flash_attention;
+        Ok(model)
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GatewayLimits {
@@ -99,6 +160,8 @@ pub(crate) struct AppState {
     limits: GatewayLimits,
     connections: Arc<Semaphore>,
     authentication: Authentication,
+    management: Arc<dyn ManagementModelResolver>,
+    profiles: Arc<dyn ProfileUpdater>,
 }
 
 impl AppState {
@@ -122,13 +185,37 @@ impl Gateway {
         lifecycle: LifecycleHandle,
         upstream: UpstreamResolver,
     ) -> Result<Self, GatewayConfigError> {
+        let models: Arc<[ApiModel]> = models.into();
+        let management = Arc::new(StaticManagementResolver {
+            models: models.clone(),
+        });
+        Self::new_with_management(
+            config,
+            models,
+            lifecycle,
+            upstream,
+            management,
+            Arc::new(CapabilityProfileUpdater),
+        )
+    }
+
+    pub fn new_with_management(
+        config: GatewayConfig,
+        models: Arc<[ApiModel]>,
+        lifecycle: LifecycleHandle,
+        upstream: UpstreamResolver,
+        management: Arc<dyn ManagementModelResolver>,
+        profiles: Arc<dyn ProfileUpdater>,
+    ) -> Result<Self, GatewayConfigError> {
         let _warnings = config.validate();
         let client = reqwest::Client::builder()
             .build()
             .expect("reqwest client configuration is valid");
         Ok(Self {
             state: AppState {
-                models: models.into(),
+                management,
+                profiles,
+                models,
                 lifecycle,
                 upstream,
                 client,

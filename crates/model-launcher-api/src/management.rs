@@ -2,7 +2,6 @@ use axum::{
     Json,
     extract::{State, rejection::JsonRejection},
 };
-use model_launcher_core::{BatchSize, ContextLength};
 use serde_json::{Value, json};
 use std::time::Instant;
 
@@ -22,18 +21,14 @@ pub(crate) async fn load(
             "request body does not match the API contract",
         )
     })?;
-    let mut model = state.find_model(&request.model)?.record.clone();
-    model.launch_profile.settings.context_length = request
-        .context_length
-        .map(ContextLength::new)
-        .transpose()
+    let resolved = state
+        .management
+        .resolve(&request.model)
+        .ok_or_else(|| ApiError::not_found("model_not_found", "model was not found"))?;
+    let model = state
+        .profiles
+        .apply(resolved, &request)
         .map_err(ApiError::core)?;
-    model.launch_profile.settings.batch_size = request
-        .eval_batch_size
-        .map(BatchSize::new)
-        .transpose()
-        .map_err(ApiError::core)?;
-    model.launch_profile.settings.flash_attention = request.flash_attention;
     let started = Instant::now();
     state
         .lifecycle
