@@ -142,6 +142,9 @@ async fn recent_models_are_successful_mru_entries_with_stable_ids() {
     assert_eq!(recent.len(), 2);
     assert_eq!(recent[0].id, models[0].id);
     assert_eq!(recent[1].id, models[1].id);
+    std::fs::remove_file(&models[0].path).unwrap();
+    handle.rescan(temp.path().join("models")).await.unwrap();
+    assert_eq!(handle.recent_models()[0].id, models[1].id);
     handle.shutdown().await.unwrap();
 }
 

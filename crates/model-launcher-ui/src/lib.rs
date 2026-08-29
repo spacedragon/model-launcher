@@ -32,6 +32,19 @@ pub struct UiLoadRequest {
     pub settings: LaunchSettings,
 }
 
+#[must_use]
+pub fn load_request_for(snapshot: &AppSnapshot, id: ModelId) -> Option<UiLoadRequest> {
+    snapshot
+        .models
+        .iter()
+        .find(|model| model.id == id)
+        .map(|model| UiLoadRequest {
+            id: model.id,
+            key: model.key.to_string(),
+            settings: model.launch_profile.settings.clone(),
+        })
+}
+
 #[cfg(not(windows))]
 pub fn run_desktop(
     snapshot: AppSnapshot,
@@ -602,16 +615,8 @@ fn dispatch_windows(command: TrayCommand) {
             }
             TrayCommand::Eject => (desktop.windows.actions.eject)(),
             TrayCommand::LoadRecent(id) => {
-                if let Some(model) = (desktop.windows.actions.snapshot)()
-                    .models
-                    .into_iter()
-                    .find(|model| model.id == id)
-                {
-                    (desktop.windows.actions.load)(UiLoadRequest {
-                        id: model.id,
-                        key: model.key.to_string(),
-                        settings: model.launch_profile.settings.clone(),
-                    });
+                if let Some(request) = load_request_for(&(desktop.windows.actions.snapshot)(), id) {
+                    (desktop.windows.actions.load)(request);
                 }
             }
             TrayCommand::Quit => (desktop.windows.actions.quit)(),

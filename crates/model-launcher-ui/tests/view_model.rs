@@ -14,6 +14,7 @@ use model_launcher_core::{
 use model_launcher_ui::{
     AppSnapshot, CloseNotice, CloseNoticeStore, EngineSettings, LogCommands, MetadataVisibility,
     ModelAction, RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
+    load_request_for,
 };
 
 fn model(name: &str, size: u64) -> ModelRecord {
@@ -261,4 +262,22 @@ fn tray_maps_commands_without_opening_a_real_window_and_drops_windows() {
         assert!(!tray.has_window());
     }
     assert_eq!(tray.live_window_count(), 0);
+}
+
+#[test]
+fn tray_recent_request_resolves_stable_id_after_catalog_reordering() {
+    let alpha = model("Alpha", 1);
+    let beta = model("Beta", 1);
+    let snapshot = AppSnapshot {
+        models: vec![beta, alpha.clone()],
+        recent_models: vec![alpha.clone()],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+    };
+
+    let request = load_request_for(&snapshot, alpha.id).unwrap();
+    assert_eq!(request.id, alpha.id);
+    assert_eq!(request.key, alpha.key.to_string());
 }

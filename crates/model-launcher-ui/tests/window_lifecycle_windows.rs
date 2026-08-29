@@ -14,6 +14,8 @@ fn real_main_window_weak_reference_dies_for_fifty_recreate_cycles() {
         recent_models: vec![],
         lifecycle: LifecycleSnapshot::default(),
         capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
     };
     let actions = UiActions {
         load: Arc::new(|_| {}),

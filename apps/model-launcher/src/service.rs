@@ -374,7 +374,16 @@ impl ServiceHandle {
             .read()
             .expect("recent lock poisoned")
             .iter()
-            .filter_map(|id| models.models.iter().find(|model| model.id == *id).cloned())
+            .filter_map(|id| {
+                models
+                    .models
+                    .iter()
+                    .find(|model| {
+                        model.id == *id
+                            && matches!(model.state, model_launcher_core::ModelState::Available)
+                    })
+                    .cloned()
+            })
             .collect()
     }
     pub fn engine_settings(&self) -> (Option<String>, Option<String>) {
