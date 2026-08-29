@@ -13,8 +13,8 @@ use model_launcher_api::{
     LoadRequest, TokenStore,
 };
 use model_launcher_core::{
-    CatalogIdentity, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
-    LaunchProfile, Lifecycle, ModelId, ModelKey, ModelRecord, ModelState,
+    AppError, CatalogIdentity, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec,
+    InferenceEngine, LaunchProfile, Lifecycle, ModelId, ModelKey, ModelRecord, ModelState,
 };
 use serde_json::{Value, json};
 use std::{
@@ -72,6 +72,89 @@ impl EngineProcess for ReadyProcess {
         Box::pin(std::future::pending())
     }
 }
+struct PendingEngine;
+impl InferenceEngine for PendingEngine {
+    fn spec(&self) -> EngineFuture<'_, EngineSpec> {
+        ReadyEngine.spec()
+    }
+    fn probe_capabilities(&self) -> EngineFuture<'_, EngineCapabilities> {
+        ReadyEngine.probe_capabilities()
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        model: &'a ModelRecord,
+        settings: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, ()> {
+        ReadyEngine.validate_launch(model, settings)
+    }
+    fn spawn<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
+        Box::pin(std::future::pending())
+    }
+}
+struct GateEngine {
+    spawns: Arc<std::sync::atomic::AtomicUsize>,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+impl InferenceEngine for GateEngine {
+    fn spec(&self) -> EngineFuture<'_, EngineSpec> {
+        ReadyEngine.spec()
+    }
+    fn probe_capabilities(&self) -> EngineFuture<'_, EngineCapabilities> {
+        ReadyEngine.probe_capabilities()
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        m: &'a ModelRecord,
+        s: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, ()> {
+        ReadyEngine.validate_launch(m, s)
+    }
+    fn spawn<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
+        Box::pin(async move {
+            self.spawns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(Box::new(ReadyProcess) as Box<dyn EngineProcess>)
+        })
+    }
+}
+struct FailureEngine;
+impl InferenceEngine for FailureEngine {
+    fn spec(&self) -> EngineFuture<'_, EngineSpec> {
+        ReadyEngine.spec()
+    }
+    fn probe_capabilities(&self) -> EngineFuture<'_, EngineCapabilities> {
+        ReadyEngine.probe_capabilities()
+    }
+    fn validate_launch<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, ()> {
+        Box::pin(async {
+            Err(AppError::ModelLoadFailed(Box::new(std::io::Error::other(
+                "fake failure",
+            ))))
+        })
+    }
+    fn spawn<'a>(
+        &'a self,
+        _: &'a ModelRecord,
+        _: &'a model_launcher_core::LaunchSettings,
+    ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
+        unreachable!()
+    }
+}
 fn api_model() -> ApiModel {
     ApiModel {
         record: ModelRecord {
@@ -89,6 +172,13 @@ fn api_model() -> ApiModel {
         quantization: "Q4_K_M".into(),
         params_string: "1B".into(),
     }
+}
+fn other_model() -> ApiModel {
+    let mut model = api_model();
+    model.record.id = ModelId::from_uuid(Uuid::from_u128(2));
+    model.record.key = ModelKey::parse("acme/other").unwrap();
+    model.record.display_name = "Other".into();
+    model
 }
 fn config(authentication: Authentication) -> GatewayConfig {
     GatewayConfig {
@@ -404,6 +494,162 @@ async fn controllable_fake_upstream_preserves_split_non_utf8_sse_bytes() {
     assert_eq!(upstream.control.stream_drops(), 1);
     stop(lifecycle, server).await;
     upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_http_matrix_jit_same_running_busy_and_unknown() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let endpoint = upstream.base_url();
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model(), other_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/completions", server.local_addr());
+    let first = tokio::spawn({
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .post(url)
+                .header("x-fake-mode", "gate")
+                .body(r#"{"model":"acme/tiny"}"#)
+                .send()
+                .await
+        }
+    });
+    upstream.control.gate_entered().await;
+    assert_eq!(lifecycle.handle().snapshot().in_flight, 1);
+    let busy = client
+        .post(&url)
+        .body(r#"{"model":"acme/other"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        busy.json::<Value>().await.unwrap()["error"]["code"],
+        "model_busy"
+    );
+    let unknown = client
+        .post(&url)
+        .body(r#"{"model":"missing"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    upstream.control.release_gate();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    let same_running = client
+        .post(&url)
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(same_running.status(), StatusCode::OK);
+    stop(lifecycle, server).await;
+    upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn zero_startup_budget_returns_model_starting_with_retry_after() {
+    let lifecycle = Lifecycle::spawn(Arc::new(PendingEngine));
+    let mut gateway_config = config(Authentication::Disabled);
+    gateway_config.limits.startup_timeout = Duration::ZERO;
+    let gateway = Gateway::new(
+        gateway_config,
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| Some("http://127.0.0.1:1".into())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/completions", server.local_addr()))
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "model_starting"
+    );
+    stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn concurrent_same_model_http_jit_shares_one_spawn() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let spawns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let lifecycle = Lifecycle::spawn(Arc::new(GateEngine {
+        spawns: spawns.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let endpoint = upstream.base_url();
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let url = format!("http://{}/v1/completions", server.local_addr());
+    let request = |url: String| {
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(url)
+                .body(r#"{"model":"acme/tiny"}"#)
+                .send()
+                .await
+        })
+    };
+    let first = request(url.clone());
+    let second = request(url);
+    entered.notified().await;
+    assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    release.notify_waiters();
+    assert_eq!(first.await.unwrap().unwrap().status(), StatusCode::OK);
+    assert_eq!(second.await.unwrap().unwrap().status(), StatusCode::OK);
+    assert_eq!(spawns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    stop(lifecycle, server).await;
+    upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_load_failure_is_stable_503() {
+    let lifecycle = Lifecycle::spawn(Arc::new(FailureEngine));
+    let gateway = Gateway::new(
+        config(Authentication::Disabled),
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| Some("http://127.0.0.1:1".into())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/completions", server.local_addr()))
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "model_load_failed"
+    );
+    stop(lifecycle, server).await;
 }
 
 #[tokio::test]
