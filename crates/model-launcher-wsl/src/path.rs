@@ -43,7 +43,12 @@ fn invalid_windows_component(component: &str) -> bool {
     if component.is_empty() {
         return false;
     }
-    if component.contains(':') || component.ends_with(['.', ' ']) {
+    if component.contains(':')
+        || component.ends_with(['.', ' '])
+        || component.chars().any(|character| {
+            character <= '\u{1f}' || matches!(character, '<' | '>' | '"' | '|' | '?' | '*')
+        })
+    {
         return true;
     }
     let stem = component
@@ -102,6 +107,14 @@ mod tests {
             r#"C:\model."#,
         ] {
             assert!(windows_to_wsl_path(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_windows_illegal_and_control_characters() {
+        for illegal in ['<', '>', '"', '|', '?', '*', '\0', '\u{1}', '\u{1f}'] {
+            let value = format!("C:\\models\\bad{illegal}name.gguf");
+            assert!(windows_to_wsl_path(&value).is_err(), "accepted {value:?}");
         }
     }
 }

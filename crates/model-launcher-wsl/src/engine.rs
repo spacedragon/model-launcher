@@ -45,7 +45,7 @@ pub enum WslError {
 pub struct CleanupObserver {
     failures: std::sync::atomic::AtomicU64,
     completed: std::sync::atomic::AtomicU64,
-    notify: tokio::sync::Notify,
+    completion: tokio::sync::Semaphore,
     logs: Option<LogStore>,
     spawner: Arc<dyn CleanupThreadSpawner>,
 }
@@ -66,7 +66,7 @@ impl Default for CleanupObserver {
         Self {
             failures: std::sync::atomic::AtomicU64::new(0),
             completed: std::sync::atomic::AtomicU64::new(0),
-            notify: tokio::sync::Notify::new(),
+            completion: tokio::sync::Semaphore::new(0),
             logs: None,
             spawner: Arc::new(StdCleanupThreadSpawner),
         }
@@ -96,13 +96,11 @@ impl CleanupObserver {
         self.completed.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub async fn wait_completed(&self) {
-        let seen = self.completed();
-        loop {
-            self.notify.notified().await;
-            if self.completed() > seen {
-                return;
-            }
-        }
+        self.completion
+            .acquire()
+            .await
+            .expect("cleanup completion semaphore is never closed")
+            .forget();
     }
     fn finish(&self, error: Option<String>) {
         if let Some(error) = error {
@@ -122,7 +120,7 @@ impl CleanupObserver {
         }
         self.completed
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.notify.notify_waiters();
+        self.completion.add_permits(1);
     }
 }
 
@@ -474,15 +472,28 @@ fn append_bounded_tail(tail: &Mutex<Vec<u8>>, bytes: &[u8]) {
 fn is_address_in_use(bytes: &[u8]) -> bool {
     String::from_utf8_lossy(bytes).lines().any(|line| {
         let line = line.to_ascii_lowercase();
-        let context = ["bind", "listen", "listener", "socket"].iter().any(|word| {
-            line.split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|token| token == *word)
+        if line.contains(['\'', '"']) {
+            return false;
+        }
+        let conflict = line.find("address already in use").or_else(|| {
+            line.match_indices("eaddrinuse")
+                .find(|(index, token)| {
+                    let before = line[..*index].chars().next_back();
+                    let after = line[index + token.len()..].chars().next();
+                    before.is_none_or(|c| !c.is_ascii_alphanumeric())
+                        && after.is_none_or(|c| !c.is_ascii_alphanumeric())
+                })
+                .map(|(index, _)| index)
         });
-        context
-            && (line.contains("address already in use")
-                || line
-                    .split(|c: char| !c.is_ascii_alphanumeric())
-                    .any(|token| token == "eaddrinuse"))
+        let Some(conflict) = conflict else {
+            return false;
+        };
+        let context = line[..conflict].trim_end();
+        context.contains("failed to bind")
+            || context.contains("failed to listen")
+            || ["bind:", "listen:", "listener:", "listen failed:"]
+                .iter()
+                .any(|suffix| context.ends_with(suffix))
     })
 }
 fn classify_pre_ready_exit(status: &str, stderr_tail: &[u8]) -> WslError {
@@ -1025,37 +1036,31 @@ impl Drop for WslEngineProcess {
         let owned_pid = self.owned_pid;
         let observer = self.cleanup_observer.clone();
         let Some(child) = self.child.take() else {
+            observer.finish(Some("owned cleanup child was missing".into()));
             return;
         };
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(supervise_owned_cleanup(
-                runner,
-                distribution,
-                owned_pid,
-                child,
-                observer,
-            ));
-        } else {
-            let spawn_observer = observer.clone();
-            let spawner = observer.spawner.clone();
-            if let Err(error) = spawner.spawn(Box::new(move || {
-                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        let spawn_observer = observer.clone();
+        let spawner = observer.spawner.clone();
+        if let Err(error) =
+            spawner.spawn(Box::new(
+                move || match tokio::runtime::Builder::new_current_thread()
                     .enable_time()
                     .build()
                 {
-                    runtime.block_on(supervise_owned_cleanup(
+                    Ok(runtime) => runtime.block_on(supervise_owned_cleanup(
                         runner,
                         distribution,
                         owned_pid,
                         child,
                         observer,
-                    ));
-                } else {
-                    observer.finish(Some("cleanup runtime build failed".into()));
-                }
-            })) {
-                spawn_observer.finish(Some(format!("cleanup thread spawn failed: {error}")));
-            }
+                    )),
+                    Err(error) => {
+                        observer.finish(Some(format!("cleanup runtime build failed: {error}")));
+                    }
+                },
+            ))
+        {
+            spawn_observer.finish(Some(format!("cleanup thread spawn failed: {error}")));
         }
     }
 }
@@ -1309,6 +1314,15 @@ mod tests {
             b"config value = 'address already in use'"
         ));
         assert!(!is_address_in_use(b"model metadata mentions EADDRINUSE"));
+        assert!(!is_address_in_use(
+            b"/models/socket/address already in use/x"
+        ));
+        assert!(!is_address_in_use(
+            b"config listen_path='address already in use'"
+        ));
+        assert!(is_address_in_use(
+            b"2026-01-01T00:00:00Z server: failed to bind listener: EADDRINUSE"
+        ));
     }
     struct BadHandshakeChild {
         aborted: Arc<AtomicBool>,
@@ -1518,12 +1532,13 @@ mod tests {
         assert_eq!(killed, ["11", "22", "33"]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn dropping_owned_process_after_pid_handshake_cleans_exact_pid() {
         let runner = Arc::new(AttemptRunner {
             children: Mutex::new(VecDeque::new()),
             signals: Mutex::new(Vec::new()),
         });
+        let observer = Arc::new(CleanupObserver::default());
         let process = WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 77,
@@ -1538,12 +1553,12 @@ mod tests {
             })),
             retry: None,
             owned_active: true,
-            cleanup_observer: Arc::new(CleanupObserver::default()),
+            cleanup_observer: observer.clone(),
         };
         drop(process);
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(251)).await;
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), observer.wait_completed())
+            .await
+            .expect("bounded cleanup must complete");
         let signals = runner.signals.lock().unwrap();
         assert_eq!(
             signals.len(),
@@ -1551,6 +1566,59 @@ mod tests {
             "an exited owned child must never receive a PID-reuse-prone KILL"
         );
         assert_eq!(&signals[0][7..], &["TERM", "77", "107"]);
+    }
+    #[tokio::test]
+    async fn completed_cleanup_remains_observable_to_a_late_waiter() {
+        let observer = CleanupObserver::default();
+        observer.finish(None);
+
+        tokio::time::timeout(Duration::from_millis(100), observer.wait_completed())
+            .await
+            .expect("a completion that precedes the wait must remain observable");
+    }
+    #[test]
+    fn cleanup_survives_runtime_that_dropped_owned_process() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        let observer = Arc::new(CleanupObserver::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            drop(WslEngineProcess {
+                distribution: "Ubuntu".into(),
+                pid: 78,
+                owned_pid: OwnedPid {
+                    pid: 78,
+                    start_time: 108,
+                },
+                runner: runner.clone(),
+                child: Some(Box::new(AttemptChild {
+                    pid: 78,
+                    ready: Some(Ok(())),
+                })),
+                retry: None,
+                owned_active: true,
+                cleanup_observer: observer.clone(),
+            });
+        });
+        drop(runtime);
+
+        let waiter = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        waiter.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), observer.wait_completed())
+                .await
+                .expect("cleanup must outlive the runtime active during Drop");
+        });
+        let signals = runner.signals.lock().unwrap();
+        assert_eq!(&signals[0][7..], &["TERM", "78", "108"]);
+        assert_eq!(observer.completed(), 1);
     }
     #[test]
     fn drop_outside_tokio_runtime_schedules_bounded_owned_cleanup() {
@@ -1654,12 +1722,13 @@ mod tests {
             Ok(())
         }
     }
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn drop_force_kills_only_when_retained_owned_child_is_still_running() {
         let runner = Arc::new(AttemptRunner {
             children: Mutex::new(VecDeque::new()),
             signals: Mutex::new(Vec::new()),
         });
+        let observer = Arc::new(CleanupObserver::default());
         drop(WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 78,
@@ -1671,11 +1740,11 @@ mod tests {
             child: Some(Box::new(HangingChild)),
             retry: None,
             owned_active: true,
-            cleanup_observer: Arc::new(CleanupObserver::default()),
+            cleanup_observer: observer.clone(),
         });
-        tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_millis(251)).await;
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(2), observer.wait_completed())
+            .await
+            .expect("bounded cleanup must complete");
         let signals = runner.signals.lock().unwrap();
         assert_eq!(signals.len(), 2);
         assert_eq!(&signals[1][7..], &["KILL", "78", "108"]);
