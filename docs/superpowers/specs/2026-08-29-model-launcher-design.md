@@ -124,6 +124,8 @@ All UI, tray, JIT, and management API operations enter one serialized lifecycle 
 
 Loading model B while model A is running stops A, waits for its port and process to exit, then starts B. Load succeeds only after the engine health endpoint is ready. If B fails to start, the application remains stopped and reports a structured error; it does not restore A.
 
+Neither UI nor management-API replacement may interrupt active inference. When one or more inference requests are in flight, a request to load a different model returns `model_busy`; the UI disables Load actions for other models and explains why. Eject remains an explicit destructive operation: it cancels active upstream requests, stops the model, and causes affected clients to receive a terminated-stream or service-unavailable error.
+
 An unexpected engine exit restarts the same desired model with exponential delays of 1, 2, 4, 8, 16, then 30 seconds, with 30 seconds as the cap. Five minutes of healthy operation resets the failure count. Explicit eject, model replacement, invalid configuration, or application shutdown clears the desired model and cancels backoff.
 
 Graceful shutdown has a bounded timeout and then force-terminates only the owned WSL PID. Lifecycle transitions and cancellation are generation-tagged so stale health checks or restart timers cannot revive a replaced model.
@@ -147,6 +149,15 @@ The gateway does not reinterpret inference payloads beyond routing and necessary
 - `POST /api/v1/models/unload` accepts `instance_id` and ejects the matching loaded model.
 
 Unsupported optional LM Studio load fields produce a validation error rather than being silently accepted.
+
+Compatibility is pinned to the public LM Studio v1 REST documentation captured on 2026-08-29. The repository keeps sanitized JSON fixtures for each supported request, success response, and error response. Contract tests compare semantic JSON values rather than object key order. The supported baseline fields are:
+
+- list entries: `type`, `publisher`, `key`, `display_name`, `architecture`, `quantization`, `size_bytes`, and `params_string`;
+- load request: `model`, `context_length`, `eval_batch_size`, `flash_attention`, `num_experts`, `offload_kv_cache_to_gpu`, and `echo_load_config` where the engine reports support;
+- load response: `type`, `model_instance_id`, `load_time_seconds`, `status`, and optional `load_config`;
+- unload request/response: `instance_id`.
+
+Fields that Model Launcher cannot derive are returned as JSON `null` only where the LM Studio schema permits null; otherwise the field is omitted. Future LM Studio additions do not enter the MVP accidentally and require an explicit compatibility update.
 
 ### 7.3 JIT model loading
 
@@ -263,4 +274,3 @@ The implementation should proceed as a vertical slice:
 5. Implement the stable API gateway, management compatibility, proxying, authentication, and JIT loading.
 6. Implement the Slint Quiet Native UI and native tray lifecycle.
 7. Add Windows packaging, real WSL integration tests, resource checks, and release documentation.
-
