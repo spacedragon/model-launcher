@@ -13,6 +13,9 @@ export component MainWindow inherits Window {
     in property <string> base-url: "http://127.0.0.1:1234";
     in property <[string]> logs;
     in-out property <int> page: 0;
+    property <bool> load-dialog-open: false;
+    property <string> selected-model-id;
+    property <string> selected-model-key;
     callback load-model(string);
     callback eject-model(string);
     callback rescan(); callback copy-text(string); callback export-logs(); callback save-settings(string, string, string);
@@ -43,7 +46,7 @@ export component MainWindow inherits Window {
                 padding: 16px; spacing: 10px;
                 HorizontalLayout { spacing: 8px; search := LineEdit { placeholder-text: "Search models"; accessible-label: "Search models"; } Button { text: "Rescan"; clicked => { root.rescan(); } } }
                 Rectangle { background: #FFFFFF; border-radius: 6px; border-width: 1px; border-color: #E5E7EB;
-                    ScrollView { VerticalLayout { spacing: 0px; for row in root.models: ModelRow { model: row; show-size: root.width >= 500px; show-path: root.width >= 720px; action(id) => { row.action == "Eject" ? root.eject-model(id) : root.load-model(id); } } } }
+                    ScrollView { VerticalLayout { spacing: 0px; for row in root.models: ModelRow { model: row; show-size: root.width >= 500px; show-path: root.width >= 720px; action(id) => { if row.action == "Eject" { root.eject-model(id); } else { root.selected-model-id=id; root.selected-model-key=row.key; root.load-dialog-open=true; } } } } }
                 }
             }
             if root.page == 1: VerticalLayout { padding: 20px; spacing: 12px; Text { text: "Server"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; } Text { text: "Public base URL"; color: #667085; font-family: "Segoe UI"; } HorizontalLayout { Text { text: root.base-url; color: #1F2937; font-family: "Segoe UI"; } Button { text: "Copy"; clicked => { root.copy-text(root.base-url); } } } Text { text: "Authentication tokens are shown once and cannot be recovered."; color: #667085; font-family: "Segoe UI"; } Rectangle { vertical-stretch: 1; } }
@@ -51,4 +54,5 @@ export component MainWindow inherits Window {
             if root.page == 3: VerticalLayout { padding: 20px; spacing: 8px; Text { text: "Settings"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; } Text { text: "Model directory"; color: #667085; font-family: "Segoe UI"; } dir := LineEdit { accessible-label: "Model directory"; } Text { text: "WSL distribution"; color: #667085; font-family: "Segoe UI"; } distro := LineEdit { accessible-label: "WSL distribution"; } Text { text: "llama-server path"; color: #667085; font-family: "Segoe UI"; } exe := LineEdit { accessible-label: "llama-server path"; } Button { text: "Save settings"; primary: true; clicked => { root.save-settings(dir.text, distro.text, exe.text); } } Text { text: "Saving validates the engine identity and probes supported settings again."; color: #667085; font-family: "Segoe UI"; } Rectangle { vertical-stretch: 1; } }
         }
     }
+    LoadDialog { open <=> root.load-dialog-open; model-key <=> root.selected-model-key; confirm(key, context, gpu) => { root.load-model(root.selected-model-id); } }
 }

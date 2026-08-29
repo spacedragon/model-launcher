@@ -15,8 +15,13 @@ pub struct UiActions {
     pub load: Arc<dyn Fn(ModelId) + Send + Sync>,
     pub eject: Arc<dyn Fn() + Send + Sync>,
     pub rescan: Arc<dyn Fn() + Send + Sync>,
+    pub snapshot: Arc<dyn Fn() -> AppSnapshot + Send + Sync>,
+    pub quit: Arc<dyn Fn() + Send + Sync>,
+    pub close_notice: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    pub save_settings: Arc<dyn Fn(EngineSettings) + Send + Sync>,
 }
 
+#[cfg(not(windows))]
 pub fn run_desktop(
     snapshot: AppSnapshot,
     address: String,
@@ -62,8 +67,241 @@ pub fn run_desktop(
         let actions = actions.clone();
         move |_| (actions.eject)()
     });
-    window.on_rescan(move || (actions.rescan)());
+    window.on_rescan({
+        let actions = actions.clone();
+        move || (actions.rescan)()
+    });
+    window.on_save_settings({
+        let actions = actions.clone();
+        move |model_directory, distribution, executable| {
+            (actions.save_settings)(EngineSettings {
+                model_directory: model_directory.into(),
+                distribution: distribution.into(),
+                executable: executable.into(),
+            })
+        }
+    });
     window.run()
+}
+
+pub struct WindowManager {
+    window: Option<MainWindow>,
+    last_closed: slint::Weak<MainWindow>,
+    address: String,
+    actions: UiActions,
+}
+
+impl WindowManager {
+    pub fn new(address: String, actions: UiActions) -> Self {
+        Self {
+            window: None,
+            last_closed: slint::Weak::default(),
+            address,
+            actions,
+        }
+    }
+
+    pub fn open(&mut self) -> Result<slint::Weak<MainWindow>, slint::PlatformError> {
+        use slint::ComponentHandle as _;
+        if let Some(window) = &self.window {
+            window.show()?;
+            return Ok(window.as_weak());
+        }
+        let window = create_window(
+            (self.actions.snapshot)(),
+            self.address.clone(),
+            self.actions.clone(),
+        )?;
+        let weak = window.as_weak();
+        window.show()?;
+        self.window = Some(window);
+        Ok(weak)
+    }
+
+    pub fn close(&mut self) -> Result<(), slint::PlatformError> {
+        use slint::ComponentHandle as _;
+        if let Some(window) = self.window.take() {
+            self.last_closed = window.as_weak();
+            window.hide()?;
+            drop(window);
+        }
+        debug_assert!(self.last_closed.upgrade().is_none());
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn last_window_destroyed(&self) -> bool {
+        self.last_closed.upgrade().is_none()
+    }
+}
+
+fn create_window(
+    snapshot: AppSnapshot,
+    address: String,
+    actions: UiActions,
+) -> Result<MainWindow, slint::PlatformError> {
+    use slint::{ModelRc, SharedString, VecModel};
+    let view_model = ViewModel::from_snapshot(snapshot);
+    let rows: Vec<ModelDisplay> = view_model
+        .rows()
+        .iter()
+        .map(|row| {
+            let action = view_model.action(row.id);
+            let (label, enabled) = match action {
+                ModelAction::Load => ("Load", true),
+                ModelAction::Eject => ("Eject", true),
+                ModelAction::Disabled(_) => ("Load", false),
+            };
+            ModelDisplay {
+                id: row.id.as_uuid().to_string().into(),
+                name: row.name.clone().into(),
+                key: row.key.clone().into(),
+                size: row.size.clone().into(),
+                path: row.path.clone().into(),
+                status: row.status.clone().into(),
+                action: label.into(),
+                action_enabled: enabled,
+            }
+        })
+        .collect();
+    let window = MainWindow::new()?;
+    window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
+    window.set_base_url(format!("http://{address}").into());
+    window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
+    window.on_load_model({
+        let actions = actions.clone();
+        move |raw: SharedString| {
+            if let Ok(id) = uuid::Uuid::parse_str(&raw) {
+                (actions.load)(ModelId::from_uuid(id));
+            }
+        }
+    });
+    window.on_eject_model({
+        let actions = actions.clone();
+        move |_| (actions.eject)()
+    });
+    window.on_rescan({
+        let actions = actions.clone();
+        move || (actions.rescan)()
+    });
+    window.on_save_settings({
+        let actions = actions.clone();
+        move |model_directory, distribution, executable| {
+            (actions.save_settings)(EngineSettings {
+                model_directory: model_directory.into(),
+                distribution: distribution.into(),
+                executable: executable.into(),
+            })
+        }
+    });
+    Ok(window)
+}
+
+#[cfg(windows)]
+thread_local! {
+    static DESKTOP: std::cell::RefCell<Option<WindowsDesktop>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+struct WindowsDesktop {
+    windows: WindowManager,
+    tray: tray::NativeTray,
+    _refresh: slint::Timer,
+}
+
+#[cfg(windows)]
+fn dispatch_windows(command: TrayCommand) {
+    DESKTOP.with_borrow_mut(|desktop| {
+        let Some(desktop) = desktop.as_mut() else {
+            return;
+        };
+        match command {
+            TrayCommand::Open => {
+                let _ = desktop.windows.open();
+            }
+            TrayCommand::Eject => (desktop.windows.actions.eject)(),
+            TrayCommand::LoadRecent(index) => {
+                if let Some(model) = (desktop.windows.actions.snapshot)().models.get(index) {
+                    (desktop.windows.actions.load)(model.id);
+                }
+            }
+            TrayCommand::Quit => (desktop.windows.actions.quit)(),
+        }
+    });
+}
+
+#[cfg(windows)]
+pub fn run_desktop(
+    snapshot: AppSnapshot,
+    address: String,
+    actions: UiActions,
+) -> Result<(), slint::PlatformError> {
+    use slint::ComponentHandle as _;
+    let active = snapshot
+        .lifecycle
+        .desired_model
+        .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
+        .map(|model| model.display_name.as_str());
+    let recent: Vec<String> = snapshot
+        .models
+        .iter()
+        .take(8)
+        .map(|model| model.display_name.clone())
+        .collect();
+    let dispatch: Arc<dyn Fn(TrayCommand) + Send + Sync> = Arc::new(dispatch_windows);
+    let tray = tray::NativeTray::new(
+        &format!("{:?}", snapshot.lifecycle.state),
+        active,
+        &recent,
+        dispatch,
+    )
+    .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
+    let mut windows = WindowManager::new(address, actions);
+    let weak = windows.open()?;
+    weak.upgrade()
+        .expect("fresh window")
+        .window()
+        .on_close_requested(|| {
+            let _ = slint::invoke_from_event_loop(|| {
+                DESKTOP.with_borrow_mut(|desktop| {
+                    if let Some(desktop) = desktop.as_mut() {
+                        if let Some(message) = (desktop.windows.actions.close_notice)() {
+                            desktop.tray.show_close_notice(&message);
+                        }
+                        let _ = desktop.windows.close();
+                    }
+                })
+            });
+            slint::CloseRequestResponse::HideWindow
+        });
+    let refresh = slint::Timer::default();
+    refresh.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(500),
+        || {
+            DESKTOP.with_borrow(|desktop| {
+                if let Some(desktop) = desktop.as_ref() {
+                    let snapshot = (desktop.windows.actions.snapshot)();
+                    let active = snapshot
+                        .lifecycle
+                        .desired_model
+                        .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
+                        .map(|model| model.display_name.as_str());
+                    desktop
+                        .tray
+                        .update(&format!("{:?}", snapshot.lifecycle.state), active);
+                }
+            });
+        },
+    );
+    DESKTOP.set(Some(WindowsDesktop {
+        windows,
+        tray,
+        _refresh: refresh,
+    }));
+    let result = slint::run_event_loop_until_quit();
+    DESKTOP.set(None);
+    result
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +455,28 @@ fn format_bytes(bytes: u64) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct CloseNotice {
     shown: bool,
+}
+
+pub struct CloseNoticeStore {
+    path: std::path::PathBuf,
+}
+impl CloseNoticeStore {
+    pub fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+    #[must_use]
+    pub fn load(&self) -> CloseNotice {
+        CloseNotice::from_persisted(self.path.exists())
+    }
+    pub fn save(&self, notice: &CloseNotice) -> io::Result<()> {
+        if notice.was_shown() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&self.path, b"shown")?;
+        }
+        Ok(())
+    }
 }
 impl CloseNotice {
     pub const fn from_persisted(shown: bool) -> Self {

@@ -13,6 +13,7 @@ model-launcher-ui = { path = "../../crates/model-launcher-ui" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 thiserror.workspace = true
 futures-util = "0.3"
+slint.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

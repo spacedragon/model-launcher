@@ -12,8 +12,8 @@ use model_launcher_core::{
     ModelKey, ModelRecord, ModelState,
 };
 use model_launcher_ui::{
-    AppSnapshot, CloseNotice, EngineSettings, LogCommands, MetadataVisibility, ModelAction,
-    RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
+    AppSnapshot, CloseNotice, CloseNoticeStore, EngineSettings, LogCommands, MetadataVisibility,
+    ModelAction, RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
 };
 
 fn model(name: &str, size: u64) -> ModelRecord {
@@ -121,6 +121,16 @@ fn close_notice_and_plaintext_token_are_each_consumed_once() {
 }
 
 #[test]
+fn close_notice_consumption_is_persisted() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = CloseNoticeStore::new(directory.path().join("notice"));
+    let mut notice = store.load();
+    assert!(notice.take().is_some());
+    store.save(&notice).unwrap();
+    assert!(store.load().take().is_none());
+}
+
+#[test]
 fn save_engine_settings_validates_identity_then_reprobes() {
     let order = Arc::new(std::sync::Mutex::new(Vec::new()));
     let save = SaveSettings::new(
@@ -200,6 +210,7 @@ fn tray_maps_commands_without_opening_a_real_window_and_drops_windows() {
         }
     });
     assert_eq!(tray.map_command("open"), Some(TrayCommand::Open));
+    assert_eq!(tray.map_command("recent"), Some(TrayCommand::LoadRecent(0)));
     assert_eq!(opened.load(Ordering::SeqCst), 0);
     for _ in 0..50 {
         tray.open_for_test();

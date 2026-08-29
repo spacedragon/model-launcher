@@ -1,6 +1,7 @@
 use model_launcher::{Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
-use model_launcher_ui::{AppSnapshot, UiActions, run_desktop};
+use model_launcher_core::InferenceEngine as _;
+use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
 use model_launcher_wsl::{LlamaCppWslEngine, TokioCommandRunner};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -28,10 +29,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "/usr/local/bin/llama-server".into()),
         Arc::new(TokioCommandRunner::default()),
     ));
+    let reprobe_engine = engine.clone();
     let service = runtime.block_on(Service::start(options.clone(), engine))?;
     let handle = service.handle();
     let snapshot = handle.snapshot();
     let runtime_handle = runtime.handle().clone();
+    let close_notice = Arc::new(std::sync::Mutex::new((
+        CloseNoticeStore::new(base.join("close-to-tray-notice")),
+        None,
+    )));
     let actions = UiActions {
         load: Arc::new({
             let handle = handle.clone();
@@ -62,6 +68,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let catalog = catalog.clone();
                 runtime_handle.spawn(async move {
                     let _ = handle.rescan(catalog).await;
+                });
+            }
+        }),
+        snapshot: Arc::new({
+            let handle = handle.clone();
+            move || {
+                let snapshot = handle.snapshot();
+                AppSnapshot {
+                    models: snapshot.models,
+                    lifecycle: snapshot.lifecycle,
+                    capabilities: handle.capabilities(),
+                }
+            }
+        }),
+        quit: Arc::new({
+            let handle = handle.clone();
+            let runtime_handle = runtime_handle.clone();
+            move || {
+                let handle = handle.clone();
+                runtime_handle.spawn(async move {
+                    let _ = handle.shutdown().await;
+                    let _ = slint::quit_event_loop();
+                });
+            }
+        }),
+        close_notice: Arc::new({
+            let close_notice = close_notice.clone();
+            move || {
+                let mut state = close_notice.lock().expect("close notice lock poisoned");
+                let mut notice = state.1.take().unwrap_or_else(|| state.0.load());
+                let message = notice.take().map(str::to_owned);
+                let _ = state.0.save(&notice);
+                state.1 = Some(notice);
+                message
+            }
+        }),
+        save_settings: Arc::new({
+            let runtime_handle = runtime_handle.clone();
+            move |_| {
+                let engine = reprobe_engine.clone();
+                runtime_handle.spawn(async move {
+                    let _ = engine.probe_capabilities().await;
                 });
             }
         }),
