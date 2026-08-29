@@ -46,6 +46,9 @@ pub trait WslChild: Send {
     async fn pid_control_line(&mut self) -> Result<String, WslError>;
     async fn wait_ready(&mut self, timeout: Duration) -> Result<(), WslError>;
     async fn check_health(&mut self) -> Result<(), WslError>;
+    async fn endpoint_responding(&mut self) -> bool {
+        self.check_health().await.is_ok()
+    }
     async fn wait_for_exit(&mut self) -> Result<i32, WslError>;
 }
 
@@ -97,6 +100,10 @@ impl CommandRunner for TokioCommandRunner {
             .find(|pair| pair[0] == "--port")
             .and_then(|pair| pair[1].parse().ok())
             .ok_or_else(|| WslError::Command("missing internal port".into()))?;
+        let distribution = argv
+            .get(1)
+            .cloned()
+            .ok_or_else(|| WslError::Command("missing distribution".into()))?;
         let mut child = Command::new(program)
             .args(argv)
             .kill_on_drop(true)
@@ -119,6 +126,8 @@ impl CommandRunner for TokioCommandRunner {
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
             logs: self.logs.clone(),
             drains: Vec::new(),
+            distribution,
+            linux_pid: None,
         }))
     }
 }
@@ -130,6 +139,8 @@ struct TokioWslChild {
     addr: SocketAddr,
     logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
     drains: Vec<tokio::task::JoinHandle<()>>,
+    distribution: String,
+    linux_pid: Option<u32>,
 }
 #[async_trait]
 impl WslChild for TokioWslChild {
@@ -145,6 +156,10 @@ impl WslChild for TokioWslChild {
         if count == 0 {
             return Err(WslError::Command("missing PID control line".into()));
         }
+        self.linux_pid = Some(
+            crate::parse_pid_control_line(&line)
+                .map_err(|error| WslError::Command(error.to_string()))?,
+        );
         if let Some(mut stdout) = self.stdout.take() {
             let logs = self.logs.clone();
             self.drains.push(tokio::spawn(async move {
@@ -172,7 +187,11 @@ impl WslChild for TokioWslChild {
                 )));
             }
             if tokio::net::TcpStream::connect(self.addr).await.is_ok() {
-                return Ok(());
+                return if self.endpoint_is_owned().await? {
+                    Ok(())
+                } else {
+                    Err(WslError::NonOwnedEndpoint)
+                };
             }
             if Instant::now() >= deadline {
                 return Err(WslError::Command("readiness timed out".into()));
@@ -183,8 +202,15 @@ impl WslChild for TokioWslChild {
     async fn check_health(&mut self) -> Result<(), WslError> {
         tokio::net::TcpStream::connect(self.addr)
             .await
-            .map(|_| ())
-            .map_err(|e| WslError::Command(e.to_string()))
+            .map_err(|e| WslError::Command(e.to_string()))?;
+        if self.endpoint_is_owned().await? {
+            Ok(())
+        } else {
+            Err(WslError::NonOwnedEndpoint)
+        }
+    }
+    async fn endpoint_responding(&mut self) -> bool {
+        tokio::net::TcpStream::connect(self.addr).await.is_ok()
     }
     async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
         let status = self
@@ -196,6 +222,38 @@ impl WslChild for TokioWslChild {
             let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
         }
         Ok(status.code().unwrap_or(-1))
+    }
+}
+
+impl TokioWslChild {
+    async fn endpoint_is_owned(&self) -> Result<bool, WslError> {
+        let pid = self
+            .linux_pid
+            .ok_or_else(|| WslError::Command("PID handshake not established".into()))?;
+        let port = format!(":{}", self.addr.port());
+        let output = Command::new("wsl.exe")
+            .args([
+                "-d",
+                &self.distribution,
+                "--",
+                "ss",
+                "-H",
+                "-ltnp",
+                "sport",
+                "=",
+                &port,
+            ])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| WslError::Command(error.to_string()))?;
+        if !output.status.success() {
+            return Err(WslError::Command(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let needle = format!("pid={pid},");
+        Ok(String::from_utf8_lossy(&output.stdout).contains(&needle))
     }
 }
 
@@ -529,7 +587,7 @@ impl EngineProcess for WslEngineProcess {
         Box::pin(async move {
             let code = self.child.wait_for_exit().await.map_err(app_error)?;
             let deadline = Instant::now() + Duration::from_secs(1);
-            while self.child.check_health().await.is_ok() {
+            while self.child.endpoint_responding().await {
                 if Instant::now() >= deadline {
                     return Err(app_error(WslError::Command(
                         "old endpoint remained live after process exit".into(),
@@ -577,7 +635,7 @@ impl WslEngineProcess {
                 .map_err(app_error)?;
         }
         let endpoint_deadline = Instant::now() + Duration::from_millis(250);
-        while self.child.check_health().await.is_ok() {
+        while self.child.endpoint_responding().await {
             if Instant::now() >= endpoint_deadline {
                 return Err(app_error(WslError::Command(
                     "owned endpoint remained live".into(),
