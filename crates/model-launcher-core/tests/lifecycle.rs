@@ -168,7 +168,6 @@ impl InferenceEngine for ScriptedEngine {
         self.inner.lock().unwrap().validation_entered += 1;
         let gate = self.inner.lock().unwrap().validation_gate.clone();
         Box::pin(async move {
-            self.inner.lock().unwrap().spawn_entered += 1;
             if let Some(gate) = gate {
                 gate.notified().await;
             }
@@ -183,6 +182,7 @@ impl InferenceEngine for ScriptedEngine {
         _settings: &'a LaunchSettings,
     ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
         Box::pin(async move {
+            self.inner.lock().unwrap().spawn_entered += 1;
             let gate = self.inner.lock().unwrap().spawn_gate.clone();
             if let Some(gate) = gate {
                 gate.notified().await;
@@ -724,6 +724,10 @@ async fn graceful_stop_timeout_forces_process_and_allows_replacement() {
         async move { handle.load(model("b")).await }
     });
     wait_for_state(&handle, LifecycleState::Stopping).await;
+    wait_until("graceful replacement stop entered", || {
+        engine.shutdown_counts().0 == 1
+    })
+    .await;
     tokio::time::advance(Duration::from_secs(5)).await;
     wait_until("forced replacement stop", || {
         engine.shutdown_counts() == (1, 1)
@@ -752,6 +756,10 @@ async fn shutdown_is_accepted_while_graceful_stop_is_pending() {
         async move { handle.load(model("b")).await }
     });
     wait_for_state(&handle, LifecycleState::Stopping).await;
+    wait_until("graceful shutdown entered", || {
+        engine.shutdown_counts().0 == 1
+    })
+    .await;
     let shutdown = tokio::spawn(async move { handle.shutdown().await });
     assert!(
         !shutdown.is_finished(),
@@ -843,7 +851,16 @@ async fn force_timeout_aggregates_stop_requests_and_blocks_replacement() {
         let handle = handle.clone();
         async move { handle.load(model("b")).await }
     });
+    wait_for_state(&handle, LifecycleState::Stopping).await;
+    wait_until("graceful force-timeout stop entered", || {
+        engine.shutdown_counts().0 == 1
+    })
+    .await;
     tokio::time::advance(Duration::from_secs(5)).await;
+    wait_until("force-timeout phase entered", || {
+        engine.shutdown_counts().1 == 1
+    })
+    .await;
     let shutdown = tokio::spawn({
         let handle = lifecycle.handle();
         async move { handle.shutdown().await }
@@ -915,6 +932,10 @@ async fn owner_drop_during_pending_stop_exits_after_bounded_force_timeout() {
     while snapshots.borrow().state != LifecycleState::Stopping {
         snapshots.changed().await.unwrap();
     }
+    wait_until("owner-drop graceful stop entered", || {
+        engine.shutdown_counts().0 == 1
+    })
+    .await;
 
     tokio::time::advance(Duration::from_secs(5)).await;
     wait_until("force shutdown start", || engine.shutdown_counts().1 == 1).await;
@@ -930,9 +951,13 @@ async fn validation_and_spawn_have_actor_enforced_timeouts() {
     let validating = Arc::new(ScriptedEngine::new());
     let _validation_gate = validating.block_validation();
     let _validation_process = validating.script();
-    let validation_lifecycle = Lifecycle::spawn(validating);
+    let validation_lifecycle = Lifecycle::spawn(validating.clone());
     let validation_handle = validation_lifecycle.handle();
     let validation = tokio::spawn(async move { validation_handle.load(model("a")).await });
+    wait_until("validation future entered", || {
+        validating.event_counts().0 == 1
+    })
+    .await;
     tokio::time::advance(Duration::from_secs(30)).await;
     assert_eq!(
         validation.await.unwrap().unwrap_err().code(),
@@ -942,9 +967,10 @@ async fn validation_and_spawn_have_actor_enforced_timeouts() {
     let spawning = Arc::new(ScriptedEngine::new());
     let _spawn_gate = spawning.block_spawn();
     let _spawn_process = spawning.script();
-    let spawn_lifecycle = Lifecycle::spawn(spawning);
+    let spawn_lifecycle = Lifecycle::spawn(spawning.clone());
     let spawn_handle = spawn_lifecycle.handle();
     let spawn = tokio::spawn(async move { spawn_handle.load(model("a")).await });
+    wait_until("spawn future entered", || spawning.event_counts().1 == 1).await;
     tokio::time::advance(Duration::from_secs(30)).await;
     assert_eq!(
         spawn.await.unwrap().unwrap_err().code(),
