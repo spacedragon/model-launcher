@@ -1,7 +1,7 @@
 use crate::{
     ExecutableIdentity, OwnedPid, PortAllocator, ProbeSnapshot, Signal, capture_version,
-    guarded_signal_argv, launch_argv, parse_identity, parse_proc_start_time, probe_argv,
-    proc_stat_argv, stat_argv, windows_to_wsl_path,
+    guarded_signal_argv, launch_argv, parse_identity, parse_ownership_handshake, probe_argv,
+    stat_argv, windows_to_wsl_path,
 };
 use async_trait::async_trait;
 use model_launcher_core::{
@@ -171,9 +171,24 @@ impl WslChild for TokioWslChild {
         if count == 0 {
             return Err(WslError::Command("missing PID control line".into()));
         }
+        let mut start_line = String::new();
+        let count = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| WslError::Command("stdout unavailable".into()))?
+            .read_line(&mut start_line)
+            .await
+            .map_err(|e| WslError::Command(e.to_string()))?;
+        if count == 0 {
+            return Err(WslError::Command(
+                "missing PID start-time control line".into(),
+            ));
+        }
+        line.push_str(&start_line);
         self.linux_pid = Some(
-            crate::parse_pid_control_line(&line)
-                .map_err(|error| WslError::Command(error.to_string()))?,
+            parse_ownership_handshake(&line)
+                .map_err(|error| WslError::Command(error.to_string()))?
+                .pid,
         );
         if let Some(mut stdout) = self.stdout.take() {
             let logs = self.logs.clone();
@@ -583,9 +598,9 @@ impl LlamaCppWslEngine {
 fn app_error(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
     AppError::EngineProcess(Box::new(error))
 }
-async fn establish_pid(child: &mut dyn WslChild) -> Result<u32, WslError> {
+async fn establish_pid(child: &mut dyn WslChild) -> Result<OwnedPid, WslError> {
     let result = child.pid_control_line().await.and_then(|line| {
-        crate::parse_pid_control_line(&line).map_err(|error| WslError::Command(error.to_string()))
+        parse_ownership_handshake(&line).map_err(|error| WslError::Command(error.to_string()))
     });
     match result {
         Ok(pid) => Ok(pid),
@@ -595,32 +610,6 @@ async fn establish_pid(child: &mut dyn WslChild) -> Result<u32, WslError> {
         }
     }
 }
-async fn establish_owned_pid(
-    child: &mut dyn WslChild,
-    runner: &dyn CommandRunner,
-    distribution: &str,
-) -> Result<OwnedPid, WslError> {
-    let pid = establish_pid(child).await?;
-    let result = runner
-        .output("wsl.exe", &proc_stat_argv(distribution, pid))
-        .await
-        .and_then(|output| {
-            if output.success {
-                parse_proc_start_time(&output.stdout)
-                    .map_err(|error| WslError::Command(error.to_string()))
-            } else {
-                Err(WslError::Command(output.stderr))
-            }
-        });
-    match result {
-        Ok(start_time) => Ok(OwnedPid { pid, start_time }),
-        Err(error) => {
-            let _ = child.abort_host().await;
-            Err(error)
-        }
-    }
-}
-
 impl InferenceEngine for LlamaCppWslEngine {
     fn spec(&self) -> EngineFuture<'_, EngineSpec> {
         Box::pin(async move {
@@ -687,9 +676,7 @@ impl InferenceEngine for LlamaCppWslEngine {
             let mut child = spawn_after_release(&*self.runner, reservation, &argv)
                 .await
                 .map_err(app_error)?;
-            let owned_pid = establish_owned_pid(&mut *child, &*self.runner, &self.distribution)
-                .await
-                .map_err(app_error)?;
+            let owned_pid = establish_pid(&mut *child).await.map_err(app_error)?;
             Ok(Box::new(WslEngineProcess {
                 distribution: self.distribution.clone(),
                 pid: owned_pid.pid,
@@ -905,9 +892,7 @@ impl WslEngineProcess {
         let mut child = spawn_after_release(&*self.runner, reservation, &argv)
             .await
             .map_err(app_error)?;
-        let owned_pid = establish_owned_pid(&mut *child, &*self.runner, &self.distribution)
-            .await
-            .map_err(app_error)?;
+        let owned_pid = establish_pid(&mut *child).await.map_err(app_error)?;
         self.child = Some(child);
         self.pid = owned_pid.pid;
         self.owned_pid = owned_pid;
@@ -1132,7 +1117,11 @@ mod tests {
     #[async_trait]
     impl WslChild for AttemptChild {
         async fn pid_control_line(&mut self) -> Result<String, WslError> {
-            Ok(format!("MODEL_LAUNCHER_PID={}\n", self.pid))
+            Ok(format!(
+                "MODEL_LAUNCHER_PID={}\nMODEL_LAUNCHER_START_TIME={}\n",
+                self.pid,
+                u64::from(self.pid) + 180
+            ))
         }
         async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
             self.ready.take().unwrap()
@@ -1157,16 +1146,6 @@ mod tests {
     #[async_trait]
     impl CommandRunner for AttemptRunner {
         async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
-            if argv.contains(&"cat".into())
-                && argv.last().is_some_and(|value| value.starts_with("/proc/"))
-            {
-                return Ok(CommandOutput {
-                    success: true,
-                    stdout: "22 (llama) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 202 20\n"
-                        .into(),
-                    stderr: String::new(),
-                });
-            }
             self.signals.lock().unwrap().push(argv.to_vec());
             Ok(CommandOutput {
                 success: true,
@@ -1221,6 +1200,18 @@ mod tests {
                     && argv.get(8).is_some_and(|v| v == "11"))
         );
         assert_eq!(process.pid, 22);
+        assert_eq!(
+            process.owned_pid,
+            OwnedPid {
+                pid: 22,
+                start_time: 202
+            }
+        );
+        assert!(
+            signals
+                .iter()
+                .all(|argv| !argv.iter().any(|arg| arg.starts_with("/proc/")))
+        );
     }
 
     #[tokio::test]
@@ -1392,7 +1383,7 @@ mod tests {
     #[async_trait]
     impl WslChild for DelayedEndpointChild {
         async fn pid_control_line(&mut self) -> Result<String, WslError> {
-            Ok("MODEL_LAUNCHER_PID=88\n".into())
+            Ok("MODEL_LAUNCHER_PID=88\nMODEL_LAUNCHER_START_TIME=109\n".into())
         }
         async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
             Ok(())

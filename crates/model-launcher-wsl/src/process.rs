@@ -7,7 +7,7 @@ use std::{
 };
 use thiserror::Error;
 
-pub const LAUNCH_SCRIPT: &str = "printf 'MODEL_LAUNCHER_PID=%s\\n' \"$$\"; exec \"$@\"";
+pub const LAUNCH_SCRIPT: &str = "stat=$(cat \"/proc/$$/stat\" 2>/dev/null) || exit 70; rest=${stat##*) }; start=$(set -- $rest; printf '%s' \"${20}\"); case $start in ''|*[!0-9]*) exit 70;; esac; printf 'MODEL_LAUNCHER_PID=%s\\nMODEL_LAUNCHER_START_TIME=%s\\n' \"$$\" \"$start\"; exec \"$@\"";
 pub const LAUNCH_SENTINEL: &str = "model-launcher";
 pub const SIGNAL_SENTINEL: &str = "model-launcher-signal";
 pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"${20}\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; kill \"$signal\" -- \"$pid\" && printf 'Signaled\\n'";
@@ -125,6 +125,27 @@ pub fn parse_pid_control_line(line: &str) -> Result<u32, PidError> {
         .filter(|pid| *pid > 0)
         .ok_or(PidError::Invalid)
 }
+pub fn parse_ownership_handshake(value: &str) -> Result<OwnedPid, PidError> {
+    let mut lines = value.split_inclusive('\n');
+    let pid = parse_pid_control_line(lines.next().ok_or(PidError::Invalid)?)?;
+    let start_line = lines.next().ok_or(PidError::Invalid)?;
+    if lines.next().is_some() {
+        return Err(PidError::Invalid);
+    }
+    let raw = start_line
+        .strip_suffix('\n')
+        .and_then(|line| line.strip_prefix("MODEL_LAUNCHER_START_TIME="))
+        .ok_or(PidError::Invalid)?;
+    if raw.is_empty() || raw.starts_with('0') || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(PidError::Invalid);
+    }
+    let start_time = raw
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(PidError::Invalid)?;
+    Ok(OwnedPid { pid, start_time })
+}
 
 #[derive(Default)]
 pub struct InternalPortAllocator;
@@ -217,12 +238,19 @@ impl EngineStreamCapture {
             return Ok(None);
         }
         self.control.extend_from_slice(bytes);
-        let Some(newline) = self.control.iter().position(|byte| *byte == b'\n') else {
+        let Some(newline) = self
+            .control
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte == b'\n')
+            .nth(1)
+            .map(|(index, _)| index)
+        else {
             return Ok(None);
         };
         let remainder = self.control.split_off(newline + 1);
         let line = std::str::from_utf8(&self.control).map_err(|_| PidError::Invalid)?;
-        let pid = parse_pid_control_line(line)?;
+        let pid = parse_ownership_handshake(line)?.pid;
         self.control.clear();
         self.pid_seen = true;
         self.stdout.push(timestamp_ms, &remainder);
@@ -274,7 +302,7 @@ mod tests {
         );
         assert_eq!(
             LAUNCH_SCRIPT,
-            "printf 'MODEL_LAUNCHER_PID=%s\\n' \"$$\"; exec \"$@\""
+            "stat=$(cat \"/proc/$$/stat\" 2>/dev/null) || exit 70; rest=${stat##*) }; start=$(set -- $rest; printf '%s' \"${20}\"); case $start in ''|*[!0-9]*) exit 70;; esac; printf 'MODEL_LAUNCHER_PID=%s\\nMODEL_LAUNCHER_START_TIME=%s\\n' \"$$\" \"$start\"; exec \"$@\""
         );
     }
 
@@ -339,6 +367,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_exact_two_line_ownership_handshake() {
+        assert_eq!(
+            parse_ownership_handshake("MODEL_LAUNCHER_PID=42\nMODEL_LAUNCHER_START_TIME=98765\n")
+                .unwrap(),
+            OwnedPid {
+                pid: 42,
+                start_time: 98765
+            }
+        );
+        for invalid in [
+            "MODEL_LAUNCHER_PID=42\n",
+            "MODEL_LAUNCHER_PID=42\nMODEL_LAUNCHER_START_TIME=0\n",
+            "MODEL_LAUNCHER_PID=42\nMODEL_LAUNCHER_START_TIME=01\n",
+            "MODEL_LAUNCHER_PID=42\nspoof MODEL_LAUNCHER_START_TIME=9\n",
+            "MODEL_LAUNCHER_PID=42\nMODEL_LAUNCHER_START_TIME=9\nextra\n",
+        ] {
+            assert!(
+                parse_ownership_handshake(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn internal_port_allocator_reserves_loopback_ephemeral_port() {
         let reservation = match InternalPortAllocator.reserve() {
             Ok(reservation) => reservation,
@@ -355,8 +407,12 @@ mod tests {
         let model_id = ModelId::new();
         let mut capture = EngineStreamCapture::new(store.clone(), Some(7), Some(model_id)).unwrap();
         assert_eq!(
+            capture.push_stdout(10, b"MODEL_LAUNCHER_PID=4").unwrap(),
+            None
+        );
+        assert_eq!(
             capture
-                .push_stdout(10, b"MODEL_LAUNCHER_PID=42\nfirst ")
+                .push_stdout(10, b"2\nMODEL_LAUNCHER_START_TIME=98765\nfirst ")
                 .unwrap(),
             Some(42)
         );
