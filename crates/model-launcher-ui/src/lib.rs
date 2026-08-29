@@ -44,9 +44,10 @@ pub fn run_desktop(
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
+    hydrate_server(&window, &view_model.snapshot);
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
     hydrate_capabilities(&window, &view_model.snapshot.capabilities);
-    window.set_logs(log_lines((actions.logs)(LogFilter::default())));
+    set_logs(&window, (actions.logs)(LogFilter::default()));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
     install_model_search(&window, actions.clone());
@@ -219,7 +220,8 @@ impl WindowManager {
             window.get_search_query().as_str(),
         )))));
         window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
-        window.set_logs(log_lines((self.actions.logs)(LogFilter::default())));
+        hydrate_server(window, &view_model.snapshot);
+        set_logs(window, (self.actions.logs)(LogFilter::default()));
         hydrate_capabilities(window, &view_model.snapshot.capabilities);
         hydrate_engine_settings(window, (self.actions.engine_settings)());
     }
@@ -241,9 +243,10 @@ fn create_window(
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
+    hydrate_server(&window, &view_model.snapshot);
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
     hydrate_capabilities(&window, &view_model.snapshot.capabilities);
-    window.set_logs(log_lines((actions.logs)(LogFilter::default())));
+    set_logs(&window, (actions.logs)(LogFilter::default()));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
     install_model_search(&window, actions.clone());
@@ -352,10 +355,10 @@ fn install_model_search(window: &MainWindow, actions: UiActions) {
     });
 }
 
-fn log_lines(records: Vec<LogRecord>) -> slint::ModelRc<slint::SharedString> {
+fn log_lines(records: &[LogRecord]) -> slint::ModelRc<slint::SharedString> {
     use slint::{ModelRc, SharedString, VecModel};
     let lines: Vec<SharedString> = records
-        .into_iter()
+        .iter()
         .map(|record| {
             format!(
                 "{} {:?} {:?}  {}",
@@ -365,6 +368,24 @@ fn log_lines(records: Vec<LogRecord>) -> slint::ModelRc<slint::SharedString> {
         })
         .collect();
     ModelRc::from(Rc::new(VecModel::from(lines)))
+}
+
+fn log_text(records: &[LogRecord]) -> String {
+    records
+        .iter()
+        .map(|record| {
+            format!(
+                "{} {:?} {:?}  {}",
+                record.timestamp_ms, record.source, record.level, record.message
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn set_logs(window: &MainWindow, records: Vec<LogRecord>) {
+    window.set_log_copy_text(log_text(&records).into());
+    window.set_logs(log_lines(&records));
 }
 
 fn install_log_filter(window: &MainWindow, actions: UiActions) {
@@ -386,10 +407,13 @@ fn install_log_filter(window: &MainWindow, actions: UiActions) {
             _ => None,
         };
         if let Some(window) = weak.upgrade() {
-            window.set_logs(log_lines((actions.logs)(LogFilter {
-                source,
-                minimum_level,
-            })));
+            set_logs(
+                &window,
+                (actions.logs)(LogFilter {
+                    source,
+                    minimum_level,
+                }),
+            );
         }
     });
 }
@@ -419,6 +443,11 @@ fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
             .map_or(1, |value| value.get()) as i32,
     );
     window.set_default_flash(settings.defaults.flash_attention.unwrap_or(false));
+}
+
+fn hydrate_server(window: &MainWindow, snapshot: &AppSnapshot) {
+    window.set_authentication_status(snapshot.authentication_status.clone().into());
+    window.set_server_warning(snapshot.server_warning.clone().into());
 }
 
 fn launch_settings(
@@ -629,6 +658,8 @@ pub struct AppSnapshot {
     pub recent_models: Vec<ModelRecord>,
     pub lifecycle: LifecycleSnapshot,
     pub capabilities: EngineCapabilities,
+    pub authentication_status: String,
+    pub server_warning: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -930,5 +961,18 @@ impl LogCommands {
     }
     pub fn export(&self, writer: impl io::Write) -> io::Result<()> {
         self.store.export_json_lines(writer)
+    }
+    #[must_use]
+    pub fn copy_text(&self, filter: LogFilter) -> String {
+        self.snapshot(filter)
+            .into_iter()
+            .map(|record| {
+                format!(
+                    "{} {:?} {:?}  {}",
+                    record.timestamp_ms, record.source, record.level, record.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

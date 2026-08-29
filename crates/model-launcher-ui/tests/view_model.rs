@@ -37,6 +37,8 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
         recent_models: vec![],
         lifecycle: LifecycleSnapshot::default(),
         capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
     };
     let vm = ViewModel::from_snapshot(snapshot);
     assert_eq!(vm.rows()[0].name, "Alpha");
@@ -75,6 +77,8 @@ fn model_search_matches_name_key_and_path_case_insensitively() {
         recent_models: vec![],
         lifecycle: LifecycleSnapshot::default(),
         capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
     });
 
     assert_eq!(vm.filtered_rows("CHAT")[0].id, alpha.id);
@@ -98,6 +102,8 @@ fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
         recent_models: vec![],
         lifecycle,
         capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
     });
     assert_eq!(
         vm.action(other.id),
@@ -218,6 +224,13 @@ fn log_commands_use_bounded_filtered_redacted_snapshots() {
         .len(),
         2
     );
+    let copied = logs.copy_text(LogFilter {
+        source: None,
+        minimum_level: Some(LogLevel::Warn),
+    });
+    assert!(copied.contains("boom"));
+    assert!(!copied.contains("old"));
+    assert!(!copied.contains("secret"));
     let mut bytes = Vec::new();
     logs.export(&mut bytes).unwrap();
     let text = String::from_utf8(bytes).unwrap();

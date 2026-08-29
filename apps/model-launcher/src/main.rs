@@ -103,6 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recent_models: handle.recent_models(),
                     lifecycle: snapshot.lifecycle,
                     capabilities: handle.capabilities(),
+                    authentication_status: "Token authentication enabled".into(),
+                    server_warning: String::new(),
                 }
             }
         }),
@@ -158,8 +160,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         export_logs: Arc::new({
             let handle = handle.clone();
             let path = base.join("model-launcher-logs.jsonl");
-            move || {
-                let _ = handle.export_logs(&path);
+            move || match handle.export_logs(&path) {
+                Ok(()) => {
+                    model_launcher_ui::report_status(format!("Logs exported to {}", path.display()))
+                }
+                Err(error) => {
+                    model_launcher_ui::report_status(format!("Log export failed: {error}"))
+                }
             }
         }),
         generate_token: Arc::new({
@@ -228,6 +235,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             recent_models: handle.recent_models(),
             lifecycle: snapshot.lifecycle,
             capabilities: handle.capabilities(),
+            authentication_status: "Token authentication enabled".into(),
+            server_warning: String::new(),
         },
         handle.local_addr().to_string(),
         actions,
