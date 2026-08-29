@@ -7,8 +7,8 @@ use std::{
 use gguf_rs_lib::{builder::GGUFBuilder, format::MetadataValue};
 use model_launcher_core::{
     CatalogDebouncer, CatalogDiagnosticKind, CatalogIdentity, CatalogService, CatalogWatchEvent,
-    ConfigStore, LauncherConfig, ModelKey, ModelState, ReconcileOptions, catalog_watch_channel,
-    reconcile_catalog, scan,
+    CatalogWatcher, ConfigStore, LauncherConfig, ModelKey, ModelState, ReconcileOptions,
+    catalog_watch_channel, reconcile_catalog, scan,
 };
 use uuid::Uuid;
 
@@ -57,10 +57,8 @@ fn metadata_gguf(name: MetadataValue) -> Vec<u8> {
             MetadataValue::String("llama".into()),
         )
         .add_metadata("general.parameter_count", MetadataValue::U64(7_000_000_000))
-        .add_metadata(
-            "general.quantization",
-            MetadataValue::String("Q4_K_M".into()),
-        )
+        .add_metadata("general.file_type", MetadataValue::U32(15))
+        .add_metadata("general.quantization_version", MetadataValue::U32(2))
         .add_metadata("llama.context_length", MetadataValue::U32(8192))
         .build_to_bytes()
         .unwrap()
@@ -109,6 +107,7 @@ fn valid_gguf_extracts_metadata_and_missing_name_uses_filename() {
     assert_eq!(metadata.metadata.architecture.as_deref(), Some("llama"));
     assert_eq!(metadata.metadata.parameter_count, Some(7_000_000_000));
     assert_eq!(metadata.metadata.quantization.as_deref(), Some("Q4_K_M"));
+    assert_eq!(metadata.metadata.quantization_version, Some(2));
     assert_eq!(metadata.metadata.context_length, Some(8192));
     assert!(
         result
@@ -135,6 +134,70 @@ fn wrong_type_name_falls_back_with_metadata_diagnostic() {
             .iter()
             .any(|item| item.kind == CatalogDiagnosticKind::Metadata)
     );
+}
+
+#[test]
+fn unknown_standard_file_type_is_retained_with_diagnostic() {
+    let root = TestDir::new();
+    let bytes = GGUFBuilder::new()
+        .add_metadata("general.name", MetadataValue::String("Future".into()))
+        .add_metadata("general.file_type", MetadataValue::U32(999))
+        .build_to_bytes()
+        .unwrap()
+        .0;
+    root.file("future.gguf", &bytes);
+    let result = scan(root.path());
+    assert_eq!(
+        result.models[0].metadata.quantization.as_deref(),
+        Some("FILE_TYPE_999")
+    );
+    assert!(result.complete);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.kind == CatalogDiagnosticKind::Metadata)
+    );
+}
+
+#[test]
+fn standard_file_types_have_stable_display_names() {
+    let root = TestDir::new();
+    let cases = [
+        (0, "F32"),
+        (1, "F16"),
+        (2, "Q4_0"),
+        (3, "Q4_1"),
+        (6, "Q5_0"),
+        (7, "Q5_1"),
+        (8, "Q8_0"),
+        (10, "Q2_K"),
+        (12, "Q3_K_M"),
+        (15, "Q4_K_M"),
+        (17, "Q5_K_M"),
+        (18, "Q6_K"),
+        (19, "IQ2_XXS"),
+        (23, "IQ4_NL"),
+        (27, "IQ1_M"),
+    ];
+    for (value, expected) in cases {
+        let bytes = GGUFBuilder::new()
+            .add_metadata("general.name", MetadataValue::String(expected.into()))
+            .add_metadata("general.file_type", MetadataValue::U32(value))
+            .build_to_bytes()
+            .unwrap()
+            .0;
+        root.file(&format!("{value}.gguf"), &bytes);
+    }
+    let result = scan(root.path());
+    for (_, expected) in cases {
+        let model = result
+            .models
+            .iter()
+            .find(|model| model.display_name == expected)
+            .unwrap();
+        assert_eq!(model.metadata.quantization.as_deref(), Some(expected));
+    }
 }
 
 #[test]
@@ -203,6 +266,22 @@ fn unreadable_root_is_incomplete_and_visible() {
     if unsafe { libc::geteuid() } != 0 {
         assert!(!result.complete);
         assert!(!result.diagnostics.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_discovered_file_makes_scan_incomplete_without_partial_model() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = TestDir::new();
+    let path = root.file("unreadable.gguf", &tiny_gguf("Unsafe partial"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let result = scan(root.path());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(!result.complete);
+        assert!(result.models.is_empty());
+        assert!(result.diagnostics.iter().any(|item| item.path == path));
     }
 }
 
@@ -413,4 +492,25 @@ async fn watcher_errors_reach_service_diagnostics() {
             .iter()
             .any(|item| item.message.contains("backend stopped"))
     );
+}
+
+#[tokio::test]
+async fn real_watcher_drives_service_and_persists_discovery() {
+    let models = TestDir::new();
+    let config = TestDir::new();
+    let store = ConfigStore::new(config.path());
+    let service = CatalogService::new(models.path(), store.clone());
+    let mut watcher = CatalogWatcher::watch(models.path(), Duration::from_millis(100)).unwrap();
+    // Give platform backends (notably macOS FSEvents) time to finish registering the root.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    models.file("watched.gguf", &tiny_gguf("Watched"));
+
+    let output = tokio::time::timeout(Duration::from_secs(5), watcher.process_next(&service))
+        .await
+        .expect("filesystem notification timeout")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(output.config.models[0].display_name, "Watched");
+    assert_eq!(store.load().unwrap(), output.config);
 }

@@ -6,7 +6,7 @@ use std::{
 };
 
 use gguf_rs_lib::{format::MetadataValue, reader::GGUFFileReader};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config as NotifyConfig, PollWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -89,6 +89,7 @@ pub struct CatalogMetadata {
     pub architecture: Option<String>,
     pub parameter_count: Option<u64>,
     pub quantization: Option<String>,
+    pub quantization_version: Option<u64>,
     pub context_length: Option<u64>,
 }
 
@@ -217,9 +218,51 @@ pub fn scan(root: &Path) -> ScanResult {
             }
         }
         consumed.extend(logical_files.iter().cloned());
-        result
-            .models
-            .push(read_model(path, &logical_files, &mut result.diagnostics));
+        let mut size_bytes = 0_u64;
+        let mut launch_size_bytes = None;
+        let mut size_error = None;
+        for shard_path in &logical_files {
+            match fs::metadata(shard_path) {
+                Ok(metadata) => {
+                    if let Err(error) = File::open(shard_path) {
+                        size_error = Some(scan_diagnostic(shard_path, error));
+                        break;
+                    }
+                    if shard_path == path {
+                        launch_size_bytes = Some(metadata.len());
+                    }
+                    size_bytes = size_bytes.saturating_add(metadata.len());
+                }
+                Err(error) => {
+                    size_error = Some(scan_diagnostic(shard_path, error));
+                    break;
+                }
+            }
+        }
+        if let Some(diagnostic) = size_error {
+            result.complete = false;
+            result.diagnostics.push(diagnostic);
+            continue;
+        }
+        match File::open(path) {
+            Ok(file) => match read_model(
+                path,
+                size_bytes,
+                launch_size_bytes.unwrap_or_default(),
+                file,
+                &mut result.diagnostics,
+            ) {
+                Ok(model) => result.models.push(model),
+                Err(diagnostic) => {
+                    result.complete = false;
+                    result.diagnostics.push(diagnostic);
+                }
+            },
+            Err(error) => {
+                result.complete = false;
+                result.diagnostics.push(scan_diagnostic(path, error));
+            }
+        }
     }
     result
 }
@@ -240,9 +283,11 @@ fn is_gguf(path: &Path) -> bool {
 
 fn read_model(
     path: &Path,
-    shards: &[PathBuf],
+    size_bytes: u64,
+    expected_launch_size: u64,
+    file: File,
     diagnostics: &mut Vec<CatalogDiagnostic>,
-) -> ScannedModel {
+) -> Result<ScannedModel, CatalogDiagnostic> {
     let fallback = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -251,13 +296,7 @@ fn read_model(
         .expect("constant regex")
         .replace(fallback, "")
         .into_owned();
-    let size_bytes = shards
-        .iter()
-        .filter_map(|shard| fs::metadata(shard).ok().map(|metadata| metadata.len()))
-        .sum();
-    let (display_name, metadata) = match File::open(path)
-        .and_then(|file| GGUFFileReader::new(file).map_err(std::io::Error::other))
-    {
+    let (display_name, metadata) = match GGUFFileReader::new(file) {
         Ok(reader) => {
             let values = reader.metadata();
             let string = |key: &str| match values.get(key) {
@@ -282,15 +321,51 @@ fn read_model(
             let context_length = architecture
                 .as_deref()
                 .and_then(|arch| integer(&format!("{arch}.context_length")));
+            let quantization = match integer("general.file_type") {
+                Some(value) => {
+                    let (display, known) = ggml_file_type(value);
+                    if !known {
+                        diagnostics.push(CatalogDiagnostic {
+                            kind: CatalogDiagnosticKind::Metadata,
+                            path: path.to_path_buf(),
+                            message: format!("unknown general.file_type value {value}"),
+                        });
+                    }
+                    Some(display)
+                }
+                None => None,
+            };
             (
                 string("general.name").unwrap_or_else(|| fallback.clone()),
                 CatalogMetadata {
                     architecture,
                     parameter_count: integer("general.parameter_count"),
-                    quantization: string("general.quantization"),
+                    quantization,
+                    quantization_version: integer("general.quantization_version"),
                     context_length,
                 },
             )
+        }
+        Err(gguf_rs_lib::GGUFError::Io(io_error))
+            if io_error.kind() != std::io::ErrorKind::UnexpectedEof
+                || fs::metadata(path).map(|metadata| metadata.len()).ok()
+                    != Some(expected_launch_size) =>
+        {
+            return Err(CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: path.to_path_buf(),
+                message: io_error.to_string(),
+            });
+        }
+        Err(error @ gguf_rs_lib::GGUFError::UnexpectedEof)
+            if fs::metadata(path).map(|metadata| metadata.len()).ok()
+                != Some(expected_launch_size) =>
+        {
+            return Err(CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            });
         }
         Err(error) => {
             diagnostics.push(CatalogDiagnostic {
@@ -301,13 +376,52 @@ fn read_model(
             (fallback, CatalogMetadata::default())
         }
     };
-    ScannedModel {
+    Ok(ScannedModel {
         display_name,
         path: path.to_path_buf(),
         size_bytes,
         identity: CatalogIdentity::for_path(path),
         metadata,
-    }
+    })
+}
+
+fn ggml_file_type(value: u64) -> (String, bool) {
+    let display = match value {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        4 => "Q4_2",
+        5 => "Q4_3",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        19 => "IQ2_XXS",
+        20 => "IQ2_XS",
+        21 => "IQ3_XXS",
+        22 => "IQ1_S",
+        23 => "IQ4_NL",
+        24 => "IQ3_S",
+        25 => "IQ2_S",
+        26 => "IQ4_XS",
+        27 => "IQ1_M",
+        28 => "BF16",
+        29 => "TQ1_0",
+        30 => "TQ2_0",
+        31 => "MXFP4",
+        _ => return (format!("FILE_TYPE_{value}"), false),
+    };
+    (display.into(), true)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -532,22 +646,24 @@ impl CatalogService {
 /// `notify` adapter. It reports typed events after the filesystem has been quiet for the configured
 /// interval; callback failures remain visible rather than being silently dropped.
 pub struct CatalogWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: PollWatcher,
     events: CatalogWatchReceiver,
 }
 
 impl CatalogWatcher {
     pub fn watch(root: &Path, delay: Duration) -> notify::Result<Self> {
         let (sender, events) = catalog_watch_channel(delay);
-        let mut watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+        let mut watcher = PollWatcher::new(
+            move |event: notify::Result<notify::Event>| match event {
                 Ok(event) => {
                     for path in event.paths {
                         sender.emit(CatalogWatchEvent::Changed(path));
                     }
                 }
                 Err(error) => sender.emit(CatalogWatchEvent::Error(error.to_string())),
-            })?;
+            },
+            NotifyConfig::default().with_poll_interval(Duration::from_millis(50)),
+        )?;
         watcher.watch(root, RecursiveMode::Recursive)?;
         Ok(Self {
             _watcher: watcher,
@@ -557,5 +673,12 @@ impl CatalogWatcher {
 
     pub async fn next(&mut self) -> Option<Vec<CatalogWatchEvent>> {
         self.events.next_batch().await
+    }
+
+    pub async fn process_next(
+        &mut self,
+        service: &CatalogService,
+    ) -> Result<Option<ReconcileResult>, AppError> {
+        service.process_next(&mut self.events).await
     }
 }
