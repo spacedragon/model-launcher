@@ -1,3 +1,6 @@
+use model_launcher_core::{
+    AppError, EngineLogFramer, LogLevel, LogSource, LogStore, MAX_ENGINE_LOG_LINE_BYTES, ModelId,
+};
 use std::{
     io,
     net::{SocketAddr, TcpListener},
@@ -89,6 +92,26 @@ impl InternalPortAllocator {
         })
     }
 }
+pub trait PortLease: Send {
+    fn addr(&self) -> SocketAddr;
+    fn release(self: Box<Self>) -> SocketAddr;
+}
+impl PortLease for PortReservation {
+    fn addr(&self) -> SocketAddr {
+        self.addr()
+    }
+    fn release(self: Box<Self>) -> SocketAddr {
+        (*self).release()
+    }
+}
+pub trait PortAllocator: Send + Sync {
+    fn reserve(&self) -> io::Result<Box<dyn PortLease>>;
+}
+impl PortAllocator for InternalPortAllocator {
+    fn reserve(&self) -> io::Result<Box<dyn PortLease>> {
+        InternalPortAllocator::reserve(self).map(|lease| Box::new(lease) as Box<dyn PortLease>)
+    }
+}
 impl PortReservation {
     #[must_use]
     pub const fn addr(&self) -> SocketAddr {
@@ -100,9 +123,74 @@ impl PortReservation {
     }
 }
 
+pub struct EngineStreamCapture {
+    stdout: EngineLogFramer,
+    stderr: EngineLogFramer,
+    control: Vec<u8>,
+    pid_seen: bool,
+}
+
+impl EngineStreamCapture {
+    pub fn new(
+        store: LogStore,
+        generation: Option<u64>,
+        model_id: Option<ModelId>,
+    ) -> Result<Self, AppError> {
+        Ok(Self {
+            stdout: EngineLogFramer::new(
+                store.clone(),
+                LogSource::EngineStdout,
+                LogLevel::Info,
+                generation,
+                model_id,
+                MAX_ENGINE_LOG_LINE_BYTES,
+            )?,
+            stderr: EngineLogFramer::new(
+                store,
+                LogSource::EngineStderr,
+                LogLevel::Error,
+                generation,
+                model_id,
+                MAX_ENGINE_LOG_LINE_BYTES,
+            )?,
+            control: Vec::new(),
+            pid_seen: false,
+        })
+    }
+    pub fn push_stdout(
+        &mut self,
+        timestamp_ms: u64,
+        bytes: &[u8],
+    ) -> Result<Option<u32>, PidError> {
+        if self.pid_seen {
+            self.stdout.push(timestamp_ms, bytes);
+            return Ok(None);
+        }
+        self.control.extend_from_slice(bytes);
+        let Some(newline) = self.control.iter().position(|byte| *byte == b'\n') else {
+            return Ok(None);
+        };
+        let remainder = self.control.split_off(newline + 1);
+        let line = std::str::from_utf8(&self.control).map_err(|_| PidError::Invalid)?;
+        let pid = parse_pid_control_line(line)?;
+        self.control.clear();
+        self.pid_seen = true;
+        self.stdout.push(timestamp_ms, &remainder);
+        Ok(Some(pid))
+    }
+    pub fn push_stderr(&mut self, timestamp_ms: u64, bytes: &[u8]) {
+        self.stderr.push(timestamp_ms, bytes);
+    }
+    pub fn finish(&mut self, timestamp_ms: u64) {
+        self.stdout.finish(timestamp_ms);
+        self.stderr.finish(timestamp_ms);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_launcher_core::{LogLevel, LogSource, LogStore, LogStoreLimits, ModelId};
 
     #[test]
     fn launch_uses_fixed_script_and_positional_arguments() {
@@ -168,5 +256,45 @@ mod tests {
         let reservation = InternalPortAllocator.reserve().unwrap();
         assert_eq!(reservation.addr().ip().to_string(), "127.0.0.1");
         assert_ne!(reservation.addr().port(), 0);
+    }
+
+    #[test]
+    fn pid_control_is_separate_and_following_arbitrary_chunks_are_structured_logs() {
+        let store = LogStore::new(LogStoreLimits::new(16, 4096, 4)).unwrap();
+        let model_id = ModelId::new();
+        let mut capture = EngineStreamCapture::new(store.clone(), Some(7), Some(model_id)).unwrap();
+        assert_eq!(
+            capture
+                .push_stdout(10, b"MODEL_LAUNCHER_PID=42\nfirst ")
+                .unwrap(),
+            Some(42)
+        );
+        assert_eq!(capture.push_stdout(11, b"line\npartial").unwrap(), None);
+        capture.push_stderr(12, b"Authorization: Bearer secret\nwarn");
+        capture.finish(13);
+        let records = store.snapshot();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].message, "first line");
+        assert_eq!(records[0].source, LogSource::EngineStdout);
+        assert_eq!(records[0].level, LogLevel::Info);
+        assert_eq!(records[0].generation, Some(7));
+        assert_eq!(records[0].model_id, Some(model_id));
+        let partial = records
+            .iter()
+            .find(|record| record.message == "partial")
+            .unwrap();
+        assert_eq!(partial.source, LogSource::EngineStdout);
+        let authorization = records
+            .iter()
+            .find(|record| record.message.starts_with("Authorization:"))
+            .unwrap();
+        assert_eq!(authorization.message, "Authorization: [REDACTED]");
+        assert_eq!(authorization.source, LogSource::EngineStderr);
+        assert_eq!(authorization.level, LogLevel::Error);
+        assert!(
+            records
+                .iter()
+                .all(|record| !record.message.contains("MODEL_LAUNCHER_PID"))
+        );
     }
 }

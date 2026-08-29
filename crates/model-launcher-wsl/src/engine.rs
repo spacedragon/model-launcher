@@ -1,11 +1,12 @@
 use crate::{
-    ExecutableIdentity, ProbeSnapshot, Signal, capture_version, launch_argv, parse_identity,
-    probe_argv, signal_argv, stat_argv, windows_to_wsl_path,
+    ExecutableIdentity, PortAllocator, ProbeSnapshot, Signal, capture_version, launch_argv,
+    parse_identity, probe_argv, signal_argv, stat_argv, windows_to_wsl_path,
 };
 use async_trait::async_trait;
 use model_launcher_core::{
-    AppError, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
-    LaunchSettings, ModelRecord,
+    AppError, EngineCapabilities, EngineFuture, EngineLogFramer, EngineProcess, EngineSpec,
+    InferenceEngine, LaunchSettings, LogLevel, LogSource, LogStore, MAX_ENGINE_LOG_LINE_BYTES,
+    ModelId, ModelRecord,
 };
 use std::{
     io,
@@ -34,6 +35,10 @@ pub enum WslError {
     Path(String),
     #[error("process spawning is unsupported by this runner")]
     SpawnUnsupported,
+    #[error("internal port is already in use")]
+    AddressInUse,
+    #[error("internal endpoint is not owned by the launched process")]
+    NonOwnedEndpoint,
 }
 
 #[async_trait]
@@ -55,7 +60,21 @@ pub trait CommandRunner: Send + Sync {
 }
 
 #[derive(Default)]
-pub struct TokioCommandRunner;
+pub struct TokioCommandRunner {
+    logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
+}
+impl TokioCommandRunner {
+    #[must_use]
+    pub fn with_log_store(
+        store: LogStore,
+        generation: Option<u64>,
+        model_id: Option<ModelId>,
+    ) -> Self {
+        Self {
+            logs: Some((store, generation, model_id)),
+        }
+    }
+}
 
 #[async_trait]
 impl CommandRunner for TokioCommandRunner {
@@ -98,6 +117,8 @@ impl CommandRunner for TokioCommandRunner {
             stdout: Some(BufReader::new(stdout)),
             stderr: Some(stderr),
             addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            logs: self.logs.clone(),
+            drains: Vec::new(),
         }))
     }
 }
@@ -107,6 +128,8 @@ struct TokioWslChild {
     stdout: Option<BufReader<ChildStdout>>,
     stderr: Option<ChildStderr>,
     addr: SocketAddr,
+    logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
+    drains: Vec<tokio::task::JoinHandle<()>>,
 }
 #[async_trait]
 impl WslChild for TokioWslChild {
@@ -122,19 +145,17 @@ impl WslChild for TokioWslChild {
         if count == 0 {
             return Err(WslError::Command("missing PID control line".into()));
         }
-        // Drain both pipes after the control record so a verbose server cannot block. Applications
-        // that need retained logs should inject their own runner and frame these streams to LogStore.
         if let Some(mut stdout) = self.stdout.take() {
-            tokio::spawn(async move {
-                let mut sink = tokio::io::sink();
-                let _ = tokio::io::copy(&mut stdout, &mut sink).await;
-            });
+            let logs = self.logs.clone();
+            self.drains.push(tokio::spawn(async move {
+                drain_stream(&mut stdout, logs, LogSource::EngineStdout, LogLevel::Info).await;
+            }));
         }
         if let Some(mut stderr) = self.stderr.take() {
-            tokio::spawn(async move {
-                let mut sink = tokio::io::sink();
-                let _ = tokio::io::copy(&mut stderr, &mut sink).await;
-            });
+            let logs = self.logs.clone();
+            self.drains.push(tokio::spawn(async move {
+                drain_stream(&mut stderr, logs, LogSource::EngineStderr, LogLevel::Error).await;
+            }));
         }
         Ok(line)
     }
@@ -171,8 +192,51 @@ impl WslChild for TokioWslChild {
             .wait()
             .await
             .map_err(|e| WslError::Command(e.to_string()))?;
+        for drain in self.drains.drain(..) {
+            let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
+        }
         Ok(status.code().unwrap_or(-1))
     }
+}
+
+async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
+    source: LogSource,
+    level: LogLevel,
+) {
+    let Some((store, generation, model_id)) = logs else {
+        let mut sink = tokio::io::sink();
+        let _ = tokio::io::copy(reader, &mut sink).await;
+        return;
+    };
+    let Ok(mut framer) = EngineLogFramer::new(
+        store,
+        source,
+        level,
+        generation,
+        model_id,
+        MAX_ENGINE_LOG_LINE_BYTES,
+    ) else {
+        return;
+    };
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match tokio::io::AsyncReadExt::read(reader, &mut buffer).await {
+            Ok(0) => break,
+            Ok(count) => framer.push(now_ms(), &buffer[..count]),
+            Err(_) => break,
+        }
+    }
+    framer.finish(now_ms());
+}
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 pub struct WslProber {
@@ -267,6 +331,7 @@ pub struct LlamaCppWslEngine {
     distribution: String,
     executable: String,
     runner: Arc<dyn CommandRunner>,
+    allocator: Arc<dyn PortAllocator>,
 }
 impl LlamaCppWslEngine {
     #[must_use]
@@ -279,7 +344,13 @@ impl LlamaCppWslEngine {
             distribution: distribution.into(),
             executable: executable.into(),
             runner,
+            allocator: Arc::new(crate::InternalPortAllocator),
         }
+    }
+    #[must_use]
+    pub fn with_port_allocator(mut self, allocator: Arc<dyn PortAllocator>) -> Self {
+        self.allocator = allocator;
+        self
     }
     async fn probe(&self) -> Result<ProbeSnapshot, WslError> {
         WslProber::new(self.runner.clone())
@@ -344,7 +415,7 @@ impl InferenceEngine for LlamaCppWslEngine {
                     .ok_or_else(|| app_error(io::Error::other("non-Unicode model path")))?,
             )
             .map_err(|e| app_error(io::Error::other(e.to_string())))?;
-            let reservation = crate::InternalPortAllocator.reserve().map_err(app_error)?;
+            let reservation = self.allocator.reserve().map_err(app_error)?;
             let port = reservation.addr().port();
             let mut args = vec![
                 "--host".into(),
@@ -367,6 +438,13 @@ impl InferenceEngine for LlamaCppWslEngine {
                 pid,
                 runner: self.runner.clone(),
                 child,
+                retry: Some(RetryContext {
+                    executable: self.executable.clone(),
+                    model_path,
+                    args,
+                    allocator: self.allocator.clone(),
+                }),
+                owned_active: true,
             }) as Box<dyn EngineProcess>)
         })
     }
@@ -377,10 +455,38 @@ struct WslEngineProcess {
     pid: u32,
     runner: Arc<dyn CommandRunner>,
     child: Box<dyn WslChild>,
+    retry: Option<RetryContext>,
+    owned_active: bool,
+}
+struct RetryContext {
+    executable: String,
+    model_path: String,
+    args: Vec<String>,
+    allocator: Arc<dyn PortAllocator>,
 }
 impl EngineProcess for WslEngineProcess {
     fn wait_ready(&mut self, timeout: Duration) -> EngineFuture<'_, ()> {
-        Box::pin(async move { self.child.wait_ready(timeout).await.map_err(app_error) })
+        Box::pin(async move {
+            let deadline = Instant::now() + timeout;
+            for attempt in 1..=3 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match self.child.wait_ready(remaining).await {
+                    Ok(()) => {
+                        self.retry = None;
+                        return Ok(());
+                    }
+                    Err(WslError::AddressInUse | WslError::NonOwnedEndpoint) if attempt < 3 => {
+                        self.stop_attempt().await?;
+                        self.spawn_retry().await?;
+                    }
+                    Err(error) => {
+                        self.stop_attempt().await?;
+                        return Err(app_error(error));
+                    }
+                }
+            }
+            Err(app_error(WslError::AddressInUse))
+        })
     }
     fn check_health(&mut self) -> EngineFuture<'_, ()> {
         Box::pin(async move { self.child.check_health().await.map_err(app_error) })
@@ -420,7 +526,119 @@ impl EngineProcess for WslEngineProcess {
         })
     }
     fn wait_for_exit(&mut self) -> EngineFuture<'_, i32> {
-        Box::pin(async move { self.child.wait_for_exit().await.map_err(app_error) })
+        Box::pin(async move {
+            let code = self.child.wait_for_exit().await.map_err(app_error)?;
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.child.check_health().await.is_ok() {
+                if Instant::now() >= deadline {
+                    return Err(app_error(WslError::Command(
+                        "old endpoint remained live after process exit".into(),
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            self.owned_active = false;
+            Ok(code)
+        })
+    }
+}
+
+impl WslEngineProcess {
+    async fn stop_attempt(&mut self) -> Result<(), AppError> {
+        let term = self
+            .runner
+            .output(
+                "wsl.exe",
+                &signal_argv(&self.distribution, self.pid, Signal::Term),
+            )
+            .await
+            .map_err(app_error)?;
+        if !term.success {
+            return Err(app_error(WslError::Command(term.stderr)));
+        }
+        if tokio::time::timeout(Duration::from_millis(250), self.child.wait_for_exit())
+            .await
+            .is_err()
+        {
+            let kill = self
+                .runner
+                .output(
+                    "wsl.exe",
+                    &signal_argv(&self.distribution, self.pid, Signal::Kill),
+                )
+                .await
+                .map_err(app_error)?;
+            if !kill.success {
+                return Err(app_error(WslError::Command(kill.stderr)));
+            }
+            tokio::time::timeout(Duration::from_secs(1), self.child.wait_for_exit())
+                .await
+                .map_err(|_| app_error(WslError::Command("owned process did not exit".into())))?
+                .map_err(app_error)?;
+        }
+        let endpoint_deadline = Instant::now() + Duration::from_millis(250);
+        while self.child.check_health().await.is_ok() {
+            if Instant::now() >= endpoint_deadline {
+                return Err(app_error(WslError::Command(
+                    "owned endpoint remained live".into(),
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.owned_active = false;
+        Ok(())
+    }
+    async fn spawn_retry(&mut self) -> Result<(), AppError> {
+        let retry = self
+            .retry
+            .as_ref()
+            .ok_or_else(|| app_error(WslError::Command("retry context unavailable".into())))?;
+        let reservation = retry.allocator.reserve().map_err(app_error)?;
+        let port = reservation.addr().port();
+        let mut args = retry.args.clone();
+        if let Some(value) = args.windows(2).position(|pair| pair[0] == "--port") {
+            args[value + 1] = port.to_string();
+        }
+        let _released = reservation.release();
+        let argv = launch_argv(
+            &self.distribution,
+            &retry.executable,
+            &retry.model_path,
+            &args,
+        );
+        let mut child = self
+            .runner
+            .spawn("wsl.exe", &argv)
+            .await
+            .map_err(app_error)?;
+        let line = child.pid_control_line().await.map_err(app_error)?;
+        let pid = crate::parse_pid_control_line(&line).map_err(app_error)?;
+        self.child = child;
+        self.pid = pid;
+        self.owned_active = true;
+        Ok(())
+    }
+}
+
+impl Drop for WslEngineProcess {
+    fn drop(&mut self) {
+        if !self.owned_active {
+            return;
+        }
+        let runner = self.runner.clone();
+        let distribution = self.distribution.clone();
+        let pid = self.pid;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = runner
+                    .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Term))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = runner
+                    .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Kill))
+                    .await;
+            });
+        }
     }
 }
 
@@ -432,6 +650,7 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+    use std::{collections::VecDeque, net::SocketAddr};
 
     #[derive(Default)]
     struct FakeRunner {
@@ -502,5 +721,211 @@ mod tests {
         let engine =
             LlamaCppWslEngine::new("Ubuntu", "/bin/llama", Arc::new(FakeRunner::default()));
         accepts(&engine);
+    }
+
+    struct FakeLease(u16);
+    impl crate::PortLease for FakeLease {
+        fn addr(&self) -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], self.0))
+        }
+        fn release(self: Box<Self>) -> SocketAddr {
+            self.addr()
+        }
+    }
+    struct FakeAllocator(Mutex<VecDeque<u16>>);
+    impl PortAllocator for FakeAllocator {
+        fn reserve(&self) -> io::Result<Box<dyn crate::PortLease>> {
+            Ok(Box::new(FakeLease(
+                self.0.lock().unwrap().pop_front().unwrap(),
+            )))
+        }
+    }
+    struct AttemptChild {
+        pid: u32,
+        ready: Option<Result<(), WslError>>,
+    }
+    #[async_trait]
+    impl WslChild for AttemptChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            Ok(format!("MODEL_LAUNCHER_PID={}\n", self.pid))
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            self.ready.take().unwrap()
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            Err(WslError::Command("down".into()))
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            Ok(0)
+        }
+    }
+    struct AttemptRunner {
+        children: Mutex<VecDeque<AttemptChild>>,
+        signals: Mutex<Vec<Vec<String>>>,
+    }
+    #[async_trait]
+    impl CommandRunner for AttemptRunner {
+        async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
+            self.signals.lock().unwrap().push(argv.to_vec());
+            Ok(CommandOutput {
+                success: true,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+        async fn spawn(&self, _: &str, _: &[String]) -> Result<Box<dyn WslChild>, WslError> {
+            Ok(Box::new(self.children.lock().unwrap().pop_front().unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn stolen_port_terminates_owned_pid_then_retries_with_fresh_port() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::from([AttemptChild {
+                pid: 22,
+                ready: Some(Ok(())),
+            }])),
+            signals: Mutex::new(Vec::new()),
+        });
+        let allocator = Arc::new(FakeAllocator(Mutex::new(VecDeque::from([2002]))));
+        let mut process = WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 11,
+            runner: runner.clone(),
+            child: Box::new(AttemptChild {
+                pid: 11,
+                ready: Some(Err(WslError::NonOwnedEndpoint)),
+            }),
+            retry: Some(RetryContext {
+                executable: "/llama".into(),
+                model_path: "/model".into(),
+                args: vec!["--port".into(), "2001".into()],
+                allocator,
+            }),
+            owned_active: true,
+        };
+        process.wait_ready(Duration::from_secs(1)).await.unwrap();
+        let signals = runner.signals.lock().unwrap();
+        assert!(signals.iter().any(|argv| argv.ends_with(&[
+            "-TERM".into(),
+            "--".into(),
+            "11".into()
+        ])));
+        assert_eq!(process.pid, 22);
+    }
+
+    #[tokio::test]
+    async fn three_stolen_ports_exhaust_and_terminate_each_owned_pid_only() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::from([
+                AttemptChild {
+                    pid: 22,
+                    ready: Some(Err(WslError::AddressInUse)),
+                },
+                AttemptChild {
+                    pid: 33,
+                    ready: Some(Err(WslError::NonOwnedEndpoint)),
+                },
+            ])),
+            signals: Mutex::new(Vec::new()),
+        });
+        let allocator = Arc::new(FakeAllocator(Mutex::new(VecDeque::from([2002, 2003]))));
+        let mut process = WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 11,
+            runner: runner.clone(),
+            child: Box::new(AttemptChild {
+                pid: 11,
+                ready: Some(Err(WslError::AddressInUse)),
+            }),
+            retry: Some(RetryContext {
+                executable: "/llama".into(),
+                model_path: "/model".into(),
+                args: vec!["--port".into(), "2001".into()],
+                allocator,
+            }),
+            owned_active: true,
+        };
+        let error = process
+            .wait_ready(Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("NonOwnedEndpoint"));
+        let signals = runner.signals.lock().unwrap();
+        let killed: Vec<_> = signals
+            .iter()
+            .filter_map(|argv| argv.last().cloned())
+            .collect();
+        assert_eq!(killed, ["11", "22", "33"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_owned_process_after_pid_handshake_cleans_exact_pid() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        let process = WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 77,
+            runner: runner.clone(),
+            child: Box::new(AttemptChild {
+                pid: 77,
+                ready: Some(Ok(())),
+            }),
+            retry: None,
+            owned_active: true,
+        };
+        drop(process);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(251)).await;
+        tokio::task::yield_now().await;
+        let signals = runner.signals.lock().unwrap();
+        assert_eq!(signals.len(), 2);
+        assert!(signals[0].ends_with(&["-TERM".into(), "--".into(), "77".into()]));
+        assert!(signals[1].ends_with(&["-KILL".into(), "--".into(), "77".into()]));
+    }
+
+    struct DelayedEndpointChild {
+        checks: usize,
+    }
+    #[async_trait]
+    impl WslChild for DelayedEndpointChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            Ok("MODEL_LAUNCHER_PID=88\n".into())
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            Ok(())
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            if self.checks == 0 {
+                Err(WslError::Command("down".into()))
+            } else {
+                self.checks -= 1;
+                Ok(())
+            }
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            Ok(0)
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_exit_waits_until_old_health_endpoint_is_down() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        let mut process = WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 88,
+            runner,
+            child: Box::new(DelayedEndpointChild { checks: 2 }),
+            retry: None,
+            owned_active: true,
+        };
+        let started = tokio::time::Instant::now();
+        process.wait_for_exit().await.unwrap();
+        assert!(!process.owned_active);
+        assert!(tokio::time::Instant::now().duration_since(started) >= Duration::from_millis(50));
     }
 }

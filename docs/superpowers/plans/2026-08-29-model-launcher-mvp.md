@@ -241,35 +241,35 @@ git commit -m "feat: discover gguf models with stable identity"
 - Create: `crates/model-launcher-wsl/src/{lib,path,probe,port,process}.rs`
 - Test: inline unit tests and `crates/model-launcher-wsl/tests/fake_wsl.rs`
 
-- [ ] **Step 1: Write failing path and help-parser tests**
+- [x] **Step 1: Write failing path and help-parser tests**
 
 Cover drive casing, spaces, Unicode, relative/UNC rejection, traversal-like input and invalid roots, known flag aliases, unsupported flags, version capture, and command argument rendering. Assert user-controlled values remain separate argv elements and are never interpolated into a script.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-wsl`
 
 Expected: crate or symbols are absent.
 
-- [ ] **Step 3: Implement probe caching and invalidation**
+- [x] **Step 3: Implement probe caching and invalidation**
 
 Persist `ProbeSnapshot { distribution, executable_path, executable_identity, version_raw, help_raw, capabilities, probed_at }`. Obtain executable identity from a structured WSL `stat` invocation (device, inode, size, mtime). Reuse a snapshot only while distribution, path, and identity match. Saving engine settings always validates identity; a changed identity executes fresh `--version` and `--help`. Test cache hit, each invalidation input, failed reprobe preserving the prior diagnostic, and raw-output persistence.
 
-- [ ] **Step 4: Implement a shell-safe PID protocol and process ownership**
+- [x] **Step 4: Implement a shell-safe PID protocol and process ownership**
 
 Invoke probes directly as `wsl.exe -d <distribution> -- <executable> --version/--help`. For launch only, pass a fixed, application-owned POSIX script as the `sh -c` program: `printf 'MODEL_LAUNCHER_PID=%s\\n' "$$"; exec "$@"`. Pass a constant `$0` sentinel, then executable/model/settings solely as subsequent positional argv elements. The script text never contains user input. Parse the first control line as the exact Linux PID; `exec` preserves that PID. Stream all following stdout/stderr to `LogStore`. Stop with structured `wsl.exe -d <distribution> -- kill -TERM -- <pid>`, wait, then use `kill -KILL -- <pid>` after timeout. Reject malformed/missing PID handshakes and never fall back to process-name termination.
 
-- [ ] **Step 5: Implement internal-port allocation and retry**
+- [x] **Step 5: Implement internal-port allocation and retry**
 
 Create an injectable `InternalPortAllocator`. The production allocator asks Windows for an ephemeral loopback port by binding `127.0.0.1:0`, reads the assigned port, releases the reservation immediately before spawn, then polls readiness. If startup reports address-in-use or the port becomes occupied by a non-owned server, terminate the attempted owned PID, allocate a new port, and retry up to three times. During model replacement, require the old process to exit and its prior health endpoint to stop responding before reuse; normally allocate a fresh port. Tests simulate a stolen port, exhausted retries, old-port release delay, and verify the public gateway port never changes.
 
-- [ ] **Step 6: Verify without requiring WSL**
+- [x] **Step 6: Verify without requiring WSL**
 
 Run: `cargo test -p model-launcher-wsl && cargo clippy -p model-launcher-wsl --all-targets -- -D warnings`
 
 Expected: all fake-runner tests pass on macOS/Linux CI too.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add Cargo.toml crates/model-launcher-wsl
