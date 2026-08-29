@@ -793,6 +793,7 @@ impl Actor {
         self.set_state(LifecycleState::Stopping);
         let mut directive = StopDirective::Continue;
         let mut waiters = Vec::new();
+        let mut commands_open = true;
         let force = {
             let graceful = process.graceful_shutdown();
             tokio::pin!(graceful);
@@ -802,12 +803,16 @@ impl Actor {
                 let event = tokio::select! {
                     result = &mut graceful => StopEvent::Graceful(result),
                     () = &mut timeout => StopEvent::Timeout,
-                    command = self.commands.recv() => StopEvent::Command(command),
+                    command = self.commands.recv(), if commands_open => StopEvent::Command(command),
                     Some(release) = self.releases.recv() => StopEvent::Release(release),
                 };
                 match event {
                     StopEvent::Graceful(result) => break result.is_err(),
                     StopEvent::Timeout => break true,
+                    StopEvent::Command(None) => {
+                        commands_open = false;
+                        directive = StopDirective::Shutdown;
+                    }
                     StopEvent::Command(command) => {
                         self.handle_stop_command(command, &mut directive, &mut waiters)
                     }
@@ -826,7 +831,7 @@ impl Actor {
                     let event = tokio::select! {
                         result = &mut force => StopEvent::Graceful(result),
                         () = &mut timeout => StopEvent::Timeout,
-                        command = self.commands.recv() => StopEvent::Command(command),
+                        command = self.commands.recv(), if commands_open => StopEvent::Command(command),
                         Some(release) = self.releases.recv() => StopEvent::Release(release),
                     };
                     match event {
@@ -834,6 +839,10 @@ impl Actor {
                             break result.map_err(|error| error.to_string());
                         }
                         StopEvent::Timeout => break Err("force shutdown timed out".to_owned()),
+                        StopEvent::Command(None) => {
+                            commands_open = false;
+                            directive = StopDirective::Shutdown;
+                        }
                         StopEvent::Command(command) => {
                             self.handle_stop_command(command, &mut directive, &mut waiters)
                         }

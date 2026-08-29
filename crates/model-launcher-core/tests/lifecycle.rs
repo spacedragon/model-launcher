@@ -238,10 +238,12 @@ fn model(name: &str) -> ModelRecord {
     }
 }
 
-async fn settle() {
-    tokio::task::yield_now().await;
-    tokio::time::advance(Duration::ZERO).await;
-    tokio::task::yield_now().await;
+async fn scheduler_barrier() {
+    let (reached, barrier) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = reached.send(());
+    });
+    barrier.await.expect("scheduler barrier task was cancelled");
 }
 
 async fn wait_for_state(handle: &model_launcher_core::LifecycleHandle, state: LifecycleState) {
@@ -289,7 +291,7 @@ async fn replacement_stops_a_and_loads_b_without_restoring_a_on_failure() {
         let a = a.clone();
         async move { handle.load(a).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     a_control.ready();
     load_a.await.unwrap().unwrap();
 
@@ -298,7 +300,7 @@ async fn replacement_stops_a_and_loads_b_without_restoring_a_on_failure() {
         let b = b.clone();
         async move { handle.load(b).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     b_control.fail_ready();
     assert_eq!(
         load_b.await.unwrap().unwrap_err().code(),
@@ -321,14 +323,14 @@ async fn replacement_is_busy_while_inference_lease_is_active() {
         let a = a.clone();
         async move { handle.acquire(a).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     control.ready();
     let lease = acquire.await.unwrap().unwrap();
 
     assert_eq!(handle.load(b).await.unwrap_err().code(), "model_busy");
     assert_eq!(handle.snapshot().in_flight, 1);
     drop(lease);
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(handle.snapshot().in_flight, 0);
 }
 
@@ -342,7 +344,7 @@ async fn explicit_eject_cancels_leases_and_clears_desired_model() {
         let handle = handle.clone();
         async move { handle.acquire(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     control.ready();
     let lease = acquire.await.unwrap().unwrap();
 
@@ -363,22 +365,22 @@ async fn unexpected_crashes_restart_with_capped_exponential_backoff() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     controls[0].ready();
     load.await.unwrap().unwrap();
 
     for (index, delay) in [1, 2, 4, 8, 16, 30].into_iter().enumerate() {
         controls[index].exit(9);
-        settle().await;
+        scheduler_barrier().await;
         assert_eq!(handle.snapshot().state, LifecycleState::Backoff);
         tokio::time::advance(Duration::from_secs(delay - 1)).await;
-        settle().await;
+        scheduler_barrier().await;
         assert_eq!(engine.spawn_count(), index + 1);
         tokio::time::advance(Duration::from_secs(1)).await;
-        settle().await;
+        scheduler_barrier().await;
         assert_eq!(engine.spawn_count(), index + 2);
         controls[index + 1].ready();
-        settle().await;
+        scheduler_barrier().await;
     }
 }
 
@@ -394,20 +396,20 @@ async fn five_healthy_minutes_reset_crash_backoff() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     first.ready();
     load.await.unwrap().unwrap();
     first.exit(9);
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    settle().await;
+    scheduler_barrier().await;
     second.ready();
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(300)).await;
     second.exit(9);
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 3, "healthy window resets delay to 1s");
     third.ready();
 }
@@ -423,15 +425,15 @@ async fn stale_generation_timer_cannot_restart_after_eject() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     control.ready();
     load.await.unwrap().unwrap();
     control.exit(9);
-    settle().await;
+    scheduler_barrier().await;
     handle.eject().await.unwrap();
 
     tokio::time::advance(Duration::from_secs(60)).await;
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 1);
     assert_eq!(handle.snapshot().state, LifecycleState::Stopped);
 }
@@ -453,7 +455,7 @@ async fn concurrent_same_model_jit_acquires_share_one_load() {
         let target = target.clone();
         async move { handle.acquire(target).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 1);
     assert!(!one.is_finished() && !two.is_finished());
 
@@ -476,16 +478,16 @@ async fn crash_cancels_and_clears_active_generation_leases() {
         let handle = handle.clone();
         async move { handle.acquire(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     first.ready();
     let lease = acquire.await.unwrap().unwrap();
     first.exit(9);
-    settle().await;
+    scheduler_barrier().await;
 
     assert!(lease.is_cancelled());
     assert_eq!(handle.snapshot().in_flight, 0);
     drop(lease);
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(handle.snapshot().in_flight, 0);
 }
 
@@ -499,10 +501,10 @@ async fn cancelled_acquire_waiter_is_never_counted_as_in_flight() {
         let handle = handle.clone();
         async move { handle.acquire(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     acquire.abort();
     control.ready();
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(handle.snapshot().in_flight, 0);
 }
 
@@ -516,7 +518,7 @@ async fn burst_lease_drops_cannot_lose_release_events() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     control.ready();
     load.await.unwrap().unwrap();
     let target = model("a");
@@ -531,7 +533,7 @@ async fn burst_lease_drops_cannot_lose_release_events() {
     }
     assert_eq!(handle.snapshot().in_flight, 100);
     drop(leases);
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(handle.snapshot().in_flight, 0);
 }
 
@@ -551,7 +553,7 @@ async fn same_model_load_waiters_share_stable_failure() {
         let handle = handle.clone();
         async move { handle.load(target).await.unwrap_err() }
     });
-    settle().await;
+    scheduler_barrier().await;
     control.fail_ready();
     let one = one.await.unwrap();
     let two = two.await.unwrap();
@@ -573,17 +575,17 @@ async fn acquire_different_model_during_backoff_switches_immediately() {
         let handle = handle.clone();
         async move { handle.load(a).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     a_control.ready();
     load.await.unwrap().unwrap();
     a_control.exit(9);
-    settle().await;
+    scheduler_barrier().await;
     let acquire = tokio::spawn({
         let handle = handle.clone();
         let b = b.clone();
         async move { handle.acquire(b).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 2);
     b_control.ready();
     assert!(acquire.await.unwrap().is_ok());
@@ -597,9 +599,9 @@ async fn startup_timeout_stops_owned_process_and_fails_load() {
     let lifecycle = Lifecycle::spawn(engine.clone());
     let handle = lifecycle.handle();
     let load = tokio::spawn(async move { handle.load(model("a")).await });
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(30)).await;
-    settle().await;
+    scheduler_barrier().await;
 
     assert!(load.is_finished());
     assert_eq!(load.await.unwrap().unwrap_err().code(), "model_load_failed");
@@ -613,7 +615,7 @@ async fn readiness_failure_stops_process_before_reporting_failure() {
     let lifecycle = Lifecycle::spawn(engine.clone());
     let handle = lifecycle.handle();
     let load = tokio::spawn(async move { handle.load(model("a")).await });
-    settle().await;
+    scheduler_barrier().await;
     control.fail_ready();
     let error = load.await.unwrap().unwrap_err();
     assert_eq!(error.code(), "model_load_failed");
@@ -638,9 +640,9 @@ async fn eject_responds_while_validation_is_pending() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let eject = tokio::spawn(async move { handle.eject().await });
-    settle().await;
+    scheduler_barrier().await;
     assert!(eject.is_finished());
     eject.await.unwrap().unwrap();
     assert_eq!(lifecycle.handle().snapshot().state, LifecycleState::Stopped);
@@ -658,9 +660,9 @@ async fn eject_responds_while_spawn_is_pending() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let eject = tokio::spawn(async move { handle.eject().await });
-    settle().await;
+    scheduler_barrier().await;
     assert!(eject.is_finished());
     eject.await.unwrap().unwrap();
     gate.notify_waiters();
@@ -678,9 +680,9 @@ async fn eject_responds_while_readiness_is_pending_and_cleans_process() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     handle.eject().await.unwrap();
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.shutdown_counts().0, 1);
     assert_eq!(load.await.unwrap().unwrap_err().code(), "model_load_failed");
 }
@@ -697,16 +699,16 @@ async fn graceful_stop_timeout_forces_process_and_allows_replacement() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     a_control.ready();
     load_a.await.unwrap().unwrap();
     let load_b = tokio::spawn({
         let handle = handle.clone();
         async move { handle.load(model("b")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(5)).await;
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.shutdown_counts(), (1, 1));
     assert_eq!(engine.spawn_count(), 2);
     b_control.ready();
@@ -724,22 +726,22 @@ async fn shutdown_is_accepted_while_graceful_stop_is_pending() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     a_control.ready();
     load_a.await.unwrap().unwrap();
     let replacement = tokio::spawn({
         let handle = handle.clone();
         async move { handle.load(model("b")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let shutdown = tokio::spawn(async move { handle.shutdown().await });
-    settle().await;
+    scheduler_barrier().await;
     assert!(
         !shutdown.is_finished(),
         "shutdown waits for actual stop completion"
     );
     tokio::time::advance(Duration::from_secs(5)).await;
-    settle().await;
+    scheduler_barrier().await;
     assert!(shutdown.is_finished());
     shutdown.await.unwrap().unwrap();
     replacement.abort();
@@ -762,20 +764,20 @@ async fn readiness_cancellation_blocks_new_launch_until_cleanup_finishes() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let eject = tokio::spawn({
         let handle = handle.clone();
         async move { handle.eject().await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let load_b = tokio::spawn(async move { handle.load(model("b")).await });
-    settle().await;
+    scheduler_barrier().await;
     assert!(!eject.is_finished());
     assert_eq!(engine.spawn_count(), 1);
     assert_eq!(load_b.await.unwrap().unwrap_err().code(), "model_starting");
 
     graceful.notify_waiters();
-    settle().await;
+    scheduler_barrier().await;
     eject.await.unwrap().unwrap();
     assert_eq!(engine.spawn_count(), 1);
     assert_eq!(
@@ -796,18 +798,18 @@ async fn cancelled_spawn_future_cannot_create_a_late_process() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     let eject = tokio::spawn({
         let handle = handle.clone();
         async move { handle.eject().await }
     });
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 0);
     assert!(eject.is_finished());
 
     eject.await.unwrap().unwrap();
     spawn_gate.notify_waiters();
-    settle().await;
+    scheduler_barrier().await;
     assert_eq!(engine.spawn_count(), 0);
     assert_eq!(engine.shutdown_counts().0, 0);
 }
@@ -825,16 +827,16 @@ async fn force_timeout_aggregates_stop_requests_and_blocks_replacement() {
         let handle = handle.clone();
         async move { handle.load(model("a")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     a_control.ready();
     load_a.await.unwrap().unwrap();
     let replacement = tokio::spawn({
         let handle = handle.clone();
         async move { handle.load(model("b")).await }
     });
-    settle().await;
+    scheduler_barrier().await;
     tokio::time::advance(Duration::from_secs(5)).await;
-    settle().await;
+    scheduler_barrier().await;
     let shutdown = tokio::spawn({
         let handle = lifecycle.handle();
         async move { handle.shutdown().await }
@@ -843,10 +845,10 @@ async fn force_timeout_aggregates_stop_requests_and_blocks_replacement() {
         let handle = lifecycle.handle();
         async move { handle.eject().await }
     });
-    settle().await;
+    scheduler_barrier().await;
     assert!(!shutdown.is_finished() && !eject.is_finished());
     tokio::time::advance(Duration::from_secs(5)).await;
-    settle().await;
+    scheduler_barrier().await;
     assert!(shutdown.await.unwrap().is_err());
     assert!(eject.await.unwrap().is_err());
     assert!(replacement.await.unwrap().is_err());
@@ -885,6 +887,43 @@ async fn dropping_all_command_owners_stops_running_process_before_actor_exit() {
 
     lifecycle.wait_for_termination().await;
     assert_eq!(engine.shutdown_counts(), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn owner_drop_during_pending_stop_exits_after_bounded_force_timeout() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let _graceful = control.block_graceful();
+    let _force = control.block_force();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    wait_for_state(&handle, LifecycleState::Starting).await;
+    control.ready();
+    load.await.unwrap().unwrap();
+    let mut snapshots = handle.subscribe();
+    drop(handle);
+    let termination = tokio::spawn(lifecycle.wait_for_termination());
+    while snapshots.borrow().state != LifecycleState::Stopping {
+        snapshots.changed().await.unwrap();
+    }
+
+    tokio::time::advance(Duration::from_secs(5)).await;
+    tokio::time::timeout(Duration::from_millis(1), async {
+        while engine.shutdown_counts().1 == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("force shutdown did not start after graceful timeout");
+    assert_eq!(engine.shutdown_counts(), (1, 1));
+    assert!(!termination.is_finished());
+    tokio::time::advance(Duration::from_secs(5)).await;
+    termination.await.unwrap();
+    assert_eq!(engine.shutdown_counts(), (1, 1));
 }
 
 #[tokio::test(start_paused = true)]
@@ -930,9 +969,13 @@ async fn same_model_start_waiters_are_capped_without_duplicate_spawn() {
         }));
     }
     wait_for_state(&handle, LifecycleState::Starting).await;
-    while loads.iter().filter(|load| load.is_finished()).count() < 32 {
-        tokio::task::yield_now().await;
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while loads.iter().filter(|load| load.is_finished()).count() < 32 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiter cap did not reject overload");
     assert_eq!(engine.spawn_count(), 1);
     control.ready();
 
