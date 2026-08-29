@@ -9,8 +9,8 @@ use std::{
 };
 
 use model_launcher_core::{
-    ConfigDiagnosticKind, ConfigStore, FileReplacer, LauncherConfig, ModelId, ModelKey,
-    ModelRecord, ModelState,
+    ConfigDiagnosticKind, ConfigIoStage, ConfigStore, FileReplacer, LauncherConfig, ModelId,
+    ModelKey, ModelRecord, ModelState,
 };
 use uuid::Uuid;
 
@@ -37,6 +37,37 @@ impl FileReplacer for FailNthReplace {
         } else {
             fs::rename(source, destination)
         }
+    }
+}
+
+struct FailStage(ConfigIoStage);
+
+impl FileReplacer for FailStage {
+    fn replace(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        fs::rename(source, destination)
+    }
+
+    fn before_stage(&self, stage: ConfigIoStage) -> io::Result<()> {
+        if stage == self.0 {
+            Err(io::Error::other(format!("injected {stage:?} failure")))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+struct PanicStage;
+
+impl FileReplacer for PanicStage {
+    fn replace(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        fs::rename(source, destination)
+    }
+
+    fn before_stage(&self, stage: ConfigIoStage) -> io::Result<()> {
+        if stage == ConfigIoStage::WriteMainTemp {
+            panic!("injected transaction panic");
+        }
+        Ok(())
     }
 }
 
@@ -128,6 +159,138 @@ fn replacement_failure_preserves_main_and_cleans_temporary_file() {
     assert_eq!(fs::read(store.config_path()).unwrap(), original_bytes);
     assert_eq!(store.load().unwrap(), previous);
     assert!(!dir.0.join("config.json.tmp").exists());
+}
+
+fn temporary_artifacts(dir: &Path) -> Vec<PathBuf> {
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".model-launcher-") && name.contains(".tmp-"))
+        })
+        .collect()
+}
+
+#[test]
+fn write_sync_copy_and_replace_failures_clean_unique_temps_and_preserve_main() {
+    for stage in [
+        ConfigIoStage::WriteMainTemp,
+        ConfigIoStage::SyncMainTemp,
+        ConfigIoStage::CopyBackupTemp,
+        ConfigIoStage::SyncBackupTemp,
+        ConfigIoStage::ReplaceBackup,
+        ConfigIoStage::ReplaceMain,
+    ] {
+        let dir = TestDir::new();
+        let initial_store = ConfigStore::new(&dir.0);
+        let previous = LauncherConfig {
+            models: vec![model(ModelState::Missing)],
+        };
+        initial_store.save(&previous).unwrap();
+        let original = fs::read(initial_store.config_path()).unwrap();
+        let store = ConfigStore::with_replacer(&dir.0, Arc::new(FailStage(stage)));
+
+        let error = store
+            .save(&LauncherConfig::default())
+            .expect_err("injected failure");
+
+        assert_eq!(error.code(), "config_io", "stage {stage:?}");
+        assert_eq!(
+            fs::read(store.config_path()).unwrap(),
+            original,
+            "stage {stage:?}"
+        );
+        assert!(temporary_artifacts(&dir.0).is_empty(), "stage {stage:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn preplanted_fixed_temp_symlinks_are_never_followed() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TestDir::new();
+    let external = dir
+        .0
+        .parent()
+        .unwrap()
+        .join(format!("external-{}", Uuid::new_v4()));
+    fs::write(&external, b"outside").unwrap();
+    symlink(&external, dir.0.join("config.json.tmp")).unwrap();
+    symlink(&external, dir.0.join("config.json.backup.tmp")).unwrap();
+
+    ConfigStore::new(&dir.0)
+        .save(&LauncherConfig::default())
+        .unwrap();
+
+    assert_eq!(fs::read(&external).unwrap(), b"outside");
+    assert!(temporary_artifacts(&dir.0).is_empty());
+    fs::remove_file(external).unwrap();
+}
+
+#[test]
+fn cloned_store_serializes_concurrent_saves_into_complete_versions() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    store.save(&LauncherConfig::default()).unwrap();
+    let configs = (0..8)
+        .map(|index| {
+            let mut record = model(ModelState::Available);
+            record.display_name = format!("model-{index}");
+            LauncherConfig {
+                models: vec![record],
+            }
+        })
+        .collect::<Vec<_>>();
+    let barrier = Arc::new(std::sync::Barrier::new(configs.len()));
+    let handles = configs
+        .iter()
+        .cloned()
+        .map(|config| {
+            let store = store.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.save(&config)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    let main = store.load().unwrap();
+    let backup = ConfigStore::load_file(store.backup_path()).unwrap();
+    assert!(configs.contains(&main));
+    assert!(configs.contains(&backup));
+    assert_ne!(main, backup);
+    assert!(temporary_artifacts(&dir.0).is_empty());
+}
+
+#[test]
+fn poisoned_transaction_lock_returns_config_io_instead_of_panicking() {
+    let dir = TestDir::new();
+    let store = ConfigStore::with_replacer(&dir.0, Arc::new(PanicStage));
+    let panicking_store = store.clone();
+    assert!(
+        std::thread::spawn(move || panicking_store.save(&LauncherConfig::default()))
+            .join()
+            .is_err()
+    );
+
+    let error = store
+        .save(&LauncherConfig::default())
+        .expect_err("poison maps to application error");
+
+    assert_eq!(error.code(), "config_io");
+    assert_eq!(
+        error.source().unwrap().to_string(),
+        "configuration transaction lock was poisoned"
+    );
+    assert!(temporary_artifacts(&dir.0).is_empty());
 }
 
 #[test]
@@ -293,4 +456,20 @@ fn unsupported_load_diagnostic_includes_the_version() {
     );
     assert_eq!(diagnostic.code(), "config_unsupported_version");
     assert!(diagnostic.quarantine_path.exists());
+}
+
+#[test]
+fn quarantine_directory_entry_errors_are_propagated() {
+    let dir = TestDir::new();
+    fs::write(dir.0.join("config.json.quarantine-fixture"), b"fixture").unwrap();
+    let store = ConfigStore::with_replacer(
+        &dir.0,
+        Arc::new(FailStage(ConfigIoStage::ReadDirectoryEntry)),
+    );
+
+    let error = store
+        .quarantined_files()
+        .expect_err("entry failure must propagate");
+
+    assert_eq!(error.code(), "config_io");
 }

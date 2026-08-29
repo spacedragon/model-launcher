@@ -1,8 +1,8 @@
 use std::{
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,6 @@ use crate::{AppError, ModelRecord};
 const CURRENT_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config.json";
 const BACKUP_FILE: &str = "config.json.backup";
-const TEMP_FILE: &str = "config.json.tmp";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LauncherConfig {
@@ -60,8 +59,23 @@ pub struct ConfigLoadOutcome {
     pub diagnostic: Option<ConfigDiagnostic>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigIoStage {
+    WriteMainTemp,
+    SyncMainTemp,
+    CopyBackupTemp,
+    SyncBackupTemp,
+    ReplaceBackup,
+    ReplaceMain,
+    ReadDirectoryEntry,
+}
+
 pub trait FileReplacer: Send + Sync {
     fn replace(&self, source: &Path, destination: &Path) -> io::Result<()>;
+
+    fn before_stage(&self, _stage: ConfigIoStage) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct SystemFileReplacer;
@@ -90,10 +104,14 @@ struct VersionZero {
     models: Vec<ModelRecord>,
 }
 
+/// A configuration store with process-local writer serialization.
+///
+/// Clones share a transaction mutex. Cross-process writers are not supported.
 #[derive(Clone)]
 pub struct ConfigStore {
     directory: PathBuf,
     replacer: Arc<dyn FileReplacer>,
+    transaction: Arc<Mutex<()>>,
 }
 
 impl ConfigStore {
@@ -101,6 +119,7 @@ impl ConfigStore {
         Self {
             directory: directory.into(),
             replacer: Arc::new(SystemFileReplacer),
+            transaction: Arc::new(Mutex::new(())),
         }
     }
 
@@ -108,6 +127,7 @@ impl ConfigStore {
         Self {
             directory: directory.into(),
             replacer,
+            transaction: Arc::new(Mutex::new(())),
         }
     }
 
@@ -126,6 +146,11 @@ impl ConfigStore {
     }
 
     pub fn load_with_diagnostic(&self) -> Result<ConfigLoadOutcome, AppError> {
+        let _transaction = self.lock_transaction()?;
+        self.load_with_diagnostic_locked()
+    }
+
+    fn load_with_diagnostic_locked(&self) -> Result<ConfigLoadOutcome, AppError> {
         let path = self.config_path();
         if !path.exists() {
             return Ok(ConfigLoadOutcome {
@@ -137,7 +162,7 @@ impl ConfigStore {
         match Self::decode_file(&path) {
             Ok((config, migrated)) => {
                 if migrated {
-                    self.save(&config)?;
+                    self.save_locked(&config)?;
                 }
                 Ok(ConfigLoadOutcome {
                     config,
@@ -164,6 +189,11 @@ impl ConfigStore {
     }
 
     pub fn save(&self, config: &LauncherConfig) -> Result<(), AppError> {
+        let _transaction = self.lock_transaction()?;
+        self.save_locked(config)
+    }
+
+    fn save_locked(&self, config: &LauncherConfig) -> Result<(), AppError> {
         fs::create_dir_all(&self.directory).map_err(config_io)?;
         let main = self.config_path();
         if main.exists() {
@@ -181,30 +211,33 @@ impl ConfigStore {
             config: config.clone(),
         })
         .map_err(config_format)?;
-        let temporary = self.directory.join(TEMP_FILE);
-        let mut file = File::create(&temporary).map_err(config_io)?;
-        file.write_all(&bytes).map_err(config_io)?;
-        file.sync_all().map_err(config_io)?;
-        drop(file);
+        let mut temporary = TempGuard::create(&self.directory, "main").map_err(config_io)?;
+        self.before_stage(ConfigIoStage::WriteMainTemp)?;
+        temporary.file_mut().write_all(&bytes).map_err(config_io)?;
+        self.before_stage(ConfigIoStage::SyncMainTemp)?;
+        temporary.file_mut().sync_all().map_err(config_io)?;
+        temporary.close();
 
         if main.exists() {
-            let backup_temporary = self.directory.join("config.json.backup.tmp");
-            fs::copy(&main, &backup_temporary).map_err(config_io)?;
-            File::open(&backup_temporary)
-                .and_then(|file| file.sync_all())
+            let mut backup_temporary =
+                TempGuard::create(&self.directory, "backup").map_err(config_io)?;
+            let mut source = File::open(&main).map_err(config_io)?;
+            self.before_stage(ConfigIoStage::CopyBackupTemp)?;
+            io::copy(&mut source, backup_temporary.file_mut()).map_err(config_io)?;
+            self.before_stage(ConfigIoStage::SyncBackupTemp)?;
+            backup_temporary.file_mut().sync_all().map_err(config_io)?;
+            backup_temporary.close();
+            self.before_stage(ConfigIoStage::ReplaceBackup)?;
+            self.replacer
+                .replace(backup_temporary.path(), &self.backup_path())
                 .map_err(config_io)?;
-            if let Err(error) = self
-                .replacer
-                .replace(&backup_temporary, &self.backup_path())
-            {
-                cleanup_files([&temporary, &backup_temporary]);
-                return Err(config_io(error));
-            }
+            backup_temporary.disarm();
         }
-        if let Err(error) = self.replacer.replace(&temporary, &main) {
-            cleanup_files([&temporary, &self.directory.join("config.json.backup.tmp")]);
-            return Err(config_io(error));
-        }
+        self.before_stage(ConfigIoStage::ReplaceMain)?;
+        self.replacer
+            .replace(temporary.path(), &main)
+            .map_err(config_io)?;
+        temporary.disarm();
         sync_directory(&self.directory).map_err(config_io)?;
         Ok(())
     }
@@ -213,10 +246,16 @@ impl ConfigStore {
         if !self.directory.exists() {
             return Ok(Vec::new());
         }
-        let mut paths = fs::read_dir(&self.directory)
+        let entries = fs::read_dir(&self.directory)
             .map_err(config_io)?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
+            .map(|entry| {
+                let entry = entry.map_err(config_io)?;
+                self.before_stage(ConfigIoStage::ReadDirectoryEntry)?;
+                Ok(entry.path())
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut paths = entries
+            .into_iter()
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
@@ -255,6 +294,74 @@ impl ConfigStore {
         sync_directory(&self.directory).map_err(config_io)?;
         Ok(destination)
     }
+
+    fn before_stage(&self, stage: ConfigIoStage) -> Result<(), AppError> {
+        self.replacer.before_stage(stage).map_err(config_io)
+    }
+
+    fn lock_transaction(&self) -> Result<MutexGuard<'_, ()>, AppError> {
+        self.transaction.lock().map_err(|_| {
+            config_io(io::Error::other(
+                "configuration transaction lock was poisoned",
+            ))
+        })
+    }
+}
+
+struct TempGuard {
+    path: Option<PathBuf>,
+    file: Option<File>,
+}
+
+impl TempGuard {
+    fn create(directory: &Path, purpose: &str) -> io::Result<Self> {
+        for _ in 0..16 {
+            let path = directory.join(format!(".model-launcher-{purpose}.tmp-{}", Uuid::new_v4()));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: Some(path),
+                        file: Some(file),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique configuration temporary file",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("armed temporary path")
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("open temporary file")
+    }
+
+    fn close(&mut self) {
+        self.file.take();
+    }
+
+    fn disarm(mut self) {
+        self.path.take();
+    }
+}
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        self.file.take();
+        if let Some(path) = self.path.take() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+    }
 }
 
 fn config_io(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
@@ -272,16 +379,6 @@ fn classify_format(path: &Path) -> Result<ConfigDiagnosticKind, AppError> {
             Ok(ConfigDiagnosticKind::UnsupportedVersion { version })
         }
         _ => Ok(ConfigDiagnosticKind::Corrupt),
-    }
-}
-
-fn cleanup_files<const N: usize>(paths: [&Path; N]) {
-    for path in paths {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(_) => {}
-        }
     }
 }
 
