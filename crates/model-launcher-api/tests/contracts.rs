@@ -188,7 +188,9 @@ fn config(authentication: Authentication) -> GatewayConfig {
             max_headers: 8,
             max_header_bytes: 256,
             max_connections: 2,
+            max_in_flight_requests: 2,
             startup_timeout: Duration::from_secs(1),
+            shutdown_grace: Duration::from_secs(1),
         },
     }
 }
@@ -293,6 +295,83 @@ async fn server_handle_keeps_stable_address_and_graceful_stop_releases_listener(
     drop(rebound);
     lifecycle.handle().shutdown().await.unwrap();
     lifecycle.wait_for_termination().await;
+}
+
+#[tokio::test]
+async fn listener_connection_cap_covers_idle_prebody_connections() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let mut gateway_config = config(Authentication::Disabled);
+    gateway_config.limits.max_connections = 1;
+    let gateway = Gateway::new(
+        gateway_config,
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(|_| None),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let first = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    first.writable().await.unwrap();
+    let mut second = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    second
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    assert_eq!(second.read(&mut byte).await.unwrap(), 0);
+    drop(first);
+    let mut recovered = tokio::net::TcpStream::connect(server.local_addr())
+        .await
+        .unwrap();
+    recovered
+        .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(recovered.read(&mut byte).await.unwrap() > 0);
+    drop(recovered);
+    stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn bounded_stop_aborts_hung_idle_connection_and_releases_port() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let mut gateway_config = config(Authentication::Disabled);
+    gateway_config.limits.shutdown_grace = Duration::ZERO;
+    let endpoint = upstream.base_url();
+    let gateway = Gateway::new(
+        gateway_config,
+        vec![api_model()],
+        lifecycle.handle(),
+        Arc::new(move |_| Some(endpoint.clone())),
+    )
+    .unwrap();
+    let server = gateway.start().await.unwrap();
+    let address = server.local_addr();
+    let request = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/v1/completions"))
+            .header("x-fake-mode", "gate")
+            .body(r#"{"model":"acme/tiny"}"#)
+            .send()
+            .await
+    });
+    upstream.control.gate_entered().await;
+    let error = server.stop().await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    request.abort();
+    let _ = request.await;
+    let rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+    drop(rebound);
+    lifecycle.handle().shutdown().await.unwrap();
+    lifecycle.wait_for_termination().await;
+    upstream.control.release_gate();
+    upstream.stop().await.unwrap();
 }
 
 #[tokio::test]
@@ -736,7 +815,7 @@ async fn active_response_holds_connection_permit_and_overload_is_stable() {
     let upstream_task = tokio::spawn(async move { axum::serve(listener, upstream).await });
     let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
     let mut gateway_config = config(Authentication::Disabled);
-    gateway_config.limits.max_connections = 1;
+    gateway_config.limits.max_in_flight_requests = 1;
     let endpoint = format!("http://{upstream_addr}");
     let gateway = Gateway::new(
         gateway_config,

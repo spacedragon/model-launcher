@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 model-launcher-core = { path = "../model-launcher-core" }
 axum = "0.8"
-tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

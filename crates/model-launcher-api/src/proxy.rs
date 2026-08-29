@@ -1,5 +1,5 @@
 use axum::{
-    body::{Body, to_bytes},
+    body::Body,
     extract::State,
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response},
 };
@@ -20,10 +20,28 @@ pub(crate) async fn proxy(
             "too many request headers",
         ));
     }
-    let bytes = to_bytes(body, state.limits.max_body_bytes)
-        .await
-        .map_err(|_| ApiError::payload("request_too_large", "request body is too large"))?;
-    let parsed: Value = serde_json::from_slice(&bytes)
+    let mut incoming = body.into_data_stream();
+    let mut chunks = Vec::new();
+    let mut total = 0_usize;
+    while let Some(chunk) = incoming.next().await {
+        let chunk = chunk
+            .map_err(|_| ApiError::bad_request("invalid_request", "request body stream failed"))?;
+        total = total
+            .checked_add(chunk.len())
+            .ok_or_else(|| ApiError::payload("request_too_large", "request body is too large"))?;
+        if total > state.limits.max_body_bytes {
+            return Err(ApiError::payload(
+                "request_too_large",
+                "request body is too large",
+            ));
+        }
+        chunks.push(chunk);
+    }
+    let mut spool = Vec::with_capacity(total);
+    for chunk in &chunks {
+        spool.extend_from_slice(chunk);
+    }
+    let parsed: Value = serde_json::from_slice(&spool)
         .map_err(|_| ApiError::bad_request("invalid_request", "request body is not valid JSON"))?;
     let model_key = parsed
         .get("model")
@@ -48,7 +66,11 @@ pub(crate) async fn proxy(
         "{upstream}{}",
         parts.uri.path_and_query().map_or("/", |v| v.as_str())
     );
-    let mut outgoing = state.client.request(parts.method, url).body(bytes);
+    let request_stream = stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+    let mut outgoing = state
+        .client
+        .request(parts.method, url)
+        .body(reqwest::Body::wrap_stream(request_stream));
     let nominated = nominated_headers(&parts.headers);
     for (name, value) in &parts.headers {
         if safe_request_header(name) && !nominated.contains(name.as_str()) {

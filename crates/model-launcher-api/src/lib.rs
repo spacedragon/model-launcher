@@ -23,8 +23,9 @@ use axum::{
 use model_launcher_core::{AppError, LifecycleHandle, ModelRecord};
 use serde::Serialize;
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
-    sync::{Semaphore, oneshot},
+    sync::{OwnedSemaphorePermit, Semaphore, oneshot},
 };
 
 pub type UpstreamResolver = Arc<dyn Fn(&ModelRecord) -> Option<String> + Send + Sync>;
@@ -35,7 +36,9 @@ pub struct GatewayLimits {
     pub max_headers: usize,
     pub max_header_bytes: usize,
     pub max_connections: usize,
+    pub max_in_flight_requests: usize,
     pub startup_timeout: Duration,
+    pub shutdown_grace: Duration,
 }
 
 impl Default for GatewayLimits {
@@ -45,7 +48,9 @@ impl Default for GatewayLimits {
             max_headers: 64,
             max_header_bytes: 32 * 1024,
             max_connections: 128,
+            max_in_flight_requests: 128,
             startup_timeout: Duration::from_secs(30),
+            shutdown_grace: Duration::from_secs(5),
         }
     }
 }
@@ -128,7 +133,7 @@ impl Gateway {
                 upstream,
                 client,
                 limits: config.limits,
-                connections: Arc::new(Semaphore::new(config.limits.max_connections)),
+                connections: Arc::new(Semaphore::new(config.limits.max_in_flight_requests)),
                 authentication: config.authentication.clone(),
             },
             config,
@@ -159,8 +164,13 @@ impl Gateway {
         let listener = TcpListener::bind(self.config.bind).await?;
         let address = listener.local_addr()?;
         let (shutdown, stop) = oneshot::channel();
+        let grace = self.config.limits.shutdown_grace;
+        let limited = LimitedListener {
+            listener,
+            permits: Arc::new(Semaphore::new(self.config.limits.max_connections)),
+        };
         let task = tokio::spawn(async move {
-            axum::serve(listener, self.router())
+            axum::serve(limited, self.router())
                 .with_graceful_shutdown(async {
                     let _ = stop.await;
                 })
@@ -170,6 +180,7 @@ impl Gateway {
             address,
             shutdown: Some(shutdown),
             task: Some(task),
+            grace,
         })
     }
 }
@@ -178,6 +189,7 @@ pub struct GatewayServer {
     address: SocketAddr,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+    grace: Duration,
 }
 impl GatewayServer {
     #[must_use]
@@ -188,11 +200,18 @@ impl GatewayServer {
         if let Some(stop) = self.shutdown.take() {
             let _ = stop.send(());
         }
-        self.task
-            .take()
-            .expect("server task exists")
-            .await
-            .map_err(std::io::Error::other)?
+        let mut task = self.task.take().expect("server task exists");
+        match tokio::time::timeout(self.grace, &mut task).await {
+            Ok(joined) => joined.map_err(std::io::Error::other)?,
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway shutdown grace expired",
+                ))
+            }
+        }
     }
 }
 impl Drop for GatewayServer {
@@ -324,4 +343,69 @@ impl IntoResponse for ApiError {
 #[must_use]
 pub fn is_loopback(address: IpAddr) -> bool {
     address.is_loopback()
+}
+
+struct LimitedListener {
+    listener: TcpListener,
+    permits: Arc<Semaphore>,
+}
+struct LimitedIo {
+    stream: tokio::net::TcpStream,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl axum::serve::Listener for LimitedListener {
+    type Io = LimitedIo;
+    type Addr = SocketAddr;
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, address) = self
+                .listener
+                .accept()
+                .await
+                .expect("bound gateway listener accepts");
+            if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+                return (
+                    LimitedIo {
+                        stream,
+                        _permit: permit,
+                    },
+                    address,
+                );
+            }
+        }
+    }
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+impl AsyncRead for LimitedIo {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_read(cx, buffer)
+    }
+}
+impl AsyncWrite for LimitedIo {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.stream).poll_write(cx, bytes)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
 }
