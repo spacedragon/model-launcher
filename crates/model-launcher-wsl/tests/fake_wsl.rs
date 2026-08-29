@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use model_launcher_wsl::{
-    CommandOutput, CommandRunner, WslError, WslProber, endpoint_owner_argv, launch_argv,
-    ss_output_owns_pid,
+    CommandOutput, CommandRunner, PortLease, WslError, WslProber, endpoint_owner_argv, launch_argv,
+    spawn_after_release, ss_output_owns_pid,
 };
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Default)]
 struct FakeRunner {
@@ -68,17 +71,83 @@ fn ownership_probe_is_structured_and_pid_match_is_exact() {
 
 #[test]
 fn internal_retry_arguments_do_not_contain_or_mutate_a_public_gateway_port() {
-    let public_gateway_port = 1234_u16;
-    let argv = launch_argv(
-        "Ubuntu",
-        "/llama",
-        "/model",
-        &["--port".into(), "45001".into()],
-    );
-    assert_eq!(public_gateway_port, 1234);
+    struct StableGateway {
+        identity: u64,
+        public_port: u16,
+        served: usize,
+    }
+    impl StableGateway {
+        fn request(&mut self) -> (u64, u16) {
+            self.served += 1;
+            (self.identity, self.public_port)
+        }
+    }
+    let mut gateway = StableGateway {
+        identity: 9,
+        public_port: 1234,
+        served: 0,
+    };
+    let before = gateway.request();
+    let attempts: Vec<_> = [45001_u16, 45002, 45003]
+        .into_iter()
+        .map(|port| {
+            launch_argv(
+                "Ubuntu",
+                "/llama",
+                "/model",
+                &["--port".into(), port.to_string()],
+            )
+        })
+        .collect();
+    let after = gateway.request();
+    assert_eq!(before, after);
+    assert_eq!(gateway.served, 2);
+    assert!(attempts.windows(2).all(|pair| pair[0] != pair[1]));
     assert!(
-        !argv
+        attempts
             .iter()
-            .any(|value| value == &public_gateway_port.to_string())
+            .flatten()
+            .all(|value| value != &gateway.public_port.to_string())
     );
+}
+
+struct RecordingLease(Arc<Mutex<Vec<&'static str>>>);
+impl PortLease for RecordingLease {
+    fn addr(&self) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 45001))
+    }
+    fn release(self: Box<Self>) -> SocketAddr {
+        self.0.lock().unwrap().push("release");
+        self.addr()
+    }
+}
+struct SpawnFailRunner(Arc<Mutex<Vec<&'static str>>>);
+#[async_trait]
+impl CommandRunner for SpawnFailRunner {
+    async fn output(&self, _: &str, _: &[String]) -> Result<CommandOutput, WslError> {
+        panic!("generic spawn failure must not guess a PID to signal")
+    }
+    async fn spawn(
+        &self,
+        _: &str,
+        _: &[String],
+    ) -> Result<Box<dyn model_launcher_wsl::WslChild>, WslError> {
+        self.0.lock().unwrap().push("spawn");
+        Err(WslError::Command("spawn failed".into()))
+    }
+}
+#[tokio::test]
+async fn reservation_is_released_strictly_before_generic_spawn_failure() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let result = spawn_after_release(
+        &SpawnFailRunner(events.clone()),
+        Box::new(RecordingLease(events.clone())),
+        &["argv".into()],
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "generic spawn errors fail immediately rather than retrying an unowned attempt"
+    );
+    assert_eq!(*events.lock().unwrap(), ["release", "spawn"]);
 }

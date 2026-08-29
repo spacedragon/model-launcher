@@ -1,6 +1,7 @@
 use crate::{
-    ExecutableIdentity, PortAllocator, ProbeSnapshot, Signal, capture_version, launch_argv,
-    parse_identity, probe_argv, signal_argv, stat_argv, windows_to_wsl_path,
+    ExecutableIdentity, OwnedPid, PortAllocator, ProbeSnapshot, Signal, capture_version,
+    guarded_signal_argv, launch_argv, parse_identity, parse_proc_start_time, probe_argv,
+    proc_stat_argv, stat_argv, windows_to_wsl_path,
 };
 use async_trait::async_trait;
 use model_launcher_core::{
@@ -62,6 +63,14 @@ pub trait CommandRunner: Send + Sync {
     async fn spawn(&self, _program: &str, _argv: &[String]) -> Result<Box<dyn WslChild>, WslError> {
         Err(WslError::SpawnUnsupported)
     }
+}
+pub async fn spawn_after_release(
+    runner: &dyn CommandRunner,
+    reservation: Box<dyn crate::PortLease>,
+    argv: &[String],
+) -> Result<Box<dyn WslChild>, WslError> {
+    let _released = reservation.release();
+    runner.spawn("wsl.exe", argv).await
 }
 
 #[derive(Clone, Default)]
@@ -586,6 +595,31 @@ async fn establish_pid(child: &mut dyn WslChild) -> Result<u32, WslError> {
         }
     }
 }
+async fn establish_owned_pid(
+    child: &mut dyn WslChild,
+    runner: &dyn CommandRunner,
+    distribution: &str,
+) -> Result<OwnedPid, WslError> {
+    let pid = establish_pid(child).await?;
+    let result = runner
+        .output("wsl.exe", &proc_stat_argv(distribution, pid))
+        .await
+        .and_then(|output| {
+            if output.success {
+                parse_proc_start_time(&output.stdout)
+                    .map_err(|error| WslError::Command(error.to_string()))
+            } else {
+                Err(WslError::Command(output.stderr))
+            }
+        });
+    match result {
+        Ok(start_time) => Ok(OwnedPid { pid, start_time }),
+        Err(error) => {
+            let _ = child.abort_host().await;
+            Err(error)
+        }
+    }
+}
 
 impl InferenceEngine for LlamaCppWslEngine {
     fn spec(&self) -> EngineFuture<'_, EngineSpec> {
@@ -649,17 +683,17 @@ impl InferenceEngine for LlamaCppWslEngine {
                 port.to_string(),
             ];
             args.extend(rendered.args);
-            let _released = reservation.release();
             let argv = launch_argv(&self.distribution, &self.executable, &model_path, &args);
-            let mut child = self
-                .runner
-                .spawn("wsl.exe", &argv)
+            let mut child = spawn_after_release(&*self.runner, reservation, &argv)
                 .await
                 .map_err(app_error)?;
-            let pid = establish_pid(&mut *child).await.map_err(app_error)?;
+            let owned_pid = establish_owned_pid(&mut *child, &*self.runner, &self.distribution)
+                .await
+                .map_err(app_error)?;
             Ok(Box::new(WslEngineProcess {
                 distribution: self.distribution.clone(),
-                pid,
+                pid: owned_pid.pid,
+                owned_pid,
                 runner: self.runner.clone(),
                 child: Some(child),
                 retry: Some(RetryContext {
@@ -677,6 +711,7 @@ impl InferenceEngine for LlamaCppWslEngine {
 struct WslEngineProcess {
     distribution: String,
     pid: u32,
+    owned_pid: OwnedPid,
     runner: Arc<dyn CommandRunner>,
     child: Option<Box<dyn WslChild>>,
     retry: Option<RetryContext>,
@@ -734,7 +769,7 @@ impl EngineProcess for WslEngineProcess {
                 .runner
                 .output(
                     "wsl.exe",
-                    &signal_argv(&self.distribution, self.pid, Signal::Term),
+                    &guarded_signal_argv(&self.distribution, self.owned_pid, Signal::Term),
                 )
                 .await
                 .map_err(app_error)?;
@@ -751,7 +786,7 @@ impl EngineProcess for WslEngineProcess {
                 .runner
                 .output(
                     "wsl.exe",
-                    &signal_argv(&self.distribution, self.pid, Signal::Kill),
+                    &guarded_signal_argv(&self.distribution, self.owned_pid, Signal::Kill),
                 )
                 .await
                 .map_err(app_error)?;
@@ -798,7 +833,7 @@ impl WslEngineProcess {
             .runner
             .output(
                 "wsl.exe",
-                &signal_argv(&self.distribution, self.pid, Signal::Term),
+                &guarded_signal_argv(&self.distribution, self.owned_pid, Signal::Term),
             )
             .await
             .is_ok_and(|output| output.success);
@@ -817,7 +852,7 @@ impl WslEngineProcess {
                 .runner
                 .output(
                     "wsl.exe",
-                    &signal_argv(&self.distribution, self.pid, Signal::Kill),
+                    &guarded_signal_argv(&self.distribution, self.owned_pid, Signal::Kill),
                 )
                 .await
                 .map_err(app_error)?;
@@ -861,21 +896,21 @@ impl WslEngineProcess {
         if let Some(value) = args.windows(2).position(|pair| pair[0] == "--port") {
             args[value + 1] = port.to_string();
         }
-        let _released = reservation.release();
         let argv = launch_argv(
             &self.distribution,
             &retry.executable,
             &retry.model_path,
             &args,
         );
-        let mut child = self
-            .runner
-            .spawn("wsl.exe", &argv)
+        let mut child = spawn_after_release(&*self.runner, reservation, &argv)
             .await
             .map_err(app_error)?;
-        let pid = establish_pid(&mut *child).await.map_err(app_error)?;
+        let owned_pid = establish_owned_pid(&mut *child, &*self.runner, &self.distribution)
+            .await
+            .map_err(app_error)?;
         self.child = Some(child);
-        self.pid = pid;
+        self.pid = owned_pid.pid;
+        self.owned_pid = owned_pid;
         self.owned_active = true;
         Ok(())
     }
@@ -888,28 +923,60 @@ impl Drop for WslEngineProcess {
         }
         let runner = self.runner.clone();
         let distribution = self.distribution.clone();
-        let pid = self.pid;
-        let Some(mut child) = self.child.take() else {
+        let owned_pid = self.owned_pid;
+        let Some(child) = self.child.take() else {
             return;
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = runner
-                    .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Term))
-                    .await;
-                let exited =
-                    tokio::time::timeout(Duration::from_millis(250), child.wait_for_exit())
-                        .await
-                        .is_ok_and(|result| result.is_ok());
-                if !exited && child.is_running().await.unwrap_or(true) {
-                    let _ = runner
-                        .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Kill))
-                        .await;
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(1), child.wait_for_exit()).await;
-                }
-            });
+            handle.spawn(supervise_owned_cleanup(
+                runner,
+                distribution,
+                owned_pid,
+                child,
+            ));
+        } else {
+            let _ = std::thread::Builder::new()
+                .name("wsl-owned-cleanup".into())
+                .spawn(move || {
+                    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_time()
+                        .build()
+                    {
+                        runtime.block_on(supervise_owned_cleanup(
+                            runner,
+                            distribution,
+                            owned_pid,
+                            child,
+                        ));
+                    }
+                });
         }
+    }
+}
+
+async fn supervise_owned_cleanup(
+    runner: Arc<dyn CommandRunner>,
+    distribution: String,
+    owned_pid: OwnedPid,
+    mut child: Box<dyn WslChild>,
+) {
+    let _ = runner
+        .output(
+            "wsl.exe",
+            &guarded_signal_argv(&distribution, owned_pid, Signal::Term),
+        )
+        .await;
+    let exited = tokio::time::timeout(Duration::from_millis(250), child.wait_for_exit())
+        .await
+        .is_ok_and(|result| result.is_ok());
+    if !exited && child.is_running().await.unwrap_or(true) {
+        let _ = runner
+            .output(
+                "wsl.exe",
+                &guarded_signal_argv(&distribution, owned_pid, Signal::Kill),
+            )
+            .await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), child.wait_for_exit()).await;
     }
 }
 
@@ -1090,6 +1157,16 @@ mod tests {
     #[async_trait]
     impl CommandRunner for AttemptRunner {
         async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
+            if argv.contains(&"cat".into())
+                && argv.last().is_some_and(|value| value.starts_with("/proc/"))
+            {
+                return Ok(CommandOutput {
+                    success: true,
+                    stdout: "22 (llama) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 202 20\n"
+                        .into(),
+                    stderr: String::new(),
+                });
+            }
             self.signals.lock().unwrap().push(argv.to_vec());
             Ok(CommandOutput {
                 success: true,
@@ -1115,6 +1192,10 @@ mod tests {
         let mut process = WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 11,
+            owned_pid: OwnedPid {
+                pid: 11,
+                start_time: 101,
+            },
             runner: runner.clone(),
             child: Some(Box::new(AttemptChild {
                 pid: 11,
@@ -1133,11 +1214,12 @@ mod tests {
         };
         process.wait_ready(Duration::from_secs(1)).await.unwrap();
         let signals = runner.signals.lock().unwrap();
-        assert!(signals.iter().any(|argv| argv.ends_with(&[
-            "-TERM".into(),
-            "--".into(),
-            "11".into()
-        ])));
+        assert!(
+            signals
+                .iter()
+                .any(|argv| argv.get(7).is_some_and(|v| v == "-TERM")
+                    && argv.get(8).is_some_and(|v| v == "11"))
+        );
         assert_eq!(process.pid, 22);
     }
 
@@ -1160,6 +1242,10 @@ mod tests {
         let mut process = WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 11,
+            owned_pid: OwnedPid {
+                pid: 11,
+                start_time: 101,
+            },
             runner: runner.clone(),
             child: Some(Box::new(AttemptChild {
                 pid: 11,
@@ -1181,7 +1267,7 @@ mod tests {
         let signals = runner.signals.lock().unwrap();
         let killed: Vec<_> = signals
             .iter()
-            .filter_map(|argv| argv.last().cloned())
+            .filter_map(|argv| argv.get(8).cloned())
             .collect();
         assert_eq!(killed, ["11", "22", "33"]);
     }
@@ -1195,6 +1281,10 @@ mod tests {
         let process = WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 77,
+            owned_pid: OwnedPid {
+                pid: 77,
+                start_time: 107,
+            },
             runner: runner.clone(),
             child: Some(Box::new(AttemptChild {
                 pid: 77,
@@ -1213,7 +1303,40 @@ mod tests {
             1,
             "an exited owned child must never receive a PID-reuse-prone KILL"
         );
-        assert!(signals[0].ends_with(&["-TERM".into(), "--".into(), "77".into()]));
+        assert_eq!(&signals[0][7..], &["-TERM", "77", "107"]);
+    }
+    #[test]
+    fn drop_outside_tokio_runtime_schedules_bounded_owned_cleanup() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        let started = std::time::Instant::now();
+        drop(WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 79,
+            owned_pid: OwnedPid {
+                pid: 79,
+                start_time: 109,
+            },
+            runner: runner.clone(),
+            child: Some(Box::new(AttemptChild {
+                pid: 79,
+                ready: Some(Ok(())),
+            })),
+            retry: None,
+            owned_active: true,
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "Drop must not synchronously wait for cleanup"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while runner.signals.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let signals = runner.signals.lock().unwrap();
+        assert_eq!(&signals[0][7..], &["-TERM", "79", "109"]);
     }
     struct HangingChild;
     #[async_trait]
@@ -1246,6 +1369,10 @@ mod tests {
         drop(WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 78,
+            owned_pid: OwnedPid {
+                pid: 78,
+                start_time: 108,
+            },
             runner: runner.clone(),
             child: Some(Box::new(HangingChild)),
             retry: None,
@@ -1256,7 +1383,7 @@ mod tests {
         tokio::task::yield_now().await;
         let signals = runner.signals.lock().unwrap();
         assert_eq!(signals.len(), 2);
-        assert!(signals[1].ends_with(&["-KILL".into(), "--".into(), "78".into()]));
+        assert_eq!(&signals[1][7..], &["-KILL", "78", "108"]);
     }
 
     struct DelayedEndpointChild {
@@ -1297,6 +1424,10 @@ mod tests {
         let mut process = WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 88,
+            owned_pid: OwnedPid {
+                pid: 88,
+                start_time: 109,
+            },
             runner,
             child: Some(Box::new(DelayedEndpointChild { checks: 2 })),
             retry: None,
@@ -1361,6 +1492,10 @@ mod tests {
         WslEngineProcess {
             distribution: "Ubuntu".into(),
             pid: 55,
+            owned_pid: OwnedPid {
+                pid: 55,
+                start_time: 105,
+            },
             runner,
             child: Some(Box::new(StopChild { waits })),
             retry: None,
@@ -1391,7 +1526,8 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|argv| argv.ends_with(&["-KILL".into(), "--".into(), "55".into()]))
+                    .any(|argv| argv.get(7).is_some_and(|v| v == "-KILL")
+                        && argv.get(8).is_some_and(|v| v == "55"))
             );
         }
     }

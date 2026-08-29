@@ -9,6 +9,55 @@ use thiserror::Error;
 
 pub const LAUNCH_SCRIPT: &str = "printf 'MODEL_LAUNCHER_PID=%s\\n' \"$$\"; exec \"$@\"";
 pub const LAUNCH_SENTINEL: &str = "model-launcher";
+pub const SIGNAL_SENTINEL: &str = "model-launcher-signal";
+pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"$20\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; kill \"$signal\" -- \"$pid\" && printf 'Signaled\\n'";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnedPid {
+    pub pid: u32,
+    pub start_time: u64,
+}
+pub fn parse_proc_start_time(stat: &str) -> Result<u64, PidError> {
+    let close = stat.rfind(')').ok_or(PidError::Invalid)?;
+    stat[close + 1..]
+        .split_ascii_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse().ok())
+        .ok_or(PidError::Invalid)
+}
+pub fn proc_stat_argv(distribution: &str, pid: u32) -> Vec<String> {
+    [
+        "-d",
+        distribution,
+        "--",
+        "cat",
+        &format!("/proc/{pid}/stat"),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+pub fn guarded_signal_argv(distribution: &str, owned: OwnedPid, signal: Signal) -> Vec<String> {
+    let signal = match signal {
+        Signal::Term => "-TERM",
+        Signal::Kill => "-KILL",
+    };
+    [
+        "-d",
+        distribution,
+        "--",
+        "sh",
+        "-c",
+        GUARDED_SIGNAL_SCRIPT,
+        SIGNAL_SENTINEL,
+        signal,
+        &owned.pid.to_string(),
+        &owned.start_time.to_string(),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
 
 pub fn launch_argv(
     distribution: &str,
@@ -255,6 +304,34 @@ mod tests {
             signal_argv("Ubuntu", 42, Signal::Kill),
             vec!["-d", "Ubuntu", "--", "kill", "-KILL", "--", "42"]
         );
+    }
+
+    #[test]
+    fn owned_pid_identity_uses_structured_proc_stat_and_guarded_signal_script() {
+        let stat = "42 (llama server) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765 20";
+        let owned = OwnedPid {
+            pid: 42,
+            start_time: parse_proc_start_time(stat).unwrap(),
+        };
+        assert_eq!(owned.start_time, 98765);
+        assert_eq!(
+            proc_stat_argv("Ubuntu", 42),
+            ["-d", "Ubuntu", "--", "cat", "/proc/42/stat"]
+        );
+        let argv = guarded_signal_argv("Ubuntu", owned, Signal::Kill);
+        assert_eq!(
+            &argv[..7],
+            &[
+                "-d",
+                "Ubuntu",
+                "--",
+                "sh",
+                "-c",
+                GUARDED_SIGNAL_SCRIPT,
+                SIGNAL_SENTINEL
+            ]
+        );
+        assert_eq!(&argv[7..], &["-KILL", "42", "98765"]);
     }
 
     #[test]
