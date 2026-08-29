@@ -1,7 +1,16 @@
-use std::{fs, path::PathBuf};
+use std::{
+    error::Error as _,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use model_launcher_core::{
-    ConfigStore, LauncherConfig, ModelId, ModelKey, ModelRecord, ModelState,
+    ConfigDiagnosticKind, ConfigStore, FileReplacer, LauncherConfig, ModelId, ModelKey,
+    ModelRecord, ModelState,
 };
 use uuid::Uuid;
 
@@ -12,6 +21,22 @@ impl TestDir {
         let path = std::env::temp_dir().join(format!("model-launcher-config-{}", Uuid::new_v4()));
         fs::create_dir(&path).expect("create test directory");
         Self(path)
+    }
+}
+
+struct FailNthReplace {
+    calls: AtomicUsize,
+    fail_on: usize,
+}
+
+impl FileReplacer for FailNthReplace {
+    fn replace(&self, source: &Path, destination: &Path) -> io::Result<()> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on {
+            Err(io::Error::other("injected replacement failure"))
+        } else {
+            fs::rename(source, destination)
+        }
     }
 }
 
@@ -78,6 +103,34 @@ fn save_atomically_replaces_the_main_file() {
 }
 
 #[test]
+fn replacement_failure_preserves_main_and_cleans_temporary_file() {
+    let dir = TestDir::new();
+    let replacer = Arc::new(FailNthReplace {
+        calls: AtomicUsize::new(0),
+        fail_on: 3,
+    });
+    let store = ConfigStore::with_replacer(&dir.0, replacer);
+    let previous = LauncherConfig {
+        models: vec![model(ModelState::Missing)],
+    };
+    store.save(&previous).expect("initial save");
+    let original_bytes = fs::read(store.config_path()).expect("read original config");
+
+    let error = store
+        .save(&LauncherConfig::default())
+        .expect_err("replacement must fail");
+
+    assert_eq!(error.code(), "config_io");
+    assert_eq!(
+        error.source().expect("replacement source").to_string(),
+        "injected replacement failure"
+    );
+    assert_eq!(fs::read(store.config_path()).unwrap(), original_bytes);
+    assert_eq!(store.load().unwrap(), previous);
+    assert!(!dir.0.join("config.json.tmp").exists());
+}
+
+#[test]
 fn replacement_retains_the_last_valid_backup() {
     let dir = TestDir::new();
     let store = ConfigStore::new(&dir.0);
@@ -112,6 +165,24 @@ fn corrupt_file_is_quarantined_without_being_overwritten() {
     assert_eq!(quarantined.len(), 1);
     assert_eq!(fs::read(&quarantined[0]).expect("read quarantine"), corrupt);
     assert!(!store.config_path().exists());
+}
+
+#[test]
+fn corrupt_load_exposes_a_typed_quarantine_diagnostic() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    fs::write(store.config_path(), b"secret invalid bytes").unwrap();
+
+    let outcome = store
+        .load_with_diagnostic()
+        .expect("recover corrupt config");
+
+    assert_eq!(outcome.config, LauncherConfig::default());
+    let diagnostic = outcome.diagnostic.expect("visible diagnostic");
+    assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Corrupt);
+    assert_eq!(diagnostic.code(), "config_corrupt");
+    assert!(diagnostic.quarantine_path.exists());
+    assert!(!diagnostic.to_string().contains("secret invalid bytes"));
 }
 
 #[test]
@@ -201,4 +272,25 @@ fn unsupported_version_is_quarantined() {
     let quarantined = store.quarantined_files().unwrap();
     assert_eq!(quarantined.len(), 1);
     assert_eq!(fs::read(&quarantined[0]).unwrap(), fixture);
+}
+
+#[test]
+fn unsupported_load_diagnostic_includes_the_version() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    fs::write(
+        store.config_path(),
+        br#"{"version":99,"config":{"models":[]}}"#,
+    )
+    .unwrap();
+
+    let outcome = store.load_with_diagnostic().expect("recover future config");
+
+    let diagnostic = outcome.diagnostic.expect("visible diagnostic");
+    assert_eq!(
+        diagnostic.kind,
+        ConfigDiagnosticKind::UnsupportedVersion { version: 99 }
+    );
+    assert_eq!(diagnostic.code(), "config_unsupported_version");
+    assert!(diagnostic.quarantine_path.exists());
 }
