@@ -9,8 +9,7 @@ use axum::{
 use fake_llama_server::FakeServer;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
-    ApiModel, Authentication, Gateway, GatewayConfig, GatewayConfigError, GatewayLimits,
-    LoadRequest, TokenStore,
+    ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest, TokenStore,
 };
 use model_launcher_core::{
     AppError, CatalogIdentity, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec,
@@ -168,9 +167,9 @@ fn api_model() -> ApiModel {
             launch_profile: LaunchProfile::default(),
         },
         publisher: "Acme".into(),
-        architecture: "llama".into(),
-        quantization: "Q4_K_M".into(),
-        params_string: "1B".into(),
+        architecture: Some("llama".into()),
+        quantization: Some("Q4_K_M".into()),
+        params_string: Some("1B".into()),
     }
 }
 fn other_model() -> ApiModel {
@@ -184,7 +183,6 @@ fn config(authentication: Authentication) -> GatewayConfig {
     GatewayConfig {
         bind: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         authentication,
-        allow_insecure_lan: false,
         limits: GatewayLimits {
             max_body_bytes: 256,
             max_headers: 8,
@@ -240,18 +238,18 @@ fn generated_tokens_persist_only_argon2_phc_hashes() {
     assert!(!format!("{store:?}").contains(&created.plaintext));
 }
 #[test]
-fn lan_without_auth_requires_override_and_warns() {
+fn lan_without_auth_is_allowed_with_typed_warning() {
     let mut value = config(Authentication::Disabled);
     value.bind = "0.0.0.0:1234".parse().unwrap();
-    assert!(matches!(
-        value.validate(),
-        Err(GatewayConfigError::UnauthenticatedLan)
-    ));
-    value.allow_insecure_lan = true;
     assert_eq!(
-        value.validate().unwrap(),
-        ["API is exposed to the LAN without authentication"]
+        value.validate(),
+        [model_launcher_api::GatewayWarning::UnauthenticatedNonLoopback]
     );
+    value.bind = "127.0.0.1:1234".parse().unwrap();
+    assert!(value.validate().is_empty());
+    value.bind = "0.0.0.0:1234".parse().unwrap();
+    value.authentication = Authentication::Tokens(Arc::new(TokenStore::default()));
+    assert!(value.validate().is_empty());
 }
 
 #[tokio::test]
@@ -310,7 +308,7 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
         .unwrap();
     assert_eq!(loaded.status(), StatusCode::OK);
     let mut loaded: Value = loaded.json().await.unwrap();
-    assert!(loaded.get("config").is_none());
+    assert!(loaded.get("load_config").is_none());
     loaded["load_time_seconds"] = json!(0.0);
     let expected: Value = serde_json::from_str(include_str!("fixtures/load/success.json")).unwrap();
     assert_eq!(loaded, expected);

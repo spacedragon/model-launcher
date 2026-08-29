@@ -60,26 +60,22 @@ pub enum Authentication {
 pub struct GatewayConfig {
     pub bind: SocketAddr,
     pub authentication: Authentication,
-    pub allow_insecure_lan: bool,
     pub limits: GatewayLimits,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayWarning {
+    UnauthenticatedNonLoopback,
+}
+
 impl GatewayConfig {
-    pub fn validate(&self) -> Result<Vec<&'static str>, GatewayConfigError> {
+    pub fn validate(&self) -> Vec<GatewayWarning> {
         let lan = !self.bind.ip().is_loopback();
-        if lan
-            && matches!(self.authentication, Authentication::Disabled)
-            && !self.allow_insecure_lan
-        {
-            return Err(GatewayConfigError::UnauthenticatedLan);
+        if lan && matches!(self.authentication, Authentication::Disabled) {
+            vec![GatewayWarning::UnauthenticatedNonLoopback]
+        } else {
+            Vec::new()
         }
-        Ok(
-            if lan && matches!(self.authentication, Authentication::Disabled) {
-                vec!["API is exposed to the LAN without authentication"]
-            } else {
-                Vec::new()
-            },
-        )
     }
 }
 
@@ -121,7 +117,7 @@ impl Gateway {
         lifecycle: LifecycleHandle,
         upstream: UpstreamResolver,
     ) -> Result<Self, GatewayConfigError> {
-        config.validate()?;
+        let _warnings = config.validate();
         let client = reqwest::Client::builder()
             .build()
             .expect("reqwest client configuration is valid");

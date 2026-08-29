@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 pub struct ApiModel {
     pub record: ModelRecord,
     pub publisher: String,
-    pub architecture: String,
-    pub quantization: String,
-    pub params_string: String,
+    pub architecture: Option<String>,
+    pub quantization: Option<String>,
+    pub params_string: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -17,10 +17,10 @@ pub struct LmModel {
     pub publisher: String,
     pub key: String,
     pub display_name: String,
-    pub architecture: String,
-    pub quantization: String,
+    pub architecture: Option<String>,
+    pub quantization: Option<String>,
     pub size_bytes: u64,
-    pub params_string: String,
+    pub params_string: Option<String>,
 }
 
 impl From<&ApiModel> for LmModel {
@@ -70,7 +70,7 @@ pub struct LoadResponse {
     pub load_time_seconds: f64,
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config: Option<LoadConfig>,
+    pub load_config: Option<LoadConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]

@@ -45,7 +45,7 @@ pub(crate) async fn load(
         model_instance_id: model.id.as_uuid().to_string(),
         load_time_seconds: started.elapsed().as_secs_f64(),
         status: "loaded",
-        config: request.echo_load_config.then(|| LoadConfig::from(&request)),
+        load_config: request.echo_load_config.then(|| LoadConfig::from(&request)),
     }))
 }
 
@@ -73,9 +73,7 @@ pub(crate) async fn unload(
         ));
     }
     state.lifecycle.eject().await.map_err(ApiError::core)?;
-    Ok(Json(
-        json!({"type":"unload_result","status":"unloaded","model_instance_id":request.instance_id}),
-    ))
+    Ok(Json(json!({"instance_id":request.instance_id})))
 }
 
 pub(crate) async fn openai_models(State(state): State<AppState>) -> Json<Value> {
