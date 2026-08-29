@@ -20,6 +20,10 @@ pub enum AppError {
     InvalidSetting(&'static str),
     #[error("engine process failed")]
     EngineProcess(#[source] BoxError),
+    #[error("configuration I/O failed")]
+    ConfigIo(#[source] BoxError),
+    #[error("configuration format is invalid")]
+    ConfigFormat(#[source] BoxError),
 }
 
 impl AppError {
@@ -34,6 +38,8 @@ impl AppError {
             Self::EngineUnavailable => "engine_unavailable",
             Self::InvalidSetting(_) => "invalid_setting",
             Self::EngineProcess(_) => "engine_process",
+            Self::ConfigIo(_) => "config_io",
+            Self::ConfigFormat(_) => "config_format",
         }
     }
 }
@@ -87,6 +93,14 @@ mod tests {
             (
                 AppError::EngineProcess(Box::new(io::Error::other("process diagnostic"))),
                 "engine_process",
+            ),
+            (
+                AppError::ConfigIo(Box::new(io::Error::other("config diagnostic"))),
+                "config_io",
+            ),
+            (
+                AppError::ConfigFormat(Box::new(io::Error::other("format diagnostic"))),
+                "config_format",
             ),
         ];
 

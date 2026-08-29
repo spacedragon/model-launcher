@@ -64,7 +64,7 @@ tests/windows-wsl/                Ignored real-WSL smoke tests and README
 - Create: `crates/model-launcher-core/src/{lib,error,model,capability,engine}.rs`
 - Test: inline unit tests in the modules above
 
-- [ ] **Step 1: Add a compile-failing domain test**
+- [x] **Step 1: Add a compile-failing domain test**
 
 Define tests for model-key validation, capability-gated launch arguments, and stable error codes before implementations. Representative assertion:
 
@@ -74,23 +74,23 @@ assert!(ModelKey::parse("../escape").is_err());
 assert_eq!(settings.to_args(&caps), vec!["--ctx-size", "8192"]);
 ```
 
-- [ ] **Step 2: Verify the tests fail**
+- [x] **Step 2: Verify the tests fail**
 
 Run: `cargo test -p model-launcher-core model_key --no-fail-fast`
 
 Expected: compilation fails because the domain types are not implemented.
 
-- [ ] **Step 3: Implement minimal typed contracts**
+- [x] **Step 3: Implement minimal typed contracts**
 
 Implement `ModelId(Uuid)`, `ModelKey`, `ModelRecord`, `ModelState`, `LaunchProfile`, typed setting values, `EngineCapabilities`, `EngineSpec`, `InferenceEngine`, `EngineProcess`, and `AppError`. Keep async engine methods object-safe with boxed futures or `async-trait`.
 
-- [ ] **Step 4: Run focused and workspace tests**
+- [x] **Step 4: Run focused and workspace tests**
 
 Run: `cargo test -p model-launcher-core && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 
 Expected: all pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml rustfmt.toml crates/model-launcher-core
@@ -104,27 +104,27 @@ git commit -m "feat: establish model launcher core contracts"
 - Modify: `crates/model-launcher-core/src/lib.rs`
 - Test: `crates/model-launcher-core/tests/config_store.rs`
 
-- [ ] **Step 1: Write failing persistence tests**
+- [x] **Step 1: Write failing persistence tests**
 
 Cover default config, round trip, atomic replacement, retained backup, corrupt-file quarantine, model UUID/key persistence, missing model preservation, and migration from a version-0 fixture.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher-core --test config_store`
 
 Expected: fails because `ConfigStore` does not exist.
 
-- [ ] **Step 3: Implement `ConfigStore`**
+- [x] **Step 3: Implement `ConfigStore`**
 
 Use a versioned Serde envelope. Write to a sibling temporary file, sync, rename, and retain the last valid backup. Inject the config directory into tests rather than reading real user directories.
 
-- [ ] **Step 4: Verify persistence behavior**
+- [x] **Step 4: Verify persistence behavior**
 
 Run: `cargo test -p model-launcher-core --test config_store && cargo clippy -p model-launcher-core --all-targets -- -D warnings`
 
 Expected: all pass; tests leave no files outside their temp directories.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/model-launcher-core
