@@ -1,10 +1,10 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 
 use crate::AppError;
 
 macro_rules! positive_setting {
     ($name:ident, $code:literal) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
         #[serde(transparent)]
         pub struct $name(u32);
 
@@ -20,6 +20,15 @@ macro_rules! positive_setting {
             #[must_use]
             pub const fn get(self) -> u32 {
                 self.0
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Self::new(u32::deserialize(deserializer)?).map_err(D::Error::custom)
             }
         }
     };
@@ -143,11 +152,9 @@ impl LaunchSettings {
             "--parallel",
             self.parallel_slots.map(ParallelSlots::get),
         );
-        if let Some(enabled) = self.flash_attention {
+        if self.flash_attention == Some(true) {
             if capabilities.flash_attention {
-                if enabled {
-                    args.push("--flash-attn".into());
-                }
+                args.push("--flash-attn".into());
             } else {
                 unsupported.push(SettingId::FlashAttention);
             }
@@ -196,6 +203,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn positive_settings_validate_during_deserialization() {
+        assert!(serde_json::from_str::<ContextLength>("0").is_err());
+        assert!(serde_json::from_str::<CpuThreads>("0").is_err());
+        assert!(serde_json::from_str::<BatchSize>("0").is_err());
+        assert!(serde_json::from_str::<ParallelSlots>("0").is_err());
+
+        assert_eq!(
+            serde_json::from_str::<ContextLength>("8192").expect("positive context length"),
+            ContextLength::new(8192).expect("positive context length")
+        );
+        assert_eq!(
+            serde_json::from_str::<CpuThreads>("8").expect("positive CPU threads"),
+            CpuThreads::new(8).expect("positive CPU threads")
+        );
+        assert_eq!(
+            serde_json::from_str::<BatchSize>("512").expect("positive batch size"),
+            BatchSize::new(512).expect("positive batch size")
+        );
+        assert_eq!(
+            serde_json::from_str::<ParallelSlots>("4").expect("positive parallel slots"),
+            ParallelSlots::new(4).expect("positive parallel slots")
+        );
+    }
+
+    #[test]
     fn launch_arguments_are_gated_by_engine_capabilities() {
         let settings = LaunchSettings {
             context_length: Some(ContextLength::new(8192).expect("valid context length")),
@@ -228,5 +260,18 @@ mod tests {
         assert_eq!(settings.gpu_layers, Some(gpu_layers));
         assert_eq!(rendered.args, vec!["--ctx-size", "8192"]);
         assert_eq!(rendered.unsupported, vec![SettingId::GpuLayers]);
+    }
+
+    #[test]
+    fn disabled_flash_attention_does_not_require_capability() {
+        let settings = LaunchSettings {
+            flash_attention: Some(false),
+            ..LaunchSettings::default()
+        };
+
+        let rendered = settings.render(&EngineCapabilities::default());
+
+        assert!(rendered.args.is_empty());
+        assert!(rendered.unsupported.is_empty());
     }
 }
