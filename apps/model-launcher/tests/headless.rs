@@ -1,4 +1,4 @@
-use model_launcher::{Service, ServiceObserver, ServiceOptions, ShutdownEvent, ShutdownPhase};
+use model_launcher::{Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits};
 use model_launcher_core::{
     EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine, LaunchSettings,
@@ -6,19 +6,11 @@ use model_launcher_core::{
 };
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
-
-#[derive(Default)]
-struct Observer(Mutex<Vec<ShutdownEvent>>);
-impl ServiceObserver for Observer {
-    fn shutdown_event(&self, event: ShutdownEvent) {
-        self.0.lock().unwrap().push(event);
-    }
-}
 
 struct Engine {
     starts: Arc<AtomicUsize>,
@@ -148,18 +140,17 @@ async fn scan_http_stream_eject_restart_and_idempotent_shutdown() {
     let upstream = fake_llama_server::FakeServer::spawn().await.unwrap();
     let starts = Arc::new(AtomicUsize::new(0));
     let stops = Arc::new(AtomicUsize::new(0));
-    let observer = Arc::new(Observer::default());
-    let service = Service::start_observed(
+    let service = Service::start(
         options(temp.path(), upstream.base_url()),
         Arc::new(Engine {
             starts: starts.clone(),
             stops: stops.clone(),
         }),
-        observer.clone(),
     )
     .await
     .unwrap();
     let handle = service.handle();
+    let mut shutdown_events = handle.subscribe_shutdown();
     let client = reqwest::Client::new();
     let base = format!("http://{}", handle.local_addr());
     let models: serde_json::Value = client
@@ -182,7 +173,7 @@ async fn scan_http_stream_eject_restart_and_idempotent_shutdown() {
         .unwrap();
     let response = client
         .post(format!("{base}/v1/chat/completions"))
-        .header("x-fake-mode", "sse")
+        .header("x-fake-mode", "sse-multi")
         .json(&serde_json::json!({"model":key,"prompt":"hello","stream":true}))
         .send()
         .await
@@ -194,11 +185,12 @@ async fn scan_http_stream_eject_restart_and_idempotent_shutdown() {
     while let Some(frame) = frames.next().await {
         chunks.push(frame.unwrap());
     }
-    assert!(
-        chunks.len() >= 2,
-        "SSE must remain incrementally consumable"
+    let joined = chunks.concat();
+    assert_eq!(joined, b"data: a\n\ndata: \xff\0\n\n");
+    assert_eq!(
+        joined.windows(2).filter(|value| *value == b"\n\n").count(),
+        2
     );
-    assert_eq!(chunks.concat(), b"data: a\xff\0\n\n");
     let instance = &loaded["model_instance_id"];
     assert!(
         client
@@ -226,8 +218,12 @@ async fn scan_http_stream_eject_restart_and_idempotent_shutdown() {
     let (left, right) = tokio::join!(a.shutdown(), b.shutdown());
     left.unwrap();
     right.unwrap();
+    let mut observed = Vec::new();
+    while let Ok(event) = shutdown_events.try_recv() {
+        observed.push(event);
+    }
     assert_eq!(
-        *observer.0.lock().unwrap(),
+        observed,
         vec![
             ShutdownEvent::Started(ShutdownPhase::StopGateway),
             ShutdownEvent::Completed(ShutdownPhase::StopGateway),
@@ -299,12 +295,14 @@ async fn shutdown_cancels_backoff_and_prevents_restart() {
         .send()
         .await
         .unwrap();
-    for _ in 0..100 {
-        if handle.snapshot().lifecycle.state == LifecycleState::Backoff {
-            break;
+    let mut lifecycle = handle.subscribe_lifecycle();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while lifecycle.borrow().state != LifecycleState::Backoff {
+            lifecycle.changed().await.unwrap();
         }
-        tokio::task::yield_now().await;
-    }
+    })
+    .await
+    .unwrap();
     assert_eq!(handle.snapshot().lifecycle.state, LifecycleState::Backoff);
     handle.shutdown().await.unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -314,11 +312,79 @@ async fn shutdown_cancels_backoff_and_prevents_restart() {
 }
 
 #[tokio::test]
+async fn cancelling_first_shutdown_caller_does_not_cancel_owned_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let upstream = fake_llama_server::FakeServer::spawn().await.unwrap();
+    let mut opts = options(temp.path(), upstream.base_url());
+    opts.shutdown_timeout = Duration::from_millis(20);
+    let pending = tokio::spawn(std::future::pending());
+    let service = Service::start_with_background_task(
+        opts,
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        Some(pending),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let mut events = handle.subscribe_shutdown();
+    let first = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    loop {
+        if events.recv().await.unwrap() == ShutdownEvent::Started(ShutdownPhase::StopWatcher) {
+            break;
+        }
+    }
+    first.abort();
+    let _ = first.await;
+    assert!(matches!(
+        handle.rescan(temp.path().join("models")).await,
+        Err(ServiceError::ShuttingDown)
+    ));
+    let one = handle.shutdown().await.unwrap_err();
+    let two = handle.shutdown().await.unwrap_err();
+    assert_eq!(one.to_string(), two.to_string());
+    assert!(
+        !one.to_string()
+            .contains("service shutdown: service shutdown:")
+    );
+    upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn dropped_and_slow_shutdown_subscribers_never_block_shutdown() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let upstream = fake_llama_server::FakeServer::spawn().await.unwrap();
+    let service = Service::start(
+        options(temp.path(), upstream.base_url()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .unwrap();
+    let dropped = service.handle().subscribe_shutdown();
+    drop(dropped);
+    let _slow = service.handle().subscribe_shutdown();
+    tokio::time::timeout(Duration::from_secs(1), service.handle().shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    upstream.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn watcher_join_timeout_is_typed_and_later_phases_are_attempted() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();
     let upstream = fake_llama_server::FakeServer::spawn().await.unwrap();
-    let observer = Arc::new(Observer::default());
     let mut opts = options(temp.path(), upstream.base_url());
     opts.shutdown_timeout = Duration::from_millis(10);
     let pending = tokio::spawn(std::future::pending());
@@ -328,20 +394,18 @@ async fn watcher_join_timeout_is_typed_and_later_phases_are_attempted() {
             starts: Arc::new(AtomicUsize::new(0)),
             stops: Arc::new(AtomicUsize::new(0)),
         }),
-        observer.clone(),
         Some(pending),
     )
     .await
     .unwrap();
+    let mut shutdown_events = service.handle().subscribe_shutdown();
     let error = service.handle().shutdown().await.unwrap_err().to_string();
     assert!(error.contains("catalog watcher join timed out"));
-    assert!(
-        observer
-            .0
-            .lock()
-            .unwrap()
-            .contains(&ShutdownEvent::Completed(ShutdownPhase::JoinLifecycle))
-    );
+    let mut observed = Vec::new();
+    while let Ok(event) = shutdown_events.try_recv() {
+        observed.push(event);
+    }
+    assert!(observed.contains(&ShutdownEvent::Completed(ShutdownPhase::JoinLifecycle)));
     upstream.stop().await.unwrap();
 }
 

@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use futures_util::FutureExt as _;
 use model_launcher_api::{
     ApiModel, Gateway, GatewayConfig, GatewayConfigError, GatewayServer, ManagementModel,
     ManagementModelResolver, ProfileUpdater, UpstreamResolver,
@@ -13,7 +14,7 @@ use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigStore, EngineCapabilities, InferenceEngine,
     LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, ModelRecord, ReconcileResult,
 };
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, broadcast, watch};
 
 #[derive(Clone)]
 pub struct ServiceOptions {
@@ -35,8 +36,18 @@ pub enum ServiceError {
     Gateway(#[from] GatewayConfigError),
     #[error("catalog watcher: {0}")]
     Watcher(String),
+    #[error("service is shutting down")]
+    ShuttingDown,
     #[error("service shutdown: {0}")]
-    Shutdown(String),
+    Shutdown(ShutdownFailure),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShutdownFailure(Arc<[String]>);
+impl std::fmt::Display for ShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.join("; "))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -62,33 +73,18 @@ pub enum ShutdownEvent {
     Started(ShutdownPhase),
     Completed(ShutdownPhase),
 }
-pub trait ServiceObserver: Send + Sync {
-    fn shutdown_event(&self, _event: ShutdownEvent) {}
-}
-struct NoopObserver;
-impl ServiceObserver for NoopObserver {}
-
 impl Service {
     pub async fn start(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, ServiceError> {
-        Self::start_observed(options, engine, Arc::new(NoopObserver)).await
-    }
-
-    pub async fn start_observed(
-        options: ServiceOptions,
-        engine: Arc<dyn InferenceEngine>,
-        observer: Arc<dyn ServiceObserver>,
-    ) -> Result<Self, ServiceError> {
-        Self::start_with_background_task(options, engine, observer, None).await
+        Self::start_with_background_task(options, engine, None).await
     }
 
     #[doc(hidden)]
     pub async fn start_with_background_task(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
-        observer: Arc<dyn ServiceObserver>,
         injected_background: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
@@ -138,15 +134,19 @@ impl Service {
             }
         };
         let address = gateway.local_addr();
+        let mutation = Arc::new(Mutex::new(()));
+        let shutdown = Arc::new(Mutex::new(ShutdownState::Running));
         let (watch_stop, mut watcher_task) = if let Some(mut watcher) = watcher {
             let (stop, mut stopped) = watch::channel(false);
             let watcher_models = models.clone();
+            let watcher_mutation = mutation.clone();
+            let watcher_shutdown = shutdown.clone();
             let task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
                         changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { break; },
                         result = watcher.process_next(&catalog) => match result {
-                            Ok(Some(result)) => *watcher_models.write().expect("model lock poisoned") = result.config,
+                            Ok(Some(result)) => { let _gate=watcher_mutation.lock().await; if matches!(*watcher_shutdown.lock().await, ShutdownState::Running) { *watcher_models.write().expect("model lock poisoned") = result.config; } },
                             Ok(None) => break,
                             Err(_) => {}
                         }
@@ -160,21 +160,24 @@ impl Service {
         if injected_background.is_some() {
             watcher_task = injected_background;
         }
+        let (events, _) = broadcast::channel(32);
+        let (shutdown_result, _) = watch::channel(None);
         let inner = Arc::new(Inner {
             address,
             lifecycle: lifecycle_handle,
             models,
             store,
             shutdown_timeout: options.shutdown_timeout,
-            observer,
+            events,
+            shutdown_result,
+            mutation,
             resources: Mutex::new(Resources {
                 gateway: Some(gateway),
                 lifecycle: Some(lifecycle),
                 watch_stop,
                 watcher_task,
             }),
-            shutdown: Mutex::new(ShutdownState::Running),
-            shutdown_done: Notify::new(),
+            shutdown,
         });
         Ok(Self {
             handle: ServiceHandle { inner },
@@ -193,7 +196,7 @@ async fn cleanup_partial_lifecycle(
 ) {
     let _ = tokio::time::timeout(timeout, handle.shutdown()).await;
     drop(handle);
-    let _ = tokio::time::timeout(timeout, lifecycle.wait_for_termination()).await;
+    let _ = lifecycle.wait_for_termination_bounded(timeout).await;
 }
 
 #[derive(Clone)]
@@ -222,36 +225,61 @@ impl ServiceHandle {
             lifecycle: self.inner.lifecycle.snapshot(),
         }
     }
-    pub fn rescan(&self, catalog_dir: PathBuf) -> Result<ReconcileResult, ServiceError> {
+    pub fn subscribe_shutdown(&self) -> broadcast::Receiver<ShutdownEvent> {
+        self.inner.events.subscribe()
+    }
+    pub fn subscribe_lifecycle(&self) -> watch::Receiver<LifecycleSnapshot> {
+        self.inner.lifecycle.subscribe()
+    }
+    pub async fn rescan(&self, catalog_dir: PathBuf) -> Result<ReconcileResult, ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         let result = CatalogService::new(catalog_dir, self.inner.store.clone()).reconcile_now()?;
         *self.inner.models.write().expect("model lock poisoned") = result.config.clone();
         Ok(result)
     }
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
-        loop {
-            let notified = self.inner.shutdown_done.notified();
-            let leader = {
-                let mut state = self.inner.shutdown.lock().await;
-                match &*state {
-                    ShutdownState::Running => {
-                        *state = ShutdownState::Stopping;
-                        true
-                    }
-                    ShutdownState::Stopping => false,
-                    ShutdownState::Done(result) => {
-                        return result.clone().map_err(ServiceError::Shutdown);
-                    }
+        let mut result = self.inner.shutdown_result.subscribe();
+        let (spawn, done) = {
+            let mut state = self.inner.shutdown.lock().await;
+            match &*state {
+                ShutdownState::Running => {
+                    *state = ShutdownState::Stopping;
+                    (true, None)
                 }
-            };
-            if !leader {
-                notified.await;
-                continue;
+                ShutdownState::Stopping => (false, None),
+                ShutdownState::Done(raw) => (false, Some(raw.clone())),
             }
-            let result = self.inner.perform_shutdown().await;
-            let stored = result.as_ref().map(|_| ()).map_err(ToString::to_string);
-            *self.inner.shutdown.lock().await = ShutdownState::Done(stored);
-            self.inner.shutdown_done.notify_waiters();
-            return result;
+        };
+        if let Some(raw) = done {
+            return raw.map_err(ServiceError::Shutdown);
+        }
+        if spawn {
+            let inner = self.inner.clone();
+            tokio::spawn(async move {
+                let raw = std::panic::AssertUnwindSafe(inner.perform_shutdown())
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(ShutdownFailure(Arc::from([
+                            "shutdown task panicked".to_owned()
+                        ])))
+                    });
+                *inner.shutdown.lock().await = ShutdownState::Done(raw.clone());
+                inner.shutdown_result.send_replace(Some(raw));
+            });
+        }
+        loop {
+            if let Some(raw) = result.borrow().clone() {
+                return raw.map_err(ServiceError::Shutdown);
+            }
+            if result.changed().await.is_err() {
+                return Err(ServiceError::Shutdown(ShutdownFailure(Arc::from([
+                    "shutdown result channel closed".to_owned(),
+                ]))));
+            }
         }
     }
 }
@@ -262,17 +290,18 @@ struct Inner {
     models: Arc<RwLock<LauncherConfig>>,
     store: ConfigStore,
     shutdown_timeout: Duration,
-    observer: Arc<dyn ServiceObserver>,
+    events: broadcast::Sender<ShutdownEvent>,
+    shutdown_result: watch::Sender<Option<Result<(), ShutdownFailure>>>,
+    mutation: Arc<Mutex<()>>,
     resources: Mutex<Resources>,
-    shutdown: Mutex<ShutdownState>,
-    shutdown_done: Notify,
+    shutdown: Arc<Mutex<ShutdownState>>,
 }
 
 impl Inner {
     fn event(&self, event: ShutdownEvent) {
-        self.observer.shutdown_event(event);
+        let _ = self.events.send(event);
     }
-    async fn perform_shutdown(&self) -> Result<(), ServiceError> {
+    async fn perform_shutdown(&self) -> Result<(), ShutdownFailure> {
         let (gateway, lifecycle, watch_stop, watcher_task) = {
             let mut resources = self.resources.lock().await;
             (
@@ -297,9 +326,13 @@ impl Inner {
             Err(_) => errors.push("lifecycle shutdown timed out".into()),
         }
         self.event(ShutdownEvent::Completed(ShutdownPhase::StopLifecycle));
+        let _mutation = self.mutation.lock().await;
         self.event(ShutdownEvent::Started(ShutdownPhase::PersistConfig));
         let latest = self.models.read().expect("model lock poisoned").clone();
-        if let Err(error) = self.store.save(&latest) {
+        if let Err(error) = self.store.update(|disk| {
+            disk.models = latest.models.clone();
+            Ok(())
+        }) {
             errors.push(error.to_string());
         }
         self.event(ShutdownEvent::Completed(ShutdownPhase::PersistConfig));
@@ -319,17 +352,17 @@ impl Inner {
         self.event(ShutdownEvent::Completed(ShutdownPhase::StopWatcher));
         self.event(ShutdownEvent::Started(ShutdownPhase::JoinLifecycle));
         if let Some(lifecycle) = lifecycle
-            && tokio::time::timeout(self.shutdown_timeout, lifecycle.wait_for_termination())
+            && !lifecycle
+                .wait_for_termination_bounded(self.shutdown_timeout)
                 .await
-                .is_err()
         {
-            errors.push("lifecycle join timed out".into());
+            errors.push("lifecycle join timed out; actor aborted and joined".into());
         }
         self.event(ShutdownEvent::Completed(ShutdownPhase::JoinLifecycle));
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(ServiceError::Shutdown(errors.join("; ")))
+            Err(ShutdownFailure(errors.into()))
         }
     }
 }
@@ -343,7 +376,7 @@ struct Resources {
 enum ShutdownState {
     Running,
     Stopping,
-    Done(Result<(), String>),
+    Done(Result<(), ShutdownFailure>),
 }
 
 struct ServiceModels {

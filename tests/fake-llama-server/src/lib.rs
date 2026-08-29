@@ -110,12 +110,20 @@ async fn handle(State(control): State<Arc<Control>>, request: Request) -> Respon
             .body(Body::from("upstream error"))
             .unwrap();
     }
-    if mode == "sse" {
-        let chunks = vec![
-            Bytes::from_static(b"data: a"),
-            Bytes::from_static(b"\xff\x00\n"),
-            Bytes::from_static(b"\n"),
-        ];
+    if mode == "sse" || mode == "sse-multi" {
+        let chunks = if mode == "sse-multi" {
+            vec![
+                Bytes::from_static(b"data: a\n\n"),
+                Bytes::from_static(b"data: \xff\x00\n"),
+                Bytes::from_static(b"\n"),
+            ]
+        } else {
+            vec![
+                Bytes::from_static(b"data: a"),
+                Bytes::from_static(b"\xff\x00\n"),
+                Bytes::from_static(b"\n"),
+            ]
+        };
         let guard = DropCount(control);
         let stream = futures_util::stream::unfold(
             (chunks.into_iter(), Some(guard)),

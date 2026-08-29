@@ -893,6 +893,30 @@ async fn dropping_all_command_owners_terminates_stopped_actor() {
     assert!(weak.upgrade().is_none());
 }
 
+#[tokio::test]
+async fn bounded_termination_aborts_and_joins_actor_without_detaching() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let _gate = engine.block_validation();
+    let weak = Arc::downgrade(&engine);
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let load = tokio::spawn({
+        let handle = lifecycle.handle();
+        async move { handle.load(model("a")).await }
+    });
+    drop(engine);
+
+    assert!(
+        !lifecycle
+            .wait_for_termination_bounded(Duration::from_millis(10))
+            .await
+    );
+    assert!(load.await.unwrap().is_err());
+    assert!(
+        weak.upgrade().is_none(),
+        "joined actor must release its engine owner"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn dropping_all_command_owners_stops_running_process_before_actor_exit() {
     let engine = Arc::new(ScriptedEngine::new());

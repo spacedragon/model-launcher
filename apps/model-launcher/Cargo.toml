@@ -11,6 +11,7 @@ model-launcher-api = { path = "../../crates/model-launcher-api" }
 model-launcher-wsl = { path = "../../crates/model-launcher-wsl" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 thiserror.workspace = true
+futures-util = "0.3"
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -18,4 +19,3 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json.workspace = true
 tempfile = "3"
 fake-llama-server = { path = "../../tests/fake-llama-server" }
-futures-util = "0.3"

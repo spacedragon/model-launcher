@@ -85,6 +85,21 @@ impl Lifecycle {
         drop(handle);
         let _ = task.await;
     }
+
+    /// Waits for actor termination without ever detaching its task.
+    ///
+    /// On timeout the actor is aborted and the resulting `JoinError` is awaited before returning.
+    pub async fn wait_for_termination_bounded(self, timeout: Duration) -> bool {
+        let Self { handle, mut task } = self;
+        drop(handle);
+        if tokio::time::timeout(timeout, &mut task).await.is_ok() {
+            true
+        } else {
+            task.abort();
+            let _ = task.await;
+            false
+        }
+    }
 }
 
 #[derive(Clone)]
