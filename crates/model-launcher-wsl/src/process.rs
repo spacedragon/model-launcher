@@ -10,7 +10,7 @@ use thiserror::Error;
 pub const LAUNCH_SCRIPT: &str = "printf 'MODEL_LAUNCHER_PID=%s\\n' \"$$\"; exec \"$@\"";
 pub const LAUNCH_SENTINEL: &str = "model-launcher";
 pub const SIGNAL_SENTINEL: &str = "model-launcher-signal";
-pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"$20\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; kill \"$signal\" -- \"$pid\" && printf 'Signaled\\n'";
+pub const GUARDED_SIGNAL_SCRIPT: &str = "signal=$1; pid=$2; expected=$3; stat=$(cat \"/proc/$pid/stat\" 2>/dev/null) || { printf 'AlreadyExited\\n'; exit 0; }; rest=${stat##*) }; set -- $rest; [ \"${20}\" = \"$expected\" ] || { printf 'IdentityMismatch\\n'; exit 0; }; kill \"$signal\" -- \"$pid\" && printf 'Signaled\\n'";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OwnedPid {
@@ -332,6 +332,10 @@ mod tests {
             ]
         );
         assert_eq!(&argv[7..], &["-KILL", "42", "98765"]);
+        assert!(
+            GUARDED_SIGNAL_SCRIPT.contains("${20}"),
+            "field 22 maps to positional field 20 after comm and must use braced shell syntax"
+        );
     }
 
     #[test]
