@@ -118,6 +118,48 @@ fn configuration_round_trips() {
 }
 
 #[test]
+fn update_loads_latest_mutates_and_saves_under_one_transaction() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    store
+        .save(&LauncherConfig {
+            models: vec![model(ModelState::Available)],
+        })
+        .unwrap();
+
+    let updated = store
+        .update(|config| {
+            config.models[0].key = ModelKey::parse("user-key")?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert_eq!(updated.models[0].key.as_str(), "user-key");
+    assert_eq!(store.load().unwrap(), updated);
+}
+
+#[test]
+fn update_propagates_mutator_error_without_saving() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    let initial = LauncherConfig {
+        models: vec![model(ModelState::Available)],
+    };
+    store.save(&initial).unwrap();
+
+    let error = store
+        .update(|_| {
+            Err(model_launcher_core::AppError::EngineProcess(Box::new(
+                io::Error::other("mutator failed"),
+            )))
+        })
+        .unwrap_err();
+
+    assert_eq!(error.source().unwrap().to_string(), "mutator failed");
+    assert_eq!(store.load().unwrap(), initial);
+}
+
+#[test]
 fn save_atomically_replaces_the_main_file() {
     let dir = TestDir::new();
     let store = ConfigStore::new(&dir.0);
@@ -289,6 +331,14 @@ fn poisoned_transaction_lock_returns_config_io_instead_of_panicking() {
     assert_eq!(error.code(), "config_io");
     assert_eq!(
         error.source().unwrap().to_string(),
+        "configuration transaction lock was poisoned"
+    );
+    let update_error = store
+        .update(|_| Ok(()))
+        .expect_err("poisoned update maps to application error");
+    assert_eq!(update_error.code(), "config_io");
+    assert_eq!(
+        update_error.source().unwrap().to_string(),
         "configuration transaction lock was poisoned"
     );
     assert!(temporary_artifacts(&dir.0).is_empty());

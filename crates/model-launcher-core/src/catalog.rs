@@ -1,11 +1,19 @@
 use std::{
     collections::{BTreeSet, HashSet},
     fs::{self, File},
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
-use gguf_rs_lib::{format::MetadataValue, reader::GGUFFileReader};
+use gguf_rs_lib::{
+    format::MetadataValue,
+    reader::{GGUFFileReader, GGUFReaderConfig},
+};
 use notify::{Config as NotifyConfig, PollWatcher, RecursiveMode, Watcher};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -24,11 +32,13 @@ use crate::{
 pub enum CatalogIdentity {
     Unix {
         device: u64,
-        inode: u64,
+        #[serde(alias = "inode")]
+        inode_fingerprint: u64,
     },
     Windows {
         volume: u64,
-        file_index: u64,
+        #[serde(alias = "file_index")]
+        file_fingerprint: u64,
     },
     #[default]
     Unavailable,
@@ -50,9 +60,24 @@ impl CatalogIdentity {
             let Ok(metadata) = file.metadata() else {
                 return Self::Unavailable;
             };
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let change_nanos = {
+                use std::os::darwin::fs::MetadataExt as _;
+                i128::from(metadata.st_birthtime()) * 1_000_000_000
+                    + i128::from(metadata.st_birthtime_nsec())
+            };
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let change_nanos = 0;
             Self::Unix {
                 device: metadata.dev(),
-                inode: metadata.ino(),
+                inode_fingerprint: stable_fingerprint(&[
+                    metadata.ino(),
+                    metadata.len(),
+                    metadata.mtime() as u64,
+                    metadata.mtime_nsec() as u64,
+                    change_nanos as u64,
+                    (change_nanos >> 64) as u64,
+                ]),
             }
         }
         #[cfg(windows)]
@@ -83,11 +108,90 @@ fn windows_identity(file: &File) -> Option<CatalogIdentity> {
     }
     // SAFETY: a successful call initialized the structure.
     let information = unsafe { information.assume_init() };
+    let metadata = file.metadata().ok()?;
     Some(CatalogIdentity::Windows {
         volume: u64::from(information.dwVolumeSerialNumber),
-        file_index: (u64::from(information.nFileIndexHigh) << 32)
-            | u64::from(information.nFileIndexLow),
+        file_fingerprint: stable_fingerprint(&[
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+            metadata.len(),
+            system_time_nanos(metadata.modified().ok()?) as u64,
+            metadata
+                .created()
+                .map(system_time_nanos)
+                .unwrap_or_default() as u64,
+        ]),
     })
+}
+
+#[cfg(windows)]
+fn windows_directory_identity(path: &Path) -> Option<(u32, u64)> {
+    use std::{
+        mem::MaybeUninit,
+        os::windows::{
+            ffi::OsStrExt as _,
+            io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle},
+        },
+    };
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+        },
+    };
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the UTF-16 path is NUL terminated and all remaining arguments are documented values.
+    let raw = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: CreateFileW returned a unique valid owned handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the handle is valid and the output is initialized on success.
+    let success =
+        unsafe { GetFileInformationByHandle(handle.as_raw_handle(), information.as_mut_ptr()) };
+    if success == 0 {
+        return None;
+    }
+    // SAFETY: a successful call initialized the structure.
+    let information = unsafe { information.assume_init() };
+    Some((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+fn stable_fingerprint(values: &[u64]) -> u64 {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+}
+
+#[cfg(windows)]
+fn system_time_nanos(value: std::time::SystemTime) -> i128 {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX))
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -129,11 +233,28 @@ pub struct ScanResult {
     pub complete: bool,
 }
 
+/// Maximum files considered in one scan. Hitting the cap makes the scan incomplete.
+pub const MAX_DISCOVERED_GGUF_FILES: usize = 1_024;
+/// Maximum logical records emitted by one scan.
+pub const MAX_DISCOVERED_MODELS: usize = 1_024;
+/// Maximum user-visible diagnostics retained by one scan.
+pub const MAX_CATALOG_DIAGNOSTICS: usize = 256;
+/// Practical shard cap; valid sets above this are rejected before candidate expansion.
+pub const MAX_LOGICAL_MODEL_SHARDS: usize = 1_024;
+/// Catalog metadata entry budget, intentionally below the general-purpose parser maximum.
+pub const MAX_CATALOG_METADATA_ENTRIES: u64 = 16_384;
+/// Aggregate metadata entry budget across one scan.
+pub const MAX_TOTAL_CATALOG_METADATA_ENTRIES: u64 = 65_536;
+/// Catalog tensor descriptor budget; catalog reads descriptors but never tensor payloads.
+pub const MAX_CATALOG_TENSORS: u64 = 100_000;
+pub const MAX_CATALOG_METADATA_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CATALOG_DECODED_METADATA_BYTES: usize = 8 * 1024 * 1024;
+
 /// Recursively scans `root` without following symlinks. This prevents both directory loops and
 /// traversal through a link outside the configured root. Entry failures are retained as diagnostics.
 #[must_use]
 pub fn scan(root: &Path) -> ScanResult {
-    scan_with_hook(root, &|_| {})
+    scan_impl(root, &|| {}, &|_| {}, &|_, actual| actual)
 }
 
 /// Scans with a hook after each logical model's shard handles are opened and snapshotted.
@@ -141,6 +262,27 @@ pub fn scan(root: &Path) -> ScanResult {
 #[doc(hidden)]
 #[must_use]
 pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResult {
+    scan_impl(root, &|| {}, after_open, &|_, actual| actual)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn scan_with_discovery_hook(root: &Path, after_discovery: &dyn Fn()) -> ScanResult {
+    scan_impl(root, after_discovery, &|_| {}, &|_, actual| actual)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn scan_with_size_hook(root: &Path, size: &dyn Fn(&Path, u64) -> u64) -> ScanResult {
+    scan_impl(root, &|| {}, &|_| {}, size)
+}
+
+fn scan_impl(
+    root: &Path,
+    after_discovery: &dyn Fn(),
+    after_open: &dyn Fn(&[PathBuf]),
+    size: &dyn Fn(&Path, u64) -> u64,
+) -> ScanResult {
     let mut result = ScanResult::default();
     let root_metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
@@ -165,43 +307,127 @@ pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResul
         });
         return result;
     }
+    let root_snapshot = match RootSnapshot::capture(root) {
+        Ok(snapshot) => snapshot,
+        Err(diagnostic) => {
+            result.diagnostics.push(diagnostic);
+            return result;
+        }
+    };
     result.complete = true;
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false).into_iter() {
+    for entry in WalkDir::new(root)
+        .follow_links(false)
+        .follow_root_links(false)
+        .into_iter()
+    {
         match entry {
             Ok(entry) if entry.file_type().is_file() && is_gguf(entry.path()) => {
-                files.push(entry.into_path())
+                if files.len() == MAX_DISCOVERED_GGUF_FILES {
+                    result.complete = false;
+                    push_scan_diagnostic(
+                        &mut result,
+                        CatalogDiagnostic {
+                            kind: CatalogDiagnosticKind::Scan,
+                            path: root.to_path_buf(),
+                            message: format!(
+                                "catalog file limit of {MAX_DISCOVERED_GGUF_FILES} was reached"
+                            ),
+                        },
+                    );
+                    break;
+                }
+                let path = entry.into_path();
+                match canonical_within(&path, &root_snapshot.canonical) {
+                    Ok(()) => files.push(path),
+                    Err(diagnostic) => {
+                        result.complete = false;
+                        push_scan_diagnostic(&mut result, diagnostic);
+                    }
+                }
             }
             Ok(_) => {}
             Err(error) => {
                 result.complete = false;
-                result.diagnostics.push(CatalogDiagnostic {
-                    kind: CatalogDiagnosticKind::Scan,
-                    path: error.path().unwrap_or(root).to_path_buf(),
-                    message: error.to_string(),
-                });
+                push_scan_diagnostic(
+                    &mut result,
+                    CatalogDiagnostic {
+                        kind: CatalogDiagnosticKind::Scan,
+                        path: error.path().unwrap_or(root).to_path_buf(),
+                        message: error.to_string(),
+                    },
+                );
             }
         }
+    }
+    after_discovery();
+    if let Err(diagnostic) = root_snapshot.validate(root) {
+        result.complete = false;
+        push_scan_diagnostic(&mut result, diagnostic);
+        return result;
     }
     files.sort();
 
     let shard = Regex::new(r"(?i)^(.*)-(\d{5})-of-(\d{5})\.gguf$").expect("constant regex");
-    let actual_files = files
+    let mut actual_files = std::collections::HashMap::<_, Vec<PathBuf>>::new();
+    for path in &files {
+        if let (Some(parent), Some(name)) = (
+            path.parent(),
+            path.file_name().and_then(|name| name.to_str()),
+        ) {
+            actual_files
+                .entry((parent.to_path_buf(), name.to_ascii_lowercase()))
+                .or_default()
+                .push(path.clone());
+        }
+    }
+    let ambiguous = actual_files
         .iter()
-        .filter_map(|path| {
-            Some((
-                (
-                    path.parent()?.to_path_buf(),
-                    path.file_name()?.to_str()?.to_ascii_lowercase(),
-                ),
-                path.clone(),
-            ))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+        .filter_map(|(key, paths)| (paths.len() > 1).then_some((key.clone(), paths.clone())))
+        .collect::<Vec<_>>();
+    for ((parent, name), paths) in &ambiguous {
+        result.complete = false;
+        push_scan_diagnostic(
+            &mut result,
+            CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: parent.join(name),
+                message: format!("ambiguous case-insensitive GGUF filenames: {paths:?}"),
+            },
+        );
+    }
+    let ambiguous_keys = ambiguous
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect::<HashSet<_>>();
     let mut consumed = HashSet::new();
+    let mut remaining_metadata_entries = MAX_TOTAL_CATALOG_METADATA_ENTRIES;
     for path in &files {
         if consumed.contains(path) {
             continue;
+        }
+        let normalized_key = path
+            .parent()
+            .zip(path.file_name().and_then(|name| name.to_str()))
+            .map(|(parent, name)| (parent.to_path_buf(), name.to_ascii_lowercase()));
+        if normalized_key
+            .as_ref()
+            .is_some_and(|key| ambiguous_keys.contains(key))
+        {
+            consumed.insert(path.clone());
+            continue;
+        }
+        if result.models.len() == MAX_DISCOVERED_MODELS {
+            result.complete = false;
+            push_scan_diagnostic(
+                &mut result,
+                CatalogDiagnostic {
+                    kind: CatalogDiagnosticKind::Scan,
+                    path: root.to_path_buf(),
+                    message: format!("catalog model limit of {MAX_DISCOVERED_MODELS} was reached"),
+                },
+            );
+            break;
         }
         let mut logical_files = vec![path.clone()];
         if let Some(captures) = path
@@ -211,6 +437,21 @@ pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResul
         {
             let index = captures[2].parse::<usize>().unwrap_or(0);
             let total = captures[3].parse::<usize>().unwrap_or(0);
+            if total > MAX_LOGICAL_MODEL_SHARDS {
+                consumed.insert(path.clone());
+                result.complete = false;
+                push_scan_diagnostic(
+                    &mut result,
+                    CatalogDiagnostic {
+                        kind: CatalogDiagnosticKind::Scan,
+                        path: path.clone(),
+                        message: format!(
+                            "declared shard total {total} exceeds limit {MAX_LOGICAL_MODEL_SHARDS}"
+                        ),
+                    },
+                );
+                continue;
+            }
             if index == 1 && total > 1 {
                 let prefix = &captures[1];
                 let candidate_names = (1..=total)
@@ -219,24 +460,46 @@ pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResul
                     })
                     .collect::<Vec<_>>();
                 let parent = path.parent().unwrap_or_else(|| Path::new(""));
-                if candidate_names
-                    .iter()
-                    .all(|name| actual_files.contains_key(&(parent.to_path_buf(), name.clone())))
-                {
+                if candidate_names.iter().all(|name| {
+                    actual_files
+                        .get(&(parent.to_path_buf(), name.clone()))
+                        .is_some_and(|paths| paths.len() == 1)
+                }) {
                     logical_files = candidate_names
                         .iter()
                         .filter_map(|name| actual_files.get(&(parent.to_path_buf(), name.clone())))
-                        .cloned()
+                        .filter_map(|paths| paths.first().cloned())
                         .collect();
                 }
             }
         }
         consumed.extend(logical_files.iter().cloned());
-        let mut opened = Vec::with_capacity(logical_files.len());
+        let mut snapshots = Vec::with_capacity(logical_files.len());
+        let mut launch_file = None;
+        let mut size_bytes = 0_u64;
         let mut open_error = None;
         for shard_path in &logical_files {
+            if let Err(diagnostic) = canonical_within(shard_path, &root_snapshot.canonical) {
+                open_error = Some(diagnostic);
+                break;
+            }
             match OpenedShard::open(shard_path) {
-                Ok(shard) => opened.push(shard),
+                Ok((mut shard, file)) => {
+                    shard.before.size = size(shard_path, shard.before.size);
+                    let Some(total) = size_bytes.checked_add(shard.before.size) else {
+                        open_error = Some(CatalogDiagnostic {
+                            kind: CatalogDiagnosticKind::Scan,
+                            path: shard_path.clone(),
+                            message: "logical model size overflowed u64".into(),
+                        });
+                        break;
+                    };
+                    size_bytes = total;
+                    if shard_path == path {
+                        launch_file = Some(file);
+                    }
+                    snapshots.push(shard);
+                }
                 Err(error) => {
                     open_error = Some(error);
                     break;
@@ -245,35 +508,136 @@ pub fn scan_with_hook(root: &Path, after_open: &dyn Fn(&[PathBuf])) -> ScanResul
         }
         if let Some(diagnostic) = open_error {
             result.complete = false;
-            result.diagnostics.push(diagnostic);
+            push_scan_diagnostic(&mut result, diagnostic);
             continue;
         }
         after_open(&logical_files);
-        let size_bytes = opened.iter().map(|shard| shard.before.size).sum();
-        let launch = &opened[0];
+        let launch = launch_file
+            .as_ref()
+            .expect("first logical shard was opened");
+        let launch_snapshot = snapshots
+            .iter()
+            .find(|shard| shard.path == *path)
+            .expect("first logical shard was snapshotted");
+        let mut model_diagnostics = Vec::new();
         let parsed = read_model(
             path,
             size_bytes,
-            launch.before.size,
-            launch.before.identity.clone(),
-            &launch.file,
-            &mut result.diagnostics,
+            launch_snapshot.before.size,
+            launch_snapshot.before.identity.clone(),
+            launch,
+            &mut remaining_metadata_entries,
+            &mut model_diagnostics,
         );
-        let validation_error = opened.iter().find_map(OpenedShard::validate_unchanged);
+        for diagnostic in model_diagnostics {
+            push_scan_diagnostic(&mut result, diagnostic);
+        }
+        let validation_error = snapshots
+            .iter()
+            .find_map(|shard| shard.validate_unchanged((shard.path == *path).then_some(launch)));
         if let Some(diagnostic) = validation_error {
             result.complete = false;
-            result.diagnostics.push(diagnostic);
+            push_scan_diagnostic(&mut result, diagnostic);
             continue;
         }
         match parsed {
             Ok(model) => result.models.push(model),
             Err(diagnostic) => {
                 result.complete = false;
-                result.diagnostics.push(diagnostic);
+                push_scan_diagnostic(&mut result, diagnostic);
             }
         }
     }
+    if let Err(diagnostic) = root_snapshot.validate(root) {
+        result.complete = false;
+        result.models.clear();
+        push_scan_diagnostic(&mut result, diagnostic);
+    }
     result
+}
+
+struct RootSnapshot {
+    canonical: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(windows)]
+    volume: Option<u32>,
+    #[cfg(windows)]
+    file_index: Option<u64>,
+}
+
+impl RootSnapshot {
+    fn capture(root: &Path) -> Result<Self, CatalogDiagnostic> {
+        let canonical = root
+            .canonicalize()
+            .map_err(|error| scan_diagnostic(root, error))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(root).map_err(|error| scan_diagnostic(root, error))?;
+            Ok(Self {
+                canonical,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            let (volume, file_index) = windows_directory_identity(root)
+                .ok_or_else(|| scan_diagnostic(root, std::io::Error::last_os_error()))?;
+            Ok(Self {
+                canonical,
+                volume: Some(volume),
+                file_index: Some(file_index),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Ok(Self { canonical })
+        }
+    }
+
+    fn validate(&self, root: &Path) -> Result<(), CatalogDiagnostic> {
+        let metadata = fs::symlink_metadata(root).map_err(|error| scan_diagnostic(root, error))?;
+        let canonical = root
+            .canonicalize()
+            .map_err(|error| scan_diagnostic(root, error))?;
+        let unchanged = !metadata.file_type().is_symlink() && canonical == self.canonical;
+        #[cfg(unix)]
+        let unchanged = {
+            use std::os::unix::fs::MetadataExt;
+            unchanged && metadata.dev() == self.device && metadata.ino() == self.inode
+        };
+        #[cfg(windows)]
+        let unchanged =
+            { unchanged && windows_directory_identity(root) == self.volume.zip(self.file_index) };
+        if unchanged {
+            Ok(())
+        } else {
+            Err(CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: root.to_path_buf(),
+                message: "catalog root changed while it was being scanned".into(),
+            })
+        }
+    }
+}
+
+fn canonical_within(path: &Path, canonical_root: &Path) -> Result<(), CatalogDiagnostic> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| scan_diagnostic(path, error))?;
+    if canonical.starts_with(canonical_root) {
+        Ok(())
+    } else {
+        Err(CatalogDiagnostic {
+            kind: CatalogDiagnosticKind::Scan,
+            path: path.to_path_buf(),
+            message: "catalog entry resolves outside the configured root".into(),
+        })
+    }
 }
 
 struct FileSnapshot {
@@ -284,27 +648,43 @@ struct FileSnapshot {
 
 struct OpenedShard {
     path: PathBuf,
-    file: File,
     before: FileSnapshot,
 }
 
 impl OpenedShard {
-    fn open(path: &Path) -> Result<Self, CatalogDiagnostic> {
+    fn open(path: &Path) -> Result<(Self, File), CatalogDiagnostic> {
         let file = File::open(path).map_err(|error| scan_diagnostic(path, error))?;
         let before = snapshot(&file, path)?;
-        Ok(Self {
-            path: path.to_path_buf(),
+        Ok((
+            Self {
+                path: path.to_path_buf(),
+                before,
+            },
             file,
-            before,
-        })
+        ))
     }
 
-    fn validate_unchanged(&self) -> Option<CatalogDiagnostic> {
-        let after = match snapshot(&self.file, &self.path) {
+    fn validate_unchanged(&self, retained_file: Option<&File>) -> Option<CatalogDiagnostic> {
+        let retained = retained_file.is_some();
+        let reopened;
+        let file = if let Some(file) = retained_file {
+            file
+        } else {
+            reopened = match File::open(&self.path) {
+                Ok(file) => file,
+                Err(error) => return Some(scan_diagnostic(&self.path, error)),
+            };
+            &reopened
+        };
+        let after = match snapshot(file, &self.path) {
             Ok(snapshot) => snapshot,
             Err(diagnostic) => return Some(diagnostic),
         };
-        let path_identity = CatalogIdentity::for_path(&self.path);
+        let path_identity = if retained {
+            CatalogIdentity::for_path(&self.path)
+        } else {
+            after.identity.clone()
+        };
         if after.size != self.before.size
             || after.modified != self.before.modified
             || after.identity != self.before.identity
@@ -344,6 +724,14 @@ fn scan_diagnostic(path: &Path, error: std::io::Error) -> CatalogDiagnostic {
     }
 }
 
+fn push_scan_diagnostic(result: &mut ScanResult, diagnostic: CatalogDiagnostic) {
+    if result.diagnostics.len() < MAX_CATALOG_DIAGNOSTICS {
+        result.diagnostics.push(diagnostic);
+    } else {
+        result.complete = false;
+    }
+}
+
 fn is_gguf(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
@@ -356,6 +744,7 @@ fn read_model(
     expected_launch_size: u64,
     identity: CatalogIdentity,
     file: &File,
+    remaining_metadata_entries: &mut u64,
     diagnostics: &mut Vec<CatalogDiagnostic>,
 ) -> Result<ScannedModel, CatalogDiagnostic> {
     let fallback = path
@@ -366,7 +755,30 @@ fn read_model(
         .expect("constant regex")
         .replace(fallback, "")
         .into_owned();
-    let (display_name, metadata) = match GGUFFileReader::new(file) {
+    if let Some(message) = catalog_header_limit(file, remaining_metadata_entries) {
+        diagnostics.push(CatalogDiagnostic {
+            kind: CatalogDiagnosticKind::Metadata,
+            path: path.to_path_buf(),
+            message,
+        });
+        return Ok(ScannedModel {
+            display_name: fallback,
+            path: path.to_path_buf(),
+            size_bytes,
+            identity,
+            metadata: CatalogMetadata::default(),
+        });
+    }
+    let config = GGUFReaderConfig {
+        validate_integrity: true,
+        eager_load_tensors: false,
+        max_file_size: 0,
+        max_metadata_size: MAX_CATALOG_METADATA_BYTES,
+        max_decoded_metadata_size: MAX_CATALOG_DECODED_METADATA_BYTES,
+        buffer_size: 64 * 1024,
+        use_mmap: false,
+    };
+    let (display_name, metadata) = match GGUFFileReader::with_config(file, config) {
         Ok(reader) => {
             let values = reader.metadata();
             let string = |key: &str| match values.get(key) {
@@ -455,6 +867,35 @@ fn read_model(
     })
 }
 
+fn catalog_header_limit(file: &File, remaining_metadata_entries: &mut u64) -> Option<String> {
+    let mut reader = file;
+    let mut header = [0_u8; 24];
+    reader.seek(SeekFrom::Start(0)).ok()?;
+    let read = reader.read_exact(&mut header);
+    let _ = reader.seek(SeekFrom::Start(0));
+    if read.is_err() || u32::from_le_bytes(header[0..4].try_into().ok()?) != 0x4655_4747 {
+        return None;
+    }
+    let tensor_count = u64::from_le_bytes(header[8..16].try_into().ok()?);
+    let metadata_count = u64::from_le_bytes(header[16..24].try_into().ok()?);
+    if metadata_count > MAX_CATALOG_METADATA_ENTRIES {
+        Some(format!(
+            "catalog metadata entry limit {MAX_CATALOG_METADATA_ENTRIES} exceeded by {metadata_count}"
+        ))
+    } else if tensor_count > MAX_CATALOG_TENSORS {
+        Some(format!(
+            "catalog tensor count limit {MAX_CATALOG_TENSORS} exceeded by {tensor_count}"
+        ))
+    } else if metadata_count > *remaining_metadata_entries {
+        Some(format!(
+            "catalog total metadata entry budget {MAX_TOTAL_CATALOG_METADATA_ENTRIES} exhausted"
+        ))
+    } else {
+        *remaining_metadata_entries -= metadata_count;
+        None
+    }
+}
+
 fn llama_file_type(value: u64) -> (String, bool) {
     // Compatibility snapshot: llama.cpp include/llama.h `enum llama_ftype` at
     // cc83d7b4824f73cfdda4dfbb47ee39804f71b328 (captured 2026-08-29).
@@ -532,6 +973,7 @@ pub fn reconcile_catalog(
         .filter(|record| !removed.contains(&record.id))
         .cloned()
         .collect::<Vec<_>>();
+    let saved_len = records.len();
     for record in &mut records {
         record.state = ModelState::Missing;
     }
@@ -540,16 +982,43 @@ pub fn reconcile_catalog(
         .iter()
         .map(|record| record.key.as_str().to_owned())
         .collect::<HashSet<_>>();
+    let scanned_identity_counts = scanned
+        .models
+        .iter()
+        .filter(|model| model.identity != CatalogIdentity::Unavailable)
+        .fold(std::collections::HashMap::new(), |mut counts, model| {
+            *counts.entry(model.identity.clone()).or_insert(0_usize) += 1;
+            counts
+        });
+    let saved_identity_counts = records[..saved_len]
+        .iter()
+        .filter(|record| record.file_identity != CatalogIdentity::Unavailable)
+        .fold(std::collections::HashMap::new(), |mut counts, record| {
+            *counts
+                .entry(record.file_identity.clone())
+                .or_insert(0_usize) += 1;
+            counts
+        });
 
     for model in scanned.models {
-        let existing = records.iter_mut().enumerate().find(|(index, record)| {
-            !matched.contains(index)
-                && ((model.identity != CatalogIdentity::Unavailable
-                    && record.file_identity == model.identity)
-                    || record.path == model.path)
+        let normalized = normalized_catalog_path(&model.path);
+        let path_match = (0..saved_len).find(|index| {
+            !matched.contains(index) && normalized_catalog_path(&records[*index].path) == normalized
         });
-        if let Some((index, record)) = existing {
+        let identity_match = path_match.or_else(|| {
+            (model.identity != CatalogIdentity::Unavailable
+                && scanned_identity_counts.get(&model.identity) == Some(&1)
+                && saved_identity_counts.get(&model.identity) == Some(&1))
+            .then(|| {
+                (0..saved_len).find(|index| {
+                    !matched.contains(index) && records[*index].file_identity == model.identity
+                })
+            })
+            .flatten()
+        });
+        if let Some(index) = identity_match {
             matched.insert(index);
+            let record = &mut records[index];
             record.path = model.path;
             record.file_identity = model.identity;
             record.size_bytes = model.size_bytes;
@@ -571,6 +1040,15 @@ pub fn reconcile_catalog(
     ReconcileResult {
         config: LauncherConfig { models: records },
         diagnostics: scanned.diagnostics,
+    }
+}
+
+fn normalized_catalog_path(path: &Path) -> String {
+    let value = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value
     }
 }
 
@@ -634,37 +1112,108 @@ pub enum CatalogWatchEvent {
 }
 
 #[derive(Clone)]
-pub struct CatalogWatchSender(mpsc::UnboundedSender<CatalogWatchEvent>);
+pub struct CatalogWatchSender {
+    events: mpsc::Sender<CatalogWatchEvent>,
+    dropped: Arc<AtomicU64>,
+}
 
 impl CatalogWatchSender {
     pub fn emit(&self, event: CatalogWatchEvent) {
-        let _ = self.0.send(event);
+        if matches!(
+            self.events.try_send(event),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 pub struct CatalogWatchReceiver {
-    events: mpsc::UnboundedReceiver<CatalogWatchEvent>,
+    events: mpsc::Receiver<CatalogWatchEvent>,
+    dropped: Arc<AtomicU64>,
     delay: Duration,
+    max_latency: Duration,
 }
+
+/// Maximum callback events waiting in memory. Path events are coalesced into a full rescan.
+pub const WATCH_CHANNEL_CAPACITY: usize = 64;
+/// Maximum individual backend error strings retained per reconciliation batch.
+pub const WATCH_MAX_BATCH_DIAGNOSTICS: usize = 32;
+/// A storm cannot postpone reconciliation beyond this duration.
+pub const WATCH_MAX_LATENCY: Duration = Duration::from_secs(2);
 
 #[must_use]
 pub fn catalog_watch_channel(delay: Duration) -> (CatalogWatchSender, CatalogWatchReceiver) {
-    let (sender, events) = mpsc::unbounded_channel();
+    catalog_watch_channel_with_limits(delay, WATCH_MAX_LATENCY, WATCH_CHANNEL_CAPACITY)
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn catalog_watch_channel_with_limits(
+    delay: Duration,
+    max_latency: Duration,
+    capacity: usize,
+) -> (CatalogWatchSender, CatalogWatchReceiver) {
+    let (sender, events) = mpsc::channel(capacity.max(1));
+    let dropped = Arc::new(AtomicU64::new(0));
     (
-        CatalogWatchSender(sender),
-        CatalogWatchReceiver { events, delay },
+        CatalogWatchSender {
+            events: sender,
+            dropped: dropped.clone(),
+        },
+        CatalogWatchReceiver {
+            events,
+            dropped,
+            delay,
+            max_latency,
+        },
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogWatchBatch {
+    pub rescan_required: bool,
+    pub errors: Vec<String>,
+    pub dropped_count: u64,
+}
+
 impl CatalogWatchReceiver {
-    async fn next_batch(&mut self) -> Option<Vec<CatalogWatchEvent>> {
+    async fn next_batch(&mut self) -> Option<CatalogWatchBatch> {
         let first = self.events.recv().await?;
-        let mut batch = vec![first];
+        let mut errors = Vec::new();
+        let mut locally_dropped = 0_u64;
+        retain_watch_event(first, &mut errors, &mut locally_dropped);
+        let quiet = tokio::time::sleep(self.delay);
+        let hard = tokio::time::sleep(self.max_latency);
+        tokio::pin!(quiet);
+        tokio::pin!(hard);
         loop {
-            match tokio::time::timeout(self.delay, self.events.recv()).await {
-                Ok(Some(event)) => batch.push(event),
-                Ok(None) | Err(_) => return Some(batch),
+            tokio::select! {
+                () = &mut quiet => break,
+                () = &mut hard => break,
+                event = self.events.recv() => match event {
+                    Some(event) => {
+                        retain_watch_event(event, &mut errors, &mut locally_dropped);
+                        quiet.as_mut().reset(tokio::time::Instant::now() + self.delay);
+                    }
+                    None => break,
+                },
             }
+        }
+        Some(CatalogWatchBatch {
+            rescan_required: true,
+            errors,
+            dropped_count: locally_dropped + self.dropped.swap(0, Ordering::Relaxed),
+        })
+    }
+}
+
+fn retain_watch_event(event: CatalogWatchEvent, errors: &mut Vec<String>, dropped: &mut u64) {
+    if let CatalogWatchEvent::Error(message) = event {
+        if errors.len() < WATCH_MAX_BATCH_DIAGNOSTICS {
+            errors.push(message);
+        } else {
+            *dropped = dropped.saturating_add(1);
         }
     }
 }
@@ -691,13 +1240,26 @@ impl CatalogService {
     }
 
     pub fn reconcile_scan(&self, scanned: ScanResult) -> Result<ReconcileResult, AppError> {
-        let saved = self.store.load()?;
         let complete = scanned.complete;
-        let output = reconcile_catalog(&saved, scanned, ReconcileOptions::default());
-        if complete {
-            self.store.save(&output.config)?;
+        if !complete {
+            let saved = self.store.load()?;
+            return Ok(reconcile_catalog(
+                &saved,
+                scanned,
+                ReconcileOptions::default(),
+            ));
         }
-        Ok(output)
+        let mut diagnostics = Vec::new();
+        let config = self.store.update(|latest| {
+            let output = reconcile_catalog(latest, scanned, ReconcileOptions::default());
+            diagnostics = output.diagnostics;
+            *latest = output.config;
+            Ok(())
+        })?;
+        Ok(ReconcileResult {
+            config,
+            diagnostics,
+        })
     }
 
     pub async fn process_next(
@@ -708,16 +1270,24 @@ impl CatalogService {
             return Ok(None);
         };
         let mut watch_diagnostics = batch
+            .errors
             .into_iter()
-            .filter_map(|event| match event {
-                CatalogWatchEvent::Error(message) => Some(CatalogDiagnostic {
-                    kind: CatalogDiagnosticKind::Scan,
-                    path: self.root.clone(),
-                    message,
-                }),
-                CatalogWatchEvent::Changed(_) | CatalogWatchEvent::Rescan => None,
+            .map(|message| CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: self.root.clone(),
+                message,
             })
             .collect::<Vec<_>>();
+        if batch.dropped_count > 0 {
+            watch_diagnostics.push(CatalogDiagnostic {
+                kind: CatalogDiagnosticKind::Scan,
+                path: self.root.clone(),
+                message: format!(
+                    "watch event buffer overflow: dropped {}; full rescan required",
+                    batch.dropped_count
+                ),
+            });
+        }
         let mut output = self.reconcile_now()?;
         watch_diagnostics.append(&mut output.diagnostics);
         output.diagnostics = watch_diagnostics;
@@ -753,7 +1323,7 @@ impl CatalogWatcher {
         })
     }
 
-    pub async fn next(&mut self) -> Option<Vec<CatalogWatchEvent>> {
+    pub async fn next(&mut self) -> Option<CatalogWatchBatch> {
         self.events.next_batch().await
     }
 

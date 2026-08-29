@@ -193,6 +193,19 @@ impl ConfigStore {
         self.save_locked(config)
     }
 
+    /// Atomically loads the latest configuration, applies `mutate`, and persists the result.
+    /// The mutator and save share the process-local transaction lock.
+    pub fn update(
+        &self,
+        mutate: impl FnOnce(&mut LauncherConfig) -> Result<(), AppError>,
+    ) -> Result<LauncherConfig, AppError> {
+        let _transaction = self.lock_transaction()?;
+        let mut config = self.load_with_diagnostic_locked()?.config;
+        mutate(&mut config)?;
+        self.save_locked(&config)?;
+        Ok(config)
+    }
+
     fn save_locked(&self, config: &LauncherConfig) -> Result<(), AppError> {
         fs::create_dir_all(&self.directory).map_err(config_io)?;
         let main = self.config_path();

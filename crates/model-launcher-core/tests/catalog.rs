@@ -7,8 +7,10 @@ use std::{
 use gguf_rs_lib::{builder::GGUFBuilder, format::MetadataValue};
 use model_launcher_core::{
     CatalogDebouncer, CatalogDiagnosticKind, CatalogIdentity, CatalogService, CatalogWatchEvent,
-    CatalogWatcher, ConfigStore, LauncherConfig, ModelKey, ModelState, ReconcileOptions,
-    catalog_watch_channel, reconcile_catalog, scan,
+    CatalogWatcher, ConfigStore, ContextLength, LauncherConfig, MAX_CATALOG_DIAGNOSTICS,
+    MAX_DISCOVERED_GGUF_FILES, MAX_DISCOVERED_MODELS, ModelKey, ModelState, ReconcileOptions,
+    WATCH_MAX_BATCH_DIAGNOSTICS, catalog_watch_channel, catalog_watch_channel_with_limits,
+    reconcile_catalog, scan,
 };
 use uuid::Uuid;
 
@@ -247,6 +249,65 @@ fn mixed_case_shard_extensions_group_using_actual_paths() {
 }
 
 #[test]
+fn excessive_declared_shard_total_is_rejected_without_expansion() {
+    let root = TestDir::new();
+    root.file("huge-00001-of-99999.gguf", &tiny_gguf("Huge"));
+    let result = scan(root.path());
+    assert!(!result.complete);
+    assert!(result.models.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("shard total"))
+    );
+}
+
+#[test]
+fn injected_sparse_shard_sizes_cannot_overflow_total() {
+    let root = TestDir::new();
+    root.file("overflow-00001-of-00002.gguf", &tiny_gguf("Overflow"));
+    root.file("overflow-00002-of-00002.gguf", b"payload");
+    let result = model_launcher_core::scan_with_size_hook(root.path(), &|path, actual| {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("00001"))
+        {
+            u64::MAX
+        } else {
+            actual
+        }
+    });
+    assert!(!result.complete);
+    assert!(result.models.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("overflow"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn normalized_filename_collision_is_incomplete_and_ambiguous_group_is_skipped() {
+    let root = TestDir::new();
+    root.file("Mix-00001-of-00002.GGUF", &tiny_gguf("One"));
+    root.file("mix-00001-of-00002.gguf", &tiny_gguf("Other one"));
+    root.file("Mix-00002-of-00002.GGUF", b"payload");
+    let result = scan(root.path());
+    assert!(!result.complete);
+    assert!(result.models.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("ambiguous"))
+    );
+}
+
+#[test]
 fn invalid_roots_are_incomplete_and_visible() {
     let missing = TestDir::new().path().join("missing");
     let missing_result = scan(&missing);
@@ -317,6 +378,35 @@ fn atomic_replacement_after_open_is_incomplete_and_never_saved() {
 
 #[cfg(unix)]
 #[test]
+fn root_swap_to_outside_symlink_is_rejected_before_outside_open() {
+    use std::os::unix::fs::symlink;
+    let holder = TestDir::new();
+    let root = holder.path().join("models");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("inside.gguf"), tiny_gguf("Inside")).unwrap();
+    let outside = TestDir::new();
+    outside.file("inside.gguf", &tiny_gguf("Outside secret"));
+    let parked = holder.path().join("models-parked");
+
+    let result = model_launcher_core::scan_with_discovery_hook(&root, &|| {
+        fs::rename(&root, &parked).unwrap();
+        symlink(outside.path(), &root).unwrap();
+    });
+    fs::remove_file(&root).unwrap();
+    fs::rename(&parked, &root).unwrap();
+
+    assert!(!result.complete);
+    assert!(result.models.is_empty());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("root changed"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn root_and_child_symlinks_are_never_followed() {
     use std::os::unix::fs::symlink;
     let outside = TestDir::new();
@@ -346,6 +436,84 @@ fn malformed_metadata_falls_back_to_filename_with_visible_diagnostic() {
     assert_eq!(result.models[0].display_name, "read-me");
     assert_eq!(result.diagnostics[0].kind, CatalogDiagnosticKind::Metadata);
     assert_eq!(result.diagnostics[0].path, result.models[0].path);
+}
+
+#[test]
+fn malicious_gguf_header_counts_are_rejected_by_catalog_budgets() {
+    fn header(tensors: u64, metadata: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&tensors.to_le_bytes());
+        bytes.extend_from_slice(&metadata.to_le_bytes());
+        bytes
+    }
+    let root = TestDir::new();
+    root.file("metadata-bomb.gguf", &header(0, u64::MAX));
+    root.file("tensor-bomb.gguf", &header(u64::MAX, 0));
+
+    let result = scan(root.path());
+
+    assert!(
+        result.complete,
+        "stable malicious files degrade without invalidating traversal"
+    );
+    assert_eq!(result.models.len(), 2);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("catalog metadata entry limit"))
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("catalog tensor count limit"))
+    );
+}
+
+#[test]
+fn total_metadata_budget_and_diagnostic_count_are_bounded() {
+    fn header(metadata: u64) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4655_4747_u32.to_le_bytes());
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&metadata.to_le_bytes());
+        bytes
+    }
+    let root = TestDir::new();
+    for index in 0..5 {
+        root.file(&format!("budget-{index}.gguf"), &header(16_000));
+    }
+    for index in 0..(MAX_CATALOG_DIAGNOSTICS + 20) {
+        root.file(
+            &format!("diagnostic-{index}.gguf"),
+            &metadata_gguf(MetadataValue::U32(index as u32)),
+        );
+    }
+    let result = scan(root.path());
+    assert!(!result.complete);
+    assert_eq!(result.diagnostics.len(), MAX_CATALOG_DIAGNOSTICS);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("total metadata entry budget"))
+    );
+}
+
+#[test]
+fn discovered_file_and_model_counts_are_globally_bounded() {
+    let root = TestDir::new();
+    for index in 0..=MAX_DISCOVERED_GGUF_FILES {
+        root.file(&format!("model-{index:05}.gguf"), b"x");
+    }
+    let result = scan(root.path());
+    assert!(!result.complete);
+    assert!(result.models.len() <= MAX_DISCOVERED_MODELS);
+    assert!(result.diagnostics.len() <= MAX_CATALOG_DIAGNOSTICS);
 }
 
 #[test]
@@ -391,6 +559,81 @@ fn reconciliation_retains_user_key_and_reconnects_a_moved_file() {
     assert_eq!(second.config.models[0].id, id);
     assert_eq!(second.config.models[0].key.as_str(), "my-custom-key");
     assert_eq!(second.config.models[0].path, moved);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn hardlinks_are_distinct_records_and_do_not_reuse_new_uuid() {
+    let root = TestDir::new();
+    let first = root.file("first.gguf", &tiny_gguf("Hardlinked"));
+    fs::hard_link(&first, root.path().join("second.gguf")).unwrap();
+    let output = reconcile_catalog(
+        &LauncherConfig::default(),
+        scan(root.path()),
+        Default::default(),
+    );
+    assert_eq!(output.config.models.len(), 2);
+    assert_ne!(output.config.models[0].id, output.config.models[1].id);
+    assert_ne!(output.config.models[0].key, output.config.models[1].key);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn identity_fingerprint_changes_when_same_inode_contents_change() {
+    use std::io::Write as _;
+    let root = TestDir::new();
+    let path = root.file("mutable.gguf", &tiny_gguf("Before"));
+    let before = CatalogIdentity::for_path(&path);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .write_all(b"change")
+        .unwrap();
+    let after = CatalogIdentity::for_path(&path);
+    assert_ne!(before, after);
+}
+
+#[cfg(unix)]
+#[test]
+fn reused_inode_with_changed_fingerprint_does_not_inherit_saved_settings() {
+    let root = TestDir::new();
+    root.file("old.gguf", &tiny_gguf("Old"));
+    let mut saved = reconcile_catalog(
+        &LauncherConfig::default(),
+        scan(root.path()),
+        Default::default(),
+    )
+    .config;
+    saved.models[0].key = ModelKey::parse("old-user-key").unwrap();
+    let old_id = saved.models[0].id;
+    let changed_identity = match saved.models[0].file_identity.clone() {
+        CatalogIdentity::Unix {
+            device,
+            inode_fingerprint,
+        } => CatalogIdentity::Unix {
+            device,
+            inode_fingerprint: inode_fingerprint.wrapping_add(1),
+        },
+        CatalogIdentity::Unavailable | CatalogIdentity::Windows { .. } => unreachable!(),
+    };
+    let scan = model_launcher_core::ScanResult {
+        complete: true,
+        diagnostics: Vec::new(),
+        models: vec![model_launcher_core::ScannedModel {
+            display_name: "Replacement".into(),
+            path: root.path().join("new.gguf"),
+            size_bytes: saved.models[0].size_bytes + 1,
+            identity: changed_identity,
+            metadata: Default::default(),
+        }],
+    };
+    let output = reconcile_catalog(&saved, scan, Default::default());
+    assert_eq!(output.config.models.len(), 2);
+    assert_eq!(output.config.models[0].id, old_id);
+    assert_eq!(output.config.models[0].state, ModelState::Missing);
+    assert_ne!(output.config.models[1].id, old_id);
+    assert_ne!(output.config.models[1].key.as_str(), "old-user-key");
 }
 
 #[test]
@@ -450,6 +693,52 @@ fn service_does_not_save_an_incomplete_scan() {
         .unwrap();
     assert!(!failed.diagnostics.is_empty());
     assert_eq!(store.load().unwrap(), initial.config);
+}
+
+#[test]
+fn concurrent_user_edit_and_catalog_reconcile_are_both_preserved() {
+    use std::sync::{Arc, Barrier};
+    let models = TestDir::new();
+    models.file("model.gguf", &tiny_gguf("Concurrent"));
+    let config = TestDir::new();
+    let store = ConfigStore::new(config.path());
+    let service = CatalogService::new(models.path(), store.clone());
+    service.reconcile_now().unwrap();
+    let scanned = scan(models.path());
+    let barrier = Arc::new(Barrier::new(3));
+
+    let edit_store = store.clone();
+    let edit_barrier = barrier.clone();
+    let edit = std::thread::spawn(move || {
+        edit_barrier.wait();
+        edit_store.update(|latest| {
+            latest.models[0].key = ModelKey::parse("user-concurrent-key")?;
+            latest.models[0].launch_profile.settings.context_length =
+                Some(ContextLength::new(4096)?);
+            Ok(())
+        })
+    });
+    let reconcile_barrier = barrier.clone();
+    let reconcile = std::thread::spawn(move || {
+        reconcile_barrier.wait();
+        service.reconcile_scan(scanned)
+    });
+    barrier.wait();
+    edit.join().unwrap().unwrap();
+    reconcile.join().unwrap().unwrap();
+
+    let saved = store.load().unwrap();
+    assert_eq!(saved.models[0].key.as_str(), "user-concurrent-key");
+    assert_eq!(
+        saved.models[0]
+            .launch_profile
+            .settings
+            .context_length
+            .unwrap()
+            .get(),
+        4096
+    );
+    assert_eq!(saved.models[0].state, ModelState::Available);
 }
 
 #[test]
@@ -522,6 +811,53 @@ async fn watcher_errors_reach_service_diagnostics() {
             .iter()
             .any(|item| item.message.contains("backend stopped"))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn watch_storm_returns_at_hard_latency_even_without_quiet() {
+    let models = TestDir::new();
+    let config = TestDir::new();
+    let service = CatalogService::new(models.path(), ConfigStore::new(config.path()));
+    let (sender, mut receiver) = catalog_watch_channel_with_limits(
+        Duration::from_millis(100),
+        Duration::from_millis(350),
+        8,
+    );
+    sender.emit(CatalogWatchEvent::Rescan);
+    let task = tokio::spawn(async move { service.process_next(&mut receiver).await });
+    tokio::task::yield_now().await;
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_millis(90)).await;
+        sender.emit(CatalogWatchEvent::Rescan);
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(79)).await;
+    assert!(!task.is_finished());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(task.await.unwrap().unwrap().is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn bounded_watch_channel_reports_overflow_and_caps_diagnostics() {
+    let models = TestDir::new();
+    let config = TestDir::new();
+    let service = CatalogService::new(models.path(), ConfigStore::new(config.path()));
+    let (sender, mut receiver) =
+        catalog_watch_channel_with_limits(Duration::from_millis(10), Duration::from_millis(100), 2);
+    for index in 0..100 {
+        sender.emit(CatalogWatchEvent::Error(format!("watch error {index}")));
+    }
+    let task = tokio::spawn(async move { service.process_next(&mut receiver).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let output = task.await.unwrap().unwrap().unwrap();
+    assert!(
+        output
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("dropped 98"))
+    );
+    assert!(output.diagnostics.len() <= WATCH_MAX_BATCH_DIAGNOSTICS + 1);
 }
 
 #[tokio::test]
