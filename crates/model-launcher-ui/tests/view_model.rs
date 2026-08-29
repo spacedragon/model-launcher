@@ -65,6 +65,25 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
 }
 
 #[test]
+fn model_search_matches_name_key_and_path_case_insensitively() {
+    let mut alpha = model("Alpha Chat", 1);
+    alpha.key = ModelKey::parse("team/assistant").unwrap();
+    alpha.path = PathBuf::from("/models/Research/alpha.gguf");
+    let beta = model("Beta", 1);
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![alpha.clone(), beta],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+    });
+
+    assert_eq!(vm.filtered_rows("CHAT")[0].id, alpha.id);
+    assert_eq!(vm.filtered_rows("assistant")[0].id, alpha.id);
+    assert_eq!(vm.filtered_rows("research")[0].id, alpha.id);
+    assert!(vm.filtered_rows("missing").is_empty());
+}
+
+#[test]
 fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
     let active = model("Active", 1);
     let other = model("Other", 1);

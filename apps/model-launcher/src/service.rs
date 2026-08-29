@@ -191,6 +191,7 @@ impl Service {
             }
             Authentication::Disabled => None,
         };
+        let (changes, _) = watch::channel(0_u64);
         let watcher = options
             .watch_catalog
             .then(|| CatalogWatcher::watch(&options.catalog_dir, Duration::from_millis(250)))
@@ -246,6 +247,7 @@ impl Service {
             let watcher_mutation = mutation.clone();
             let watcher_shutdown = shutdown.clone();
             let watcher_barrier = watcher_barrier.clone();
+            let watcher_changes = changes.clone();
             let task = tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -256,7 +258,10 @@ impl Service {
                             let _gate=watcher_mutation.lock().await;
                             if !matches!(*watcher_shutdown.lock().await, ShutdownState::Running) { break; }
                             if let Some(barrier)=&watcher_barrier && matches!(barrier.point, WatcherBarrierPoint::InsideGate) { barrier.pause().await; }
-                            if let Ok(result)=catalog.process_batch(batch) { *watcher_models.write().expect("model lock poisoned") = result.config; }
+                            if let Ok(result)=catalog.process_batch(batch) {
+                                *watcher_models.write().expect("model lock poisoned") = result.config;
+                                watcher_changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+                            }
                         }
                     }
                 }
@@ -284,6 +289,7 @@ impl Service {
             shutdown_timeout: options.shutdown_timeout,
             events,
             shutdown_result,
+            changes,
             mutation,
             resources: Mutex::new(Resources {
                 gateway: Some(gateway),
@@ -400,6 +406,7 @@ impl ServiceHandle {
             .write()
             .expect("model lock poisoned")
             .auth_token_hashes = latest.auth_token_hashes;
+        self.inner.changed();
         Ok(created)
     }
     pub async fn save_engine_settings(
@@ -424,6 +431,7 @@ impl ServiceHandle {
         config.engine_executable = latest.engine_executable;
         manager.apply(distribution, executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
+        self.inner.changed();
         Ok(caps)
     }
     pub async fn load(&self, id: model_launcher_core::ModelId) -> Result<(), ServiceError> {
@@ -439,6 +447,7 @@ impl ServiceHandle {
             .ok_or(AppError::ModelNotFound)?;
         self.inner.lifecycle.load(model).await?;
         self.inner.record_recent(id);
+        self.inner.changed();
         Ok(())
     }
     pub async fn load_model_with_profile(
@@ -488,6 +497,7 @@ impl ServiceHandle {
         *self.inner.models.write().expect("model lock poisoned") = next;
         self.inner.lifecycle.load(model).await?;
         self.inner.record_recent(id);
+        self.inner.changed();
         Ok(())
     }
     pub async fn eject(&self) -> Result<(), ServiceError> {
@@ -500,6 +510,9 @@ impl ServiceHandle {
     pub fn subscribe_lifecycle(&self) -> watch::Receiver<LifecycleSnapshot> {
         self.inner.lifecycle.subscribe()
     }
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.inner.changes.subscribe()
+    }
     pub async fn rescan(&self, catalog_dir: PathBuf) -> Result<ReconcileResult, ServiceError> {
         let _mutation = self.inner.mutation.lock().await;
         if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
@@ -507,6 +520,7 @@ impl ServiceHandle {
         }
         let result = CatalogService::new(catalog_dir, self.inner.store.clone()).reconcile_now()?;
         *self.inner.models.write().expect("model lock poisoned") = result.config.clone();
+        self.inner.changed();
         Ok(result)
     }
     pub async fn shutdown(&self) -> Result<(), ServiceError> {
@@ -567,12 +581,18 @@ struct Inner {
     shutdown_timeout: Duration,
     events: broadcast::Sender<ShutdownEvent>,
     shutdown_result: watch::Sender<Option<Result<(), ShutdownFailure>>>,
+    changes: watch::Sender<u64>,
     mutation: Arc<Mutex<()>>,
     resources: Mutex<Resources>,
     shutdown: Arc<Mutex<ShutdownState>>,
 }
 
 impl Inner {
+    fn changed(&self) {
+        self.changes
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     fn record_recent(&self, id: model_launcher_core::ModelId) {
         let mut recent = self.recent.write().expect("recent lock poisoned");
         recent.retain(|candidate| *candidate != id);

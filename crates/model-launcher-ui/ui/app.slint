@@ -9,6 +9,7 @@ export component MainWindow inherits Window {
     preferred-width: 840px; preferred-height: 620px; min-width: 400px; min-height: 420px;
     background: #F7F8FA;
     in property <[ModelDisplay]> models;
+    in-out property <string> search-query;
     in property <string> service-status: "Stopped";
     in property <string> base-url: "http://127.0.0.1:1234";
     in property <[string]> logs;
@@ -27,6 +28,7 @@ export component MainWindow inherits Window {
     callback rescan(); callback copy-text(string); callback export-logs(); callback save-settings(string, string, string);
     callback generate-token();
     callback filter-logs(string, string);
+    callback search-models(string);
 
     VerticalLayout { spacing: 0px;
         Rectangle {
@@ -52,7 +54,7 @@ export component MainWindow inherits Window {
             background: #F7F8FA;
             if root.page == 0: VerticalLayout {
                 padding: 16px; spacing: 10px;
-                HorizontalLayout { spacing: 8px; search := LineEdit { placeholder-text: "Search models"; accessible-label: "Search models"; } Button { text: "Rescan"; clicked => { root.rescan(); } } }
+                HorizontalLayout { spacing: 8px; search := LineEdit { text <=> root.search-query; placeholder-text: "Search models"; accessible-label: "Search models"; edited => { root.search-models(self.text); } } Button { text: "Rescan"; clicked => { root.rescan(); } } }
                 Rectangle { background: #FFFFFF; border-radius: 6px; border-width: 1px; border-color: #E5E7EB;
                     ScrollView { VerticalLayout { spacing: 0px; for row in root.models: ModelRow { model: row; show-size: root.width >= 500px; show-path: root.width >= 720px; action(id) => { if row.action == "Eject" { root.eject-model(id); } else { root.selected-model-id=id; root.selected-model-key=row.key; root.load-dialog-open=true; } } } } }
                 }

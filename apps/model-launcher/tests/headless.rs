@@ -146,6 +146,32 @@ async fn recent_models_are_successful_mru_entries_with_stable_ids() {
 }
 
 #[tokio::test]
+async fn service_change_subscription_observes_catalog_and_profile_mutations() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    std::fs::write(temp.path().join("models/tiny.gguf"), b"GGUFtiny").unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let mut changes = handle.subscribe_changes();
+    let model = handle.snapshot().models[0].clone();
+    handle
+        .load_model_with_profile(model.id, model.key.to_string(), LaunchSettings::default())
+        .await
+        .unwrap();
+    changes.changed().await.unwrap();
+    assert!(*changes.borrow() > 0);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn service_persists_live_tokens_and_exposes_redacted_logs() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();

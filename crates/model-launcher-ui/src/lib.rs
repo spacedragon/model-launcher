@@ -40,7 +40,7 @@ pub fn run_desktop(
 ) -> Result<(), slint::PlatformError> {
     use slint::{ComponentHandle as _, ModelRc, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
-    let rows = display_rows(&view_model);
+    let rows = display_rows(&view_model, "");
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
@@ -49,6 +49,7 @@ pub fn run_desktop(
     window.set_logs(log_lines((actions.logs)(LogFilter::default())));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
+    install_model_search(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -159,6 +160,7 @@ impl WindowManager {
         let view_model = ViewModel::from_snapshot((self.actions.snapshot)());
         window.set_models(ModelRc::from(Rc::new(VecModel::from(display_rows(
             &view_model,
+            window.get_search_query().as_str(),
         )))));
         window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
         window.set_logs(log_lines((self.actions.logs)(LogFilter::default())));
@@ -179,7 +181,7 @@ fn create_window(
 ) -> Result<MainWindow, slint::PlatformError> {
     use slint::{ComponentHandle as _, ModelRc, VecModel};
     let view_model = ViewModel::from_snapshot(snapshot);
-    let rows = display_rows(&view_model);
+    let rows = display_rows(&view_model, "");
     let window = MainWindow::new()?;
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
@@ -188,6 +190,7 @@ fn create_window(
     window.set_logs(log_lines((actions.logs)(LogFilter::default())));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
+    install_model_search(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -231,10 +234,10 @@ fn create_window(
     Ok(window)
 }
 
-fn display_rows(view_model: &ViewModel) -> Vec<ModelDisplay> {
+fn display_rows(view_model: &ViewModel, query: &str) -> Vec<ModelDisplay> {
     view_model
-        .rows()
-        .iter()
+        .filtered_rows(query)
+        .into_iter()
         .map(|row| {
             let action = view_model.action(row.id);
             let (label, enabled) = match action {
@@ -254,6 +257,20 @@ fn display_rows(view_model: &ViewModel) -> Vec<ModelDisplay> {
             }
         })
         .collect()
+}
+
+fn install_model_search(window: &MainWindow, actions: UiActions) {
+    use slint::{ComponentHandle as _, ModelRc, VecModel};
+    let weak = window.as_weak();
+    window.on_search_models(move |query| {
+        let view_model = ViewModel::from_snapshot((actions.snapshot)());
+        if let Some(window) = weak.upgrade() {
+            window.set_models(ModelRc::from(Rc::new(VecModel::from(display_rows(
+                &view_model,
+                query.as_str(),
+            )))));
+        }
+    });
 }
 
 fn log_lines(records: Vec<LogRecord>) -> slint::ModelRc<slint::SharedString> {
@@ -351,8 +368,35 @@ thread_local! {
 struct WindowsDesktop {
     windows: WindowManager,
     tray: tray::NativeTray,
-    _refresh: slint::Timer,
 }
+
+#[cfg(windows)]
+pub fn request_refresh() {
+    let _ = slint::invoke_from_event_loop(|| {
+        DESKTOP.with_borrow(|desktop| {
+            if let Some(desktop) = desktop.as_ref() {
+                desktop.windows.refresh();
+                let snapshot = (desktop.windows.actions.snapshot)();
+                let active = snapshot
+                    .lifecycle
+                    .desired_model
+                    .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
+                    .map(|model| model.display_name.as_str());
+                let recent: Vec<_> = snapshot
+                    .recent_models
+                    .iter()
+                    .map(|model| (model.id, model.display_name.clone()))
+                    .collect();
+                desktop
+                    .tray
+                    .update(&format!("{:?}", snapshot.lifecycle.state), active, &recent);
+            }
+        });
+    });
+}
+
+#[cfg(not(windows))]
+pub fn request_refresh() {}
 
 #[cfg(windows)]
 fn dispatch_windows(command: TrayCommand) {
@@ -410,39 +454,7 @@ pub fn run_desktop(
     .map_err(|error| slint::PlatformError::Other(error.to_string()))?;
     let mut windows = WindowManager::new(address, actions);
     windows.open()?;
-    let refresh = slint::Timer::default();
-    refresh.start(
-        slint::TimerMode::Repeated,
-        std::time::Duration::from_millis(500),
-        || {
-            DESKTOP.with_borrow(|desktop| {
-                if let Some(desktop) = desktop.as_ref() {
-                    desktop.windows.refresh();
-                    let snapshot = (desktop.windows.actions.snapshot)();
-                    let active = snapshot
-                        .lifecycle
-                        .desired_model
-                        .and_then(|id| snapshot.models.iter().find(|model| model.id == id))
-                        .map(|model| model.display_name.as_str());
-                    let recent: Vec<_> = snapshot
-                        .recent_models
-                        .iter()
-                        .map(|model| (model.id, model.display_name.clone()))
-                        .collect();
-                    desktop.tray.update(
-                        &format!("{:?}", snapshot.lifecycle.state),
-                        active,
-                        &recent,
-                    );
-                }
-            });
-        },
-    );
-    DESKTOP.set(Some(WindowsDesktop {
-        windows,
-        tray,
-        _refresh: refresh,
-    }));
+    DESKTOP.set(Some(WindowsDesktop { windows, tray }));
     let result = slint::run_event_loop_until_quit();
     DESKTOP.set(None);
     result
@@ -516,6 +528,20 @@ impl ViewModel {
     #[must_use]
     pub fn rows(&self) -> &[ModelRow] {
         &self.rows
+    }
+
+    #[must_use]
+    pub fn filtered_rows(&self, query: &str) -> Vec<&ModelRow> {
+        let query = query.trim().to_lowercase();
+        self.rows
+            .iter()
+            .filter(|row| {
+                query.is_empty()
+                    || row.name.to_lowercase().contains(&query)
+                    || row.key.to_lowercase().contains(&query)
+                    || row.path.to_lowercase().contains(&query)
+            })
+            .collect()
     }
 
     #[must_use]

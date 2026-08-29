@@ -161,6 +161,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }),
     };
+    runtime_handle.spawn({
+        let handle = handle.clone();
+        async move {
+            let mut lifecycle = handle.subscribe_lifecycle();
+            let mut changes = handle.subscribe_changes();
+            let mut logs = handle.log_store().subscribe();
+            let mut log_poll = tokio::time::interval(Duration::from_millis(100));
+            loop {
+                let refresh = tokio::select! {
+                    changed = lifecycle.changed() => changed.is_ok(),
+                    changed = changes.changed() => changed.is_ok(),
+                    _ = log_poll.tick() => logs.try_recv().is_ok(),
+                };
+                if !refresh {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(35)).await;
+                model_launcher_ui::request_refresh();
+            }
+        }
+    });
     run_desktop(
         AppSnapshot {
             models: snapshot.models,
