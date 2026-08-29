@@ -6,6 +6,7 @@ use axum::{
     response::Response,
     routing::post,
 };
+use fake_llama_server::FakeServer;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
     ApiModel, Authentication, Gateway, GatewayConfig, GatewayConfigError, GatewayLimits,
@@ -378,6 +379,31 @@ async fn proxy_preserves_raw_bytes_and_safe_headers() {
     assert!(got.3.is_none());
     stop(lifecycle, server).await;
     task.abort();
+}
+
+#[tokio::test]
+async fn controllable_fake_upstream_preserves_split_non_utf8_sse_bytes() {
+    let upstream = FakeServer::spawn().await.unwrap();
+    let (lifecycle, server) = start(Authentication::Disabled, upstream.base_url()).await;
+    let response = reqwest::Client::new()
+        .post(format!(
+            "http://{}/v1/chat/completions",
+            server.local_addr()
+        ))
+        .header("x-fake-mode", "sse")
+        .body(r#"{"model":"acme/tiny"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "text/event-stream");
+    assert_eq!(
+        response.bytes().await.unwrap(),
+        Bytes::from_static(b"data: a\xff\x00\n\n")
+    );
+    assert_eq!(upstream.control.requests(), 1);
+    assert_eq!(upstream.control.stream_drops(), 1);
+    stop(lifecycle, server).await;
+    upstream.stop().await.unwrap();
 }
 
 #[tokio::test]

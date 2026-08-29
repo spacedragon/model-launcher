@@ -684,6 +684,7 @@ dependencies = [
  "argon2",
  "axum",
  "bytes",
+ "fake-llama-server",
  "futures-util",
  "http-body-util",
  "model-launcher-core",

@@ -11,3 +11,7 @@ bytes = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 http-body-util = "0.1"
+
+[lib]
+name = "fake_llama_server"
+path = "src/lib.rs"

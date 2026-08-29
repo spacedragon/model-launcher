@@ -24,3 +24,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+fake-llama-server = { path = "../../tests/fake-llama-server" }
