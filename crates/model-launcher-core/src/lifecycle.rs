@@ -1,10 +1,11 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{collections::HashSet, io, sync::Arc, time::Duration};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{AppError, EngineProcess, InferenceEngine, ModelId, ModelRecord};
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const HEALTHY_RESET: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,7 +54,7 @@ pub struct Lifecycle {
 impl Lifecycle {
     #[must_use]
     pub fn spawn(engine: Arc<dyn InferenceEngine>) -> Self {
-        let (commands, receiver) = mpsc::channel(32);
+        let (commands, receiver) = mpsc::unbounded_channel();
         let (snapshots, _) = watch::channel(LifecycleSnapshot::default());
         let handle = LifecycleHandle {
             commands,
@@ -81,7 +82,7 @@ impl Lifecycle {
 
 #[derive(Clone)]
 pub struct LifecycleHandle {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::UnboundedSender<Command>,
     snapshots: watch::Sender<LifecycleSnapshot>,
 }
 
@@ -90,7 +91,6 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Load { model, reply })
-            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -99,7 +99,6 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Acquire { model, reply })
-            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -108,7 +107,6 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Eject { reply })
-            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -117,7 +115,6 @@ impl LifecycleHandle {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(Command::Shutdown { reply })
-            .await
             .map_err(|_| AppError::EngineUnavailable)?;
         response.await.map_err(|_| AppError::EngineUnavailable)?
     }
@@ -134,8 +131,9 @@ impl LifecycleHandle {
 }
 
 pub struct InferenceLease {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::UnboundedSender<Command>,
     generation: u64,
+    id: u64,
     cancelled: watch::Receiver<bool>,
 }
 
@@ -154,8 +152,9 @@ impl InferenceLease {
 
 impl Drop for InferenceLease {
     fn drop(&mut self) {
-        let _ = self.commands.try_send(Command::Release {
+        let _ = self.commands.send(Command::Release {
             generation: self.generation,
+            id: self.id,
         });
     }
 }
@@ -171,6 +170,7 @@ enum Command {
     },
     Release {
         generation: u64,
+        id: u64,
     },
     Eject {
         reply: oneshot::Sender<Result<(), AppError>>,
@@ -185,19 +185,109 @@ enum ProcessEvent<T> {
     Command(Option<Command>),
 }
 
-async fn select_ready(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopDirective {
+    Continue,
+    Cancel,
+    Shutdown,
+}
+
+enum StopEvent {
+    Graceful(Result<(), AppError>),
+    Timeout,
+    Command(Option<Command>),
+}
+
+enum StartOutcome {
+    Ready(Box<dyn EngineProcess>),
+    ValidationFailed(AppError),
+    LoadFailed(AppError),
+    Cancelled,
+}
+
+enum ReadinessOutcome {
+    Ready,
+    Failed(AppError),
+    TimedOut,
+    Cancelled,
+}
+
+async fn await_readiness(
     process: &mut dyn EngineProcess,
-    commands: &mut mpsc::Receiver<Command>,
-) -> ProcessEvent<()> {
+    cancelled: &mut watch::Receiver<bool>,
+) -> ReadinessOutcome {
     tokio::select! {
-        result = process.wait_ready(READY_TIMEOUT) => ProcessEvent::Process(result),
-        command = commands.recv() => ProcessEvent::Command(command),
+        result = process.wait_ready(READY_TIMEOUT) => match result {
+            Ok(()) => ReadinessOutcome::Ready,
+            Err(error) => ReadinessOutcome::Failed(error),
+        },
+        () = tokio::time::sleep(READY_TIMEOUT) => ReadinessOutcome::TimedOut,
+        _ = cancelled.changed() => ReadinessOutcome::Cancelled,
+    }
+}
+
+async fn graceful_result(process: &mut dyn EngineProcess) -> Result<(), AppError> {
+    match tokio::time::timeout(STOP_TIMEOUT, process.graceful_shutdown()).await {
+        Ok(result) => result,
+        Err(_) => Err(load_error("graceful shutdown timed out")),
+    }
+}
+
+async fn launch_process(
+    engine: Arc<dyn InferenceEngine>,
+    model: ModelRecord,
+    mut cancelled: watch::Receiver<bool>,
+) -> StartOutcome {
+    let validation = engine.validate_launch(&model, &model.launch_profile.settings);
+    tokio::pin!(validation);
+    tokio::select! {
+        result = &mut validation => if let Err(error) = result {
+            return StartOutcome::ValidationFailed(error);
+        },
+        _ = cancelled.changed() => return StartOutcome::Cancelled,
+    }
+    if *cancelled.borrow() {
+        return StartOutcome::Cancelled;
+    }
+
+    // Spawn is deliberately allowed to finish after cancellation. Dropping an arbitrary engine's
+    // spawn future is not guaranteed to undo a child it already created; a stale returned process
+    // is instead cleaned up below before the task exits.
+    let mut process = match engine.spawn(&model, &model.launch_profile.settings).await {
+        Ok(process) => process,
+        Err(error) => return StartOutcome::LoadFailed(error),
+    };
+    if *cancelled.borrow() {
+        stop_owned_process(&mut *process).await;
+        return StartOutcome::Cancelled;
+    }
+
+    match await_readiness(&mut *process, &mut cancelled).await {
+        ReadinessOutcome::Ready => StartOutcome::Ready(process),
+        ReadinessOutcome::Failed(error) => {
+            stop_owned_process(&mut *process).await;
+            StartOutcome::LoadFailed(error)
+        }
+        ReadinessOutcome::TimedOut => {
+            stop_owned_process(&mut *process).await;
+            StartOutcome::LoadFailed(load_error("engine readiness timed out"))
+        }
+        ReadinessOutcome::Cancelled => {
+            stop_owned_process(&mut *process).await;
+            StartOutcome::Cancelled
+        }
+    }
+}
+
+async fn stop_owned_process(process: &mut dyn EngineProcess) {
+    if graceful_result(process).await.is_err() {
+        let _ = process.force_shutdown().await;
     }
 }
 
 async fn select_exit(
     process: &mut dyn EngineProcess,
-    commands: &mut mpsc::Receiver<Command>,
+    commands: &mut mpsc::UnboundedReceiver<Command>,
 ) -> ProcessEvent<i32> {
     tokio::select! {
         result = process.wait_for_exit() => ProcessEvent::Process(result),
@@ -207,19 +297,21 @@ async fn select_exit(
 
 struct Actor {
     engine: Arc<dyn InferenceEngine>,
-    commands_tx: mpsc::Sender<Command>,
-    commands: mpsc::Receiver<Command>,
+    commands_tx: mpsc::UnboundedSender<Command>,
+    commands: mpsc::UnboundedReceiver<Command>,
     snapshots: watch::Sender<LifecycleSnapshot>,
     snapshot: LifecycleSnapshot,
     desired: Option<ModelRecord>,
     failures: u32,
     lease_cancel: watch::Sender<bool>,
+    active_leases: HashSet<u64>,
+    next_lease_id: u64,
 }
 
 async fn run_actor(
     engine: Arc<dyn InferenceEngine>,
-    commands_tx: mpsc::Sender<Command>,
-    commands: mpsc::Receiver<Command>,
+    commands_tx: mpsc::UnboundedSender<Command>,
+    commands: mpsc::UnboundedReceiver<Command>,
     snapshots: watch::Sender<LifecycleSnapshot>,
 ) {
     let (lease_cancel, _) = watch::channel(false);
@@ -232,6 +324,8 @@ async fn run_actor(
         desired: None,
         failures: 0,
         lease_cancel,
+        active_leases: HashSet::new(),
+        next_lease_id: 1,
     };
     actor.stopped().await;
 }
@@ -285,41 +379,17 @@ impl Actor {
         self.desired = Some(model.clone());
         self.snapshot.diagnostic = None;
         self.set_state(LifecycleState::Starting);
-
-        if let Err(error) = self
-            .engine
-            .validate_launch(&model, &model.launch_profile.settings)
-            .await
-        {
-            self.snapshot.diagnostic = Some(error.to_string());
-            self.desired = None;
-            self.set_state(LifecycleState::FailedValidation);
-            fail_waiters(loads, acquires, error);
-            self.set_state(LifecycleState::Stopped);
-            return true;
-        }
-
-        let process = self
-            .engine
-            .spawn(&model, &model.launch_profile.settings)
-            .await;
-        let mut process = match process {
-            Ok(process) => process,
-            Err(error) => {
-                self.load_failed(loads, acquires, error);
-                return true;
-            }
-        };
-        self.snapshot.process = Some(ProcessContext {
-            model_id: model.id,
-            generation,
-        });
-        self.publish();
-
+        let (cancel, cancelled) = watch::channel(false);
+        let mut launch = tokio::spawn(launch_process(
+            self.engine.clone(),
+            model.clone(),
+            cancelled,
+        ));
         loop {
-            match select_ready(&mut *process, &mut self.commands).await {
-                ProcessEvent::Process(result) => match result {
-                    Ok(()) => {
+            tokio::select! {
+                outcome = &mut launch => match outcome.unwrap_or_else(|error| StartOutcome::LoadFailed(load_error(&error.to_string()))) {
+                    StartOutcome::Ready(process) => {
+                        self.snapshot.process = Some(ProcessContext { model_id: model.id, generation });
                         self.set_state(LifecycleState::Running);
                         for reply in loads.drain(..) {
                             let _ = reply.send(Ok(()));
@@ -327,12 +397,24 @@ impl Actor {
                         self.grant_acquires(&mut acquires, generation);
                         return Box::pin(self.running(process, model, generation)).await;
                     }
-                    Err(error) => {
+                    StartOutcome::ValidationFailed(error) => {
+                        self.snapshot.diagnostic = Some(error.to_string());
+                        self.desired = None;
+                        self.set_state(LifecycleState::FailedValidation);
+                        fail_waiters(loads, acquires, error);
+                        self.set_state(LifecycleState::Stopped);
+                        return true;
+                    }
+                    StartOutcome::LoadFailed(error) => {
                         self.load_failed(loads, acquires, error);
                         return true;
                     }
+                    StartOutcome::Cancelled => {
+                        fail_cancelled(loads, acquires);
+                        return true;
+                    }
                 },
-                ProcessEvent::Command(command) => match command {
+                command = self.commands.recv() => match command {
                     Some(Command::Load { model: same, reply }) if same.id == model.id => {
                         loads.push(reply)
                     }
@@ -340,14 +422,14 @@ impl Actor {
                         acquires.push(reply)
                     }
                     Some(Command::Eject { reply }) => {
-                        self.stop_process(&mut *process).await;
+                        cancel.send_replace(true);
                         self.clear_desired();
                         fail_cancelled(loads, acquires);
                         let _ = reply.send(Ok(()));
                         return true;
                     }
                     Some(Command::Shutdown { reply }) => {
-                        self.stop_process(&mut *process).await;
+                        cancel.send_replace(true);
                         self.clear_desired();
                         fail_cancelled(loads, acquires);
                         let _ = reply.send(Ok(()));
@@ -382,6 +464,7 @@ impl Actor {
                     };
                     self.snapshot.process = None;
                     self.snapshot.diagnostic = Some(diagnostic);
+                    self.cancel_leases();
                     if started.elapsed() >= HEALTHY_RESET {
                         self.failures = 0;
                     }
@@ -390,9 +473,12 @@ impl Actor {
                 }
                 ProcessEvent::Command(command) => match command {
                     Some(Command::Acquire { model: same, reply }) if same.id == model.id => {
-                        self.snapshot.in_flight += 1;
-                        self.publish();
-                        let _ = reply.send(Ok(self.lease(generation)));
+                        let lease = self.new_lease(generation);
+                        let id = lease.id;
+                        if reply.send(Ok(lease)).is_ok() {
+                            self.active_leases.insert(id);
+                            self.sync_in_flight();
+                        }
                     }
                     Some(Command::Load { model: same, reply }) if same.id == model.id => {
                         let _ = reply.send(Ok(()));
@@ -401,8 +487,13 @@ impl Actor {
                         if self.snapshot.in_flight > 0 {
                             let _ = reply.send(Err(AppError::ModelBusy));
                         } else {
-                            self.stop_process(&mut *process).await;
+                            let directive = self.stop_process(&mut *process).await;
                             self.failures = 0;
+                            if directive != StopDirective::Continue {
+                                let _ = reply.send(Err(load_error("replacement cancelled")));
+                                self.clear_desired();
+                                return directive != StopDirective::Shutdown;
+                            }
                             return Box::pin(self.start(next, vec![reply], Vec::new())).await;
                         }
                     }
@@ -411,17 +502,19 @@ impl Actor {
                     }
                     Some(Command::Release {
                         generation: released,
+                        id,
                     }) if released == generation => {
-                        self.snapshot.in_flight = self.snapshot.in_flight.saturating_sub(1);
-                        self.publish();
+                        if self.active_leases.remove(&id) {
+                            self.sync_in_flight();
+                        }
                     }
                     Some(Command::Release { .. }) => {}
                     Some(Command::Eject { reply }) => {
                         self.cancel_leases();
-                        self.stop_process(&mut *process).await;
+                        let directive = self.stop_process(&mut *process).await;
                         self.clear_desired();
                         let _ = reply.send(Ok(()));
-                        return true;
+                        return directive != StopDirective::Shutdown;
                     }
                     Some(Command::Shutdown { reply }) => {
                         self.cancel_leases();
@@ -461,7 +554,10 @@ impl Actor {
                         self.failures = 0;
                         return Box::pin(self.start(next, vec![reply], Vec::new())).await;
                     }
-                    Some(Command::Acquire { reply, .. }) => { let _ = reply.send(Err(AppError::ModelBusy)); }
+                    Some(Command::Acquire { model: next, reply }) => {
+                        self.failures = 0;
+                        return Box::pin(self.start(next, Vec::new(), vec![reply])).await;
+                    }
                     Some(Command::Release { .. }) => {}
                     Some(Command::Eject { reply }) => {
                         self.clear_desired();
@@ -485,34 +581,92 @@ impl Actor {
         generation: u64,
     ) {
         for reply in acquires.drain(..) {
-            self.snapshot.in_flight += 1;
-            let _ = reply.send(Ok(self.lease(generation)));
+            let lease = self.new_lease(generation);
+            let id = lease.id;
+            if reply.send(Ok(lease)).is_ok() {
+                self.active_leases.insert(id);
+            }
         }
-        self.publish();
+        self.sync_in_flight();
     }
 
-    fn lease(&self, generation: u64) -> InferenceLease {
+    fn new_lease(&mut self, generation: u64) -> InferenceLease {
+        let id = self.next_lease_id;
+        self.next_lease_id = self.next_lease_id.wrapping_add(1);
         InferenceLease {
             commands: self.commands_tx.clone(),
             generation,
+            id,
             cancelled: self.lease_cancel.subscribe(),
         }
+    }
+
+    fn sync_in_flight(&mut self) {
+        self.snapshot.in_flight = self.active_leases.len();
+        self.publish();
     }
 
     fn cancel_leases(&mut self) {
         self.lease_cancel.send_replace(true);
         let (lease_cancel, _) = watch::channel(false);
         self.lease_cancel = lease_cancel;
-        self.snapshot.in_flight = 0;
-        self.publish();
+        self.active_leases.clear();
+        self.sync_in_flight();
     }
 
-    async fn stop_process(&mut self, process: &mut dyn EngineProcess) {
+    async fn stop_process(&mut self, process: &mut dyn EngineProcess) -> StopDirective {
         self.set_state(LifecycleState::Stopping);
-        if process.graceful_shutdown().await.is_err() {
+        let mut directive = StopDirective::Continue;
+        let force = {
+            let graceful = process.graceful_shutdown();
+            tokio::pin!(graceful);
+            let timeout = tokio::time::sleep(STOP_TIMEOUT);
+            tokio::pin!(timeout);
+            loop {
+                let event = tokio::select! {
+                    result = &mut graceful => StopEvent::Graceful(result),
+                    () = &mut timeout => StopEvent::Timeout,
+                    command = self.commands.recv() => StopEvent::Command(command),
+                };
+                match event {
+                    StopEvent::Graceful(result) => break result.is_err(),
+                    StopEvent::Timeout => break true,
+                    StopEvent::Command(Some(Command::Release { id, .. })) => {
+                        if self.active_leases.remove(&id) {
+                            self.sync_in_flight();
+                        }
+                    }
+                    StopEvent::Command(Some(Command::Eject { reply })) => {
+                        if directive != StopDirective::Shutdown {
+                            directive = StopDirective::Cancel;
+                        }
+                        self.desired = None;
+                        self.publish();
+                        let _ = reply.send(Ok(()));
+                    }
+                    StopEvent::Command(Some(Command::Shutdown { reply })) => {
+                        directive = StopDirective::Shutdown;
+                        self.desired = None;
+                        self.publish();
+                        let _ = reply.send(Ok(()));
+                    }
+                    StopEvent::Command(Some(Command::Load { reply, .. })) => {
+                        let _ = reply.send(Err(AppError::ModelStarting));
+                    }
+                    StopEvent::Command(Some(Command::Acquire { reply, .. })) => {
+                        let _ = reply.send(Err(AppError::ModelStarting));
+                    }
+                    StopEvent::Command(None) => {
+                        directive = StopDirective::Shutdown;
+                    }
+                }
+            }
+        };
+        if force {
             let _ = process.force_shutdown().await;
         }
         self.snapshot.process = None;
+        directive
     }
 
     fn clear_desired(&mut self) {
@@ -533,8 +687,21 @@ impl Actor {
         self.snapshot.process = None;
         self.snapshot.diagnostic = Some(diagnostic.clone());
         self.desired = None;
-        fail_waiters(loads, acquires, load_error(&diagnostic));
+        fail_waiters_shared(loads, acquires, Arc::new(error));
         self.set_state(LifecycleState::Stopped);
+    }
+}
+
+fn fail_waiters_shared(
+    loads: Vec<oneshot::Sender<Result<(), AppError>>>,
+    acquires: Vec<oneshot::Sender<Result<InferenceLease, AppError>>>,
+    source: Arc<AppError>,
+) {
+    for reply in loads {
+        let _ = reply.send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
+    }
+    for reply in acquires {
+        let _ = reply.send(Err(AppError::ModelLoadFailed(Box::new(source.clone()))));
     }
 }
 

@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::{
     collections::VecDeque,
     io,
@@ -23,18 +24,24 @@ struct ScriptedEngine {
 struct FakeState {
     scripts: VecDeque<SpawnScript>,
     spawned: Vec<ModelId>,
+    validation_gate: Option<Arc<Notify>>,
+    spawn_gate: Option<Arc<Notify>>,
+    graceful_calls: usize,
+    force_calls: usize,
 }
 
 struct SpawnScript {
     ready: Arc<Notify>,
     ready_fails: Arc<AtomicBool>,
     exit_rx: oneshot::Receiver<i32>,
+    graceful_gate: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 struct SpawnControl {
     ready: Arc<Notify>,
     ready_fails: Arc<AtomicBool>,
     exit_tx: Option<oneshot::Sender<i32>>,
+    graceful_gate: Arc<Mutex<Option<Arc<Notify>>>>,
 }
 
 impl SpawnControl {
@@ -50,6 +57,12 @@ impl SpawnControl {
         self.ready_fails.store(true, Ordering::Release);
         self.ready.notify_waiters();
     }
+
+    fn block_graceful(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        *self.graceful_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
 }
 
 impl ScriptedEngine {
@@ -63,20 +76,40 @@ impl ScriptedEngine {
         let ready = Arc::new(Notify::new());
         let ready_fails = Arc::new(AtomicBool::new(false));
         let (exit_tx, exit_rx) = oneshot::channel();
+        let graceful_gate = Arc::new(Mutex::new(None));
         self.inner.lock().unwrap().scripts.push_back(SpawnScript {
             ready: ready.clone(),
             ready_fails: ready_fails.clone(),
             exit_rx,
+            graceful_gate: graceful_gate.clone(),
         });
         SpawnControl {
             ready,
             ready_fails,
             exit_tx: Some(exit_tx),
+            graceful_gate,
         }
     }
 
     fn spawn_count(&self) -> usize {
         self.inner.lock().unwrap().spawned.len()
+    }
+
+    fn block_validation(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.inner.lock().unwrap().validation_gate = Some(gate.clone());
+        gate
+    }
+
+    fn block_spawn(&self) -> Arc<Notify> {
+        let gate = Arc::new(Notify::new());
+        self.inner.lock().unwrap().spawn_gate = Some(gate.clone());
+        gate
+    }
+
+    fn shutdown_counts(&self) -> (usize, usize) {
+        let state = self.inner.lock().unwrap();
+        (state.graceful_calls, state.force_calls)
     }
 }
 
@@ -84,6 +117,8 @@ struct FakeProcess {
     ready: Arc<Notify>,
     ready_fails: Arc<AtomicBool>,
     exit_rx: oneshot::Receiver<i32>,
+    graceful_gate: Arc<Mutex<Option<Arc<Notify>>>>,
+    engine: ScriptedEngine,
 }
 
 impl InferenceEngine for ScriptedEngine {
@@ -100,7 +135,13 @@ impl InferenceEngine for ScriptedEngine {
         _model: &'a ModelRecord,
         _settings: &'a LaunchSettings,
     ) -> EngineFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        let gate = self.inner.lock().unwrap().validation_gate.clone();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn spawn<'a>(
@@ -109,6 +150,10 @@ impl InferenceEngine for ScriptedEngine {
         _settings: &'a LaunchSettings,
     ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
         Box::pin(async move {
+            let gate = self.inner.lock().unwrap().spawn_gate.clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             let mut state = self.inner.lock().unwrap();
             state.spawned.push(model.id);
             let script = state.scripts.pop_front().expect("scripted spawn");
@@ -116,6 +161,8 @@ impl InferenceEngine for ScriptedEngine {
                 ready: script.ready,
                 ready_fails: script.ready_fails,
                 exit_rx: script.exit_rx,
+                graceful_gate: script.graceful_gate,
+                engine: self.clone(),
             }) as Box<dyn EngineProcess>)
         })
     }
@@ -140,11 +187,21 @@ impl EngineProcess for FakeProcess {
     }
 
     fn graceful_shutdown(&mut self) -> EngineFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.engine.inner.lock().unwrap().graceful_calls += 1;
+            let gate = self.graceful_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(())
+        })
     }
 
     fn force_shutdown(&mut self) -> EngineFuture<'_, ()> {
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.engine.inner.lock().unwrap().force_calls += 1;
+            Ok(())
+        })
     }
 
     fn wait_for_exit(&mut self) -> EngineFuture<'_, i32> {
@@ -382,6 +439,290 @@ async fn concurrent_same_model_jit_acquires_share_one_load() {
     assert_eq!(engine.spawn_count(), 1);
     assert_eq!(handle.snapshot().in_flight, 2);
     drop((lease_one, lease_two));
+}
+
+#[tokio::test(start_paused = true)]
+async fn crash_cancels_and_clears_active_generation_leases() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let mut first = engine.script();
+    let _restart = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let acquire = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.acquire(model("a")).await }
+    });
+    settle().await;
+    first.ready();
+    let lease = acquire.await.unwrap().unwrap();
+    first.exit(9);
+    settle().await;
+
+    assert!(lease.is_cancelled());
+    assert_eq!(handle.snapshot().in_flight, 0);
+    drop(lease);
+    settle().await;
+    assert_eq!(handle.snapshot().in_flight, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_acquire_waiter_is_never_counted_as_in_flight() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let acquire = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.acquire(model("a")).await }
+    });
+    settle().await;
+    acquire.abort();
+    control.ready();
+    settle().await;
+    assert_eq!(handle.snapshot().in_flight, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn burst_lease_drops_cannot_lose_release_events() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    control.ready();
+    load.await.unwrap().unwrap();
+    let target = model("a");
+    // Same identity as the running model is required, so retain it from the snapshot through a
+    // fresh record with the exact id.
+    let running_id = handle.snapshot().desired_model.unwrap();
+    let mut target = target;
+    target.id = running_id;
+    let mut leases = Vec::new();
+    for _ in 0..100 {
+        leases.push(handle.acquire(target.clone()).await.unwrap());
+    }
+    assert_eq!(handle.snapshot().in_flight, 100);
+    drop(leases);
+    settle().await;
+    assert_eq!(handle.snapshot().in_flight, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn same_model_load_waiters_share_stable_failure() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let target = model("a");
+    let one = tokio::spawn({
+        let handle = handle.clone();
+        let target = target.clone();
+        async move { handle.load(target).await.unwrap_err() }
+    });
+    let two = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(target).await.unwrap_err() }
+    });
+    settle().await;
+    control.fail_ready();
+    let one = one.await.unwrap();
+    let two = two.await.unwrap();
+    assert_eq!(one.code(), "model_load_failed");
+    assert_eq!(two.code(), one.code());
+    assert_eq!(two.to_string(), one.to_string());
+}
+
+#[tokio::test(start_paused = true)]
+async fn acquire_different_model_during_backoff_switches_immediately() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let mut a_control = engine.script();
+    let b_control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let a = model("a");
+    let b = model("b");
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(a).await }
+    });
+    settle().await;
+    a_control.ready();
+    load.await.unwrap().unwrap();
+    a_control.exit(9);
+    settle().await;
+    let acquire = tokio::spawn({
+        let handle = handle.clone();
+        let b = b.clone();
+        async move { handle.acquire(b).await }
+    });
+    settle().await;
+    assert_eq!(engine.spawn_count(), 2);
+    b_control.ready();
+    assert!(acquire.await.unwrap().is_ok());
+    assert_eq!(handle.snapshot().desired_model, Some(b.id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_timeout_stops_owned_process_and_fails_load() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let _control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load = tokio::spawn(async move { handle.load(model("a")).await });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(30)).await;
+    settle().await;
+
+    assert!(load.is_finished());
+    assert_eq!(load.await.unwrap().unwrap_err().code(), "model_load_failed");
+    assert_eq!(engine.shutdown_counts().0, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_failure_stops_process_before_reporting_failure() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load = tokio::spawn(async move { handle.load(model("a")).await });
+    settle().await;
+    control.fail_ready();
+    let error = load.await.unwrap().unwrap_err();
+    assert_eq!(error.code(), "model_load_failed");
+    let mut sources = Vec::new();
+    let mut source = error.source();
+    while let Some(error) = source {
+        sources.push(error.to_string());
+        source = error.source();
+    }
+    assert!(sources.iter().any(|source| source == "readiness failed"));
+    assert_eq!(engine.shutdown_counts().0, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn eject_responds_while_validation_is_pending() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let _gate = engine.block_validation();
+    let _control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    let eject = tokio::spawn(async move { handle.eject().await });
+    settle().await;
+    assert!(eject.is_finished());
+    eject.await.unwrap().unwrap();
+    assert_eq!(lifecycle.handle().snapshot().state, LifecycleState::Stopped);
+    load.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn eject_responds_while_spawn_is_pending() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let _gate = engine.block_spawn();
+    let _control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    let eject = tokio::spawn(async move { handle.eject().await });
+    settle().await;
+    assert!(eject.is_finished());
+    eject.await.unwrap().unwrap();
+    load.abort();
+}
+
+#[tokio::test(start_paused = true)]
+async fn eject_responds_while_readiness_is_pending_and_cleans_process() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let _control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    handle.eject().await.unwrap();
+    settle().await;
+    assert_eq!(engine.shutdown_counts().0, 1);
+    assert_eq!(load.await.unwrap().unwrap_err().code(), "model_load_failed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn graceful_stop_timeout_forces_process_and_allows_replacement() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let a_control = engine.script();
+    let _gate = a_control.block_graceful();
+    let b_control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load_a = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    a_control.ready();
+    load_a.await.unwrap().unwrap();
+    let load_b = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("b")).await }
+    });
+    settle().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert_eq!(engine.shutdown_counts(), (1, 1));
+    assert_eq!(engine.spawn_count(), 2);
+    b_control.ready();
+    load_b.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_is_accepted_while_graceful_stop_is_pending() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let a_control = engine.script();
+    let _gate = a_control.block_graceful();
+    let _b_control = engine.script();
+    let lifecycle = Lifecycle::spawn(engine.clone());
+    let handle = lifecycle.handle();
+    let load_a = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("a")).await }
+    });
+    settle().await;
+    a_control.ready();
+    load_a.await.unwrap().unwrap();
+    let replacement = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("b")).await }
+    });
+    settle().await;
+    let shutdown = tokio::spawn(async move { handle.shutdown().await });
+    settle().await;
+    assert!(
+        shutdown.is_finished(),
+        "shutdown reply must not wait for stop timeout"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    settle().await;
+    assert!(shutdown.is_finished());
+    shutdown.await.unwrap().unwrap();
+    replacement.abort();
+    assert_eq!(
+        engine.spawn_count(),
+        1,
+        "shutdown cancels pending replacement"
+    );
 }
 
 #[test]
