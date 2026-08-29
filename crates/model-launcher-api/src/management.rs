@@ -1,4 +1,7 @@
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{State, rejection::JsonRejection},
+};
 use model_launcher_core::{BatchSize, ContextLength};
 use serde_json::{Value, json};
 use std::time::Instant;
@@ -11,8 +14,14 @@ pub(crate) async fn list(State(state): State<AppState>) -> Json<Value> {
 
 pub(crate) async fn load(
     State(state): State<AppState>,
-    Json(request): Json<LoadRequest>,
+    request: Result<Json<LoadRequest>, JsonRejection>,
 ) -> Result<Json<LoadResponse>, ApiError> {
+    let Json(request) = request.map_err(|_| {
+        ApiError::bad_request(
+            "invalid_request",
+            "request body does not match the API contract",
+        )
+    })?;
     let mut model = state.find_model(&request.model)?.record.clone();
     model.launch_profile.settings.context_length = request
         .context_length
@@ -42,8 +51,14 @@ pub(crate) async fn load(
 
 pub(crate) async fn unload(
     State(state): State<AppState>,
-    Json(request): Json<UnloadRequest>,
+    request: Result<Json<UnloadRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Json(request) = request.map_err(|_| {
+        ApiError::bad_request(
+            "invalid_request",
+            "request body does not match the API contract",
+        )
+    })?;
     let snapshot = state.lifecycle.snapshot();
     let Some(process) = snapshot.process else {
         return Err(ApiError::not_found(

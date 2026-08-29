@@ -255,7 +255,7 @@ impl ApiError {
             retry_after: false,
         }
     }
-    fn bad_request(code: &'static str, message: &'static str) -> Self {
+    pub(crate) fn bad_request(code: &'static str, message: &'static str) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, message)
     }
     fn payload(code: &'static str, message: &'static str) -> Self {

@@ -286,6 +286,18 @@ async fn lists_match_pinned_semantics() {
 }
 
 #[tokio::test]
+async fn server_handle_keeps_stable_address_and_graceful_stop_releases_listener() {
+    let (lifecycle, server) = start(Authentication::Disabled, "http://127.0.0.1:1".into()).await;
+    let address = server.local_addr();
+    assert_eq!(address, server.local_addr());
+    server.stop().await.unwrap();
+    let rebound = tokio::net::TcpListener::bind(address).await.unwrap();
+    drop(rebound);
+    lifecycle.handle().shutdown().await.unwrap();
+    lifecycle.wait_for_termination().await;
+}
+
+#[tokio::test]
 async fn management_load_echo_unload_and_errors_match_contracts() {
     let (lifecycle, server) = start(Authentication::Disabled, "http://127.0.0.1:1".into()).await;
     let client = reqwest::Client::new();
@@ -338,7 +350,11 @@ async fn management_load_echo_unload_and_errors_match_contracts() {
         .send()
         .await
         .unwrap();
-    assert_eq!(extra.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(extra.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extra.json::<Value>().await.unwrap()["error"]["code"],
+        "invalid_request"
+    );
 
     let mismatch = client
         .post(format!("{base}/api/v1/models/unload"))
