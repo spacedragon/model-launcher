@@ -114,7 +114,7 @@ fn validate_phc(encoded: &str) -> Result<(), argon2::password_hash::Error> {
         .params
         .get_decimal("p")
         .ok_or(argon2::password_hash::Error::ParamNameInvalid)?;
-    if !(8192..=262144).contains(&m) || !(1..=10).contains(&t) || !(1..=8).contains(&p) {
+    if !(8192..=65536).contains(&m) || !(1..=10).contains(&t) || !(1..=8).contains(&p) {
         return Err(argon2::password_hash::Error::ParamsMaxExceeded);
     }
     let salt = parsed

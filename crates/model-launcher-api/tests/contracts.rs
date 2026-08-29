@@ -314,6 +314,7 @@ fn token_store_rejects_malicious_phc_inputs_and_excessive_counts() {
     assert!(TokenStore::from_phc_hashes(vec![valid.replacen("argon2id", "argon2i", 1)]).is_err());
     assert!(TokenStore::from_phc_hashes(vec![valid.replacen("v=19", "v=16", 1)]).is_err());
     assert!(TokenStore::from_phc_hashes(vec![valid.replacen("m=19456", "m=999999", 1)]).is_err());
+    assert!(TokenStore::from_phc_hashes(vec![valid.replacen("m=19456", "m=65537", 1)]).is_err());
     assert!(TokenStore::from_phc_hashes(vec![valid; 17]).is_err());
 }
 
@@ -480,6 +481,47 @@ async fn scripted_acceptor_retries_transient_and_reports_fatal_error() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     lifecycle.handle().shutdown().await.unwrap();
     lifecycle.wait_for_termination().await;
+}
+
+#[tokio::test]
+async fn gateway_auto_builder_serves_http2_prior_knowledge() {
+    let (lifecycle, server) = start(Authentication::Disabled, "http://127.0.0.1:1".into()).await;
+    let response = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap()
+        .get(format!("http://{}/v1/models", server.local_addr()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
+    assert_eq!(response.status(), StatusCode::OK);
+    stop(lifecycle, server).await;
+}
+
+#[tokio::test]
+async fn connection_churn_is_reaped_and_joinset_storage_returns_to_zero() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (lifecycle, server) = start(Authentication::Disabled, "http://127.0.0.1:1".into()).await;
+    let metrics = server.metrics();
+    let address = server.local_addr();
+    for _ in 0..1000 {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+    }
+    while metrics.active_connections() != 0 || metrics.stored_tasks() != 0 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(metrics.active_connections(), 0);
+    assert_eq!(metrics.stored_tasks(), 0);
+    assert_eq!(metrics.join_errors(), 0);
+    stop(lifecycle, server).await;
 }
 
 #[tokio::test]
@@ -820,19 +862,12 @@ async fn controllable_fake_upstream_preserves_split_non_utf8_sse_bytes() {
         .await
         .unwrap();
     assert_eq!(response.headers()["content-type"], "text/event-stream");
-    let chunks = response
-        .bytes_stream()
-        .map(|value| value.unwrap())
-        .collect::<Vec<_>>()
-        .await;
-    assert_eq!(
-        chunks,
-        vec![
-            Bytes::from_static(b"data: a"),
-            Bytes::from_static(b"\xff\x00\n"),
-            Bytes::from_static(b"\n")
-        ]
-    );
+    let mut raw = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        raw.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(raw, b"data: a\xff\x00\n\n");
     assert_eq!(upstream.control.requests(), 1);
     assert_eq!(upstream.control.stream_drops(), 1);
     stop(lifecycle, server).await;

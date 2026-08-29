@@ -8,7 +8,10 @@ pub use models::*;
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -270,13 +273,15 @@ impl Gateway {
         let (shutdown, stop) = oneshot::channel();
         let grace = self.config.limits.shutdown_grace;
         let permits = Arc::new(Semaphore::new(self.config.limits.max_connections));
+        let metrics = Arc::new(ServerMetrics::default());
         let router = self.router();
-        let task = tokio::spawn(run_server(acceptor, router, permits, stop));
+        let task = tokio::spawn(run_server(acceptor, router, permits, stop, metrics.clone()));
         Ok(GatewayServer {
             address,
             shutdown: Some(shutdown),
             task: Some(task),
             grace,
+            metrics,
         })
     }
 }
@@ -286,11 +291,32 @@ pub struct GatewayServer {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     grace: Duration,
+    metrics: Arc<ServerMetrics>,
+}
+#[derive(Default)]
+pub struct ServerMetrics {
+    active: AtomicUsize,
+    stored: AtomicUsize,
+    join_errors: AtomicUsize,
+}
+impl ServerMetrics {
+    pub fn active_connections(&self) -> usize {
+        self.active.load(Ordering::SeqCst)
+    }
+    pub fn stored_tasks(&self) -> usize {
+        self.stored.load(Ordering::SeqCst)
+    }
+    pub fn join_errors(&self) -> usize {
+        self.join_errors.load(Ordering::SeqCst)
+    }
 }
 impl GatewayServer {
     #[must_use]
     pub const fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+    pub fn metrics(&self) -> Arc<ServerMetrics> {
+        self.metrics.clone()
     }
     pub async fn stop(mut self) -> std::io::Result<()> {
         if let Some(stop) = self.shutdown.take() {
@@ -464,12 +490,14 @@ async fn run_server(
     router: Router,
     permits: Arc<Semaphore>,
     mut stop: oneshot::Receiver<()>,
+    metrics: Arc<ServerMetrics>,
 ) -> std::io::Result<()> {
     let mut connections = JoinSet::new();
     let (connection_stop, _) = tokio::sync::watch::channel(false);
     loop {
         let accepted = tokio::select! {
             _ = &mut stop => break,
+            joined = connections.join_next(), if !connections.is_empty() => { metrics.stored.fetch_sub(1,Ordering::SeqCst); if joined.is_some_and(|value|value.is_err()){metrics.join_errors.fetch_add(1,Ordering::SeqCst);} continue; },
             value = accept_one(acceptor.as_ref(), permits.clone()) => value,
         };
         let (stream, permit) = match accepted {
@@ -487,25 +515,34 @@ async fn run_server(
         };
         let app = router.clone();
         let mut connection_stop = connection_stop.subscribe();
+        metrics.active.fetch_add(1, Ordering::SeqCst);
+        metrics.stored.fetch_add(1, Ordering::SeqCst);
+        let task_metrics = metrics.clone();
         connections.spawn(async move {
-            let service = hyper::service::service_fn(
+            let service = tower::service_fn(
                 move |request: hyper::Request<hyper::body::Incoming>| {
                     let app = app.clone();
                     async move { app.oneshot(request.map(Body::new)).await }
                 },
             );
-            let connection = hyper::server::conn::http1::Builder::new()
-                .serve_connection(hyper_util::rt::TokioIo::new(stream), service);
+            let builder=hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            let connection = builder.serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_util::service::TowerToHyperService::new(service));
             tokio::pin!(connection);
             tokio::select! {
                 _ = &mut connection => {},
                 _ = connection_stop.changed() => { connection.as_mut().graceful_shutdown(); let _ = connection.await; }
             }
             drop(permit);
+            task_metrics.active.fetch_sub(1,Ordering::SeqCst);
         });
     }
     let _ = connection_stop.send(true);
-    while connections.join_next().await.is_some() {}
+    while let Some(joined) = connections.join_next().await {
+        metrics.stored.fetch_sub(1, Ordering::SeqCst);
+        if joined.is_err() {
+            metrics.join_errors.fetch_add(1, Ordering::SeqCst);
+        }
+    }
     Ok(())
 }
 
