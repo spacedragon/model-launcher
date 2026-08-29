@@ -45,6 +45,11 @@ pub fn load_request_for(snapshot: &AppSnapshot, id: ModelId) -> Option<UiLoadReq
         })
 }
 
+#[must_use]
+pub fn load_dialog_values_for(snapshot: &AppSnapshot, id: ModelId) -> Option<UiLoadRequest> {
+    load_request_for(snapshot, id)
+}
+
 #[cfg(not(windows))]
 pub fn run_desktop(
     snapshot: AppSnapshot,
@@ -63,6 +68,7 @@ pub fn run_desktop(
     set_logs(&window, (actions.logs)(LogFilter::default()));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
+    install_prepare_load(&window, actions.clone());
     install_model_search(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
@@ -281,6 +287,7 @@ fn create_window(
     set_logs(&window, (actions.logs)(LogFilter::default()));
     hydrate_engine_settings(&window, (actions.engine_settings)());
     install_load_callback(&window, actions.clone());
+    install_prepare_load(&window, actions.clone());
     install_model_search(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
@@ -384,6 +391,45 @@ fn install_model_search(window: &MainWindow, actions: UiActions) {
                 query.as_str(),
             )))));
         }
+    });
+}
+
+fn install_prepare_load(window: &MainWindow, actions: UiActions) {
+    use slint::ComponentHandle as _;
+    let weak = window.as_weak();
+    window.on_prepare_load(move |raw| {
+        let Ok(uuid) = uuid::Uuid::parse_str(&raw) else {
+            return;
+        };
+        let Some(values) = load_dialog_values_for(&(actions.snapshot)(), ModelId::from_uuid(uuid))
+        else {
+            return;
+        };
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let settings = values.settings;
+        window.set_selected_model_id(raw);
+        window.set_selected_model_key(values.key.into());
+        window
+            .set_selected_context(settings.context_length.map_or(4096, |value| value.get()) as i32);
+        window.set_selected_gpu(settings.gpu_layers.map_or(0, |value| value.get()) as i32);
+        window.set_selected_threads(settings.cpu_threads.map_or(1, |value| value.get()) as i32);
+        window.set_selected_batch(settings.batch_size.map_or(512, |value| value.get()) as i32);
+        window.set_selected_parallel(settings.parallel_slots.map_or(1, |value| value.get()) as i32);
+        window.set_selected_flash(settings.flash_attention.unwrap_or(false));
+        window.set_selected_kv(
+            match settings
+                .kv_cache_type
+                .unwrap_or(model_launcher_core::KvCacheType::F16)
+            {
+                model_launcher_core::KvCacheType::F16 => "f16",
+                model_launcher_core::KvCacheType::Q8_0 => "q8_0",
+                model_launcher_core::KvCacheType::Q4_0 => "q4_0",
+            }
+            .into(),
+        );
+        window.set_load_dialog_open(true);
     });
 }
 

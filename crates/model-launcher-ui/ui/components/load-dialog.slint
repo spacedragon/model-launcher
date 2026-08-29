@@ -3,6 +3,13 @@ import { Button, CheckBox, ComboBox, LineEdit, SpinBox } from "std-widgets.slint
 export component LoadDialog inherits Rectangle {
     in-out property <bool> open: false;
     in-out property <string> model-key;
+    in-out property <int> context-value: 4096;
+    in-out property <int> gpu-value: 0;
+    in-out property <int> threads-value: 1;
+    in-out property <int> batch-value: 512;
+    in-out property <int> parallel-value: 1;
+    in-out property <bool> flash-value: false;
+    in-out property <string> kv-value: "f16";
     in property <bool> show-context: true;
     in property <bool> show-gpu: true;
     in property <bool> show-threads: true; in property <bool> show-batch: true;
@@ -17,13 +24,13 @@ export component LoadDialog inherits Rectangle {
             Text { text: "Load model"; color: #1F2937; font-family: "Segoe UI"; font-size: 18px; font-weight: 600; }
             Text { text: "Model key"; color: #667085; font-family: "Segoe UI"; font-size: 12px; }
             key := LineEdit { text <=> root.model-key; accessible-label: "Model key"; }
-            ctx := SpinBox { visible: root.show-context; value: 4096; minimum: 1; maximum: 1048576; accessible-label: "Context length"; }
-            gpu := SpinBox { visible: root.show-gpu; value: 0; minimum: 0; maximum: 999; accessible-label: "GPU layers"; }
-            threads := SpinBox { visible: root.show-threads; value: 1; minimum: 1; maximum: 1024; accessible-label: "CPU threads"; }
-            batch := SpinBox { visible: root.show-batch; value: 512; minimum: 1; maximum: 1048576; accessible-label: "Batch size"; }
-            parallel := SpinBox { visible: root.show-parallel; value: 1; minimum: 1; maximum: 1024; accessible-label: "Parallel slots"; }
-            flash := CheckBox { visible: root.show-flash; text: "Flash attention"; accessible-label: "Flash attention"; }
-            kv := ComboBox { visible: root.show-kv; model: ["f16", "q8_0", "q4_0"]; accessible-label: "KV cache type"; }
+            ctx := SpinBox { visible: root.show-context; value <=> root.context-value; minimum: 1; maximum: 1048576; accessible-label: "Context length"; }
+            gpu := SpinBox { visible: root.show-gpu; value <=> root.gpu-value; minimum: 0; maximum: 999; accessible-label: "GPU layers"; }
+            threads := SpinBox { visible: root.show-threads; value <=> root.threads-value; minimum: 1; maximum: 1024; accessible-label: "CPU threads"; }
+            batch := SpinBox { visible: root.show-batch; value <=> root.batch-value; minimum: 1; maximum: 1048576; accessible-label: "Batch size"; }
+            parallel := SpinBox { visible: root.show-parallel; value <=> root.parallel-value; minimum: 1; maximum: 1024; accessible-label: "Parallel slots"; }
+            flash := CheckBox { visible: root.show-flash; checked <=> root.flash-value; text: "Flash attention"; accessible-label: "Flash attention"; }
+            kv := ComboBox { visible: root.show-kv; current-value <=> root.kv-value; model: ["f16", "q8_0", "q4_0"]; accessible-label: "KV cache type"; }
             HorizontalLayout { spacing: 8px; Rectangle { horizontal-stretch: 1; } Button { text: "Cancel"; clicked => { root.open=false; } } Button { text: "Load"; primary: true; clicked => { root.confirm(root.model-key, ctx.value, gpu.value, threads.value, batch.value, parallel.value, flash.checked, kv.current-value); } } }
         }
     }

@@ -14,7 +14,7 @@ use model_launcher_core::{
 use model_launcher_ui::{
     AppSnapshot, CloseNotice, CloseNoticeStore, EngineSettings, LogCommands, MetadataVisibility,
     ModelAction, RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
-    load_request_for,
+    load_dialog_values_for, load_request_for,
 };
 
 fn model(name: &str, size: u64) -> ModelRecord {
@@ -280,4 +280,30 @@ fn tray_recent_request_resolves_stable_id_after_catalog_reordering() {
     let request = load_request_for(&snapshot, alpha.id).unwrap();
     assert_eq!(request.id, alpha.id);
     assert_eq!(request.key, alpha.key.to_string());
+}
+
+#[test]
+fn load_dialog_adapter_hydrates_every_saved_profile_value() {
+    let mut alpha = model("Alpha", 1);
+    alpha.launch_profile.settings = LaunchSettings {
+        context_length: Some(model_launcher_core::ContextLength::new(8192).unwrap()),
+        gpu_layers: Some(model_launcher_core::GpuLayers::new(31)),
+        cpu_threads: Some(model_launcher_core::CpuThreads::new(9).unwrap()),
+        batch_size: Some(model_launcher_core::BatchSize::new(777).unwrap()),
+        parallel_slots: Some(model_launcher_core::ParallelSlots::new(3).unwrap()),
+        flash_attention: Some(true),
+        kv_cache_type: Some(model_launcher_core::KvCacheType::Q8_0),
+    };
+    let snapshot = AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+    };
+
+    let values = load_dialog_values_for(&snapshot, alpha.id).unwrap();
+    assert_eq!(values.key, alpha.key.to_string());
+    assert_eq!(values.settings, alpha.launch_profile.settings);
 }
