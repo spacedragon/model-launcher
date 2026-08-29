@@ -751,6 +751,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "model-launcher"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fake-llama-server",
+ "model-launcher-api",
+ "model-launcher-core",
+ "model-launcher-wsl",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "model-launcher-api"
 version = "0.1.0"
 dependencies = [

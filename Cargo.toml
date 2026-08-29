@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/model-launcher-core", "crates/model-launcher-wsl", "crates/model-launcher-api", "tests/fake-llama-server"]
+members = ["apps/model-launcher", "crates/model-launcher-core", "crates/model-launcher-wsl", "crates/model-launcher-api", "tests/fake-llama-server"]
 resolver = "2"
 
 [workspace.package]
