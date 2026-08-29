@@ -25,6 +25,7 @@ pub fn launch_argv(
         LAUNCH_SCRIPT,
         LAUNCH_SENTINEL,
         executable,
+        "--model",
         model,
     ]
     .into_iter()
@@ -216,6 +217,7 @@ mod tests {
             &argv[7..],
             &[
                 "/opt/llama server",
+                "--model",
                 "/mnt/c/a;echo bad.gguf",
                 "--ctx-size",
                 "4096"
@@ -235,6 +237,10 @@ mod tests {
         );
         for bad in [
             "MODEL_LAUNCHER_PID=0\n",
+            "MODEL_LAUNCHER_PID=01\n",
+            "MODEL_LAUNCHER_PID=+42\n",
+            "MODEL_LAUNCHER_PID=4294967296\n",
+            "MODEL_LAUNCHER_PID=42\nextra",
             " MODEL_LAUNCHER_PID=42\n",
             "MODEL_LAUNCHER_PID=42 x\n",
             "42\n",
@@ -253,7 +259,11 @@ mod tests {
 
     #[test]
     fn internal_port_allocator_reserves_loopback_ephemeral_port() {
-        let reservation = InternalPortAllocator.reserve().unwrap();
+        let reservation = match InternalPortAllocator.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected bind error: {error}"),
+        };
         assert_eq!(reservation.addr().ip().to_string(), "127.0.0.1");
         assert_ne!(reservation.addr().port(), 0);
     }

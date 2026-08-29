@@ -9,10 +9,10 @@ use model_launcher_core::{
     ModelId, ModelRecord,
 };
 use std::{
-    io,
+    io::{self, Write},
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -50,6 +50,8 @@ pub trait WslChild: Send {
         self.check_health().await.is_ok()
     }
     async fn wait_for_exit(&mut self) -> Result<i32, WslError>;
+    async fn is_running(&mut self) -> Result<bool, WslError>;
+    async fn abort_host(&mut self) -> Result<(), WslError>;
 }
 
 /// Implementations must make `spawn` cancellation-safe: a dropped future retains ownership and
@@ -62,7 +64,7 @@ pub trait CommandRunner: Send + Sync {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TokioCommandRunner {
     logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
 }
@@ -128,6 +130,8 @@ impl CommandRunner for TokioCommandRunner {
             drains: Vec::new(),
             distribution,
             linux_pid: None,
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            inspector: Arc::new(self.clone()),
         }))
     }
 }
@@ -141,6 +145,8 @@ struct TokioWslChild {
     drains: Vec<tokio::task::JoinHandle<()>>,
     distribution: String,
     linux_pid: Option<u32>,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
+    inspector: Arc<dyn CommandRunner>,
 }
 #[async_trait]
 impl WslChild for TokioWslChild {
@@ -163,13 +169,28 @@ impl WslChild for TokioWslChild {
         if let Some(mut stdout) = self.stdout.take() {
             let logs = self.logs.clone();
             self.drains.push(tokio::spawn(async move {
-                drain_stream(&mut stdout, logs, LogSource::EngineStdout, LogLevel::Info).await;
+                drain_stream(
+                    &mut stdout,
+                    logs,
+                    LogSource::EngineStdout,
+                    LogLevel::Info,
+                    None,
+                )
+                .await;
             }));
         }
         if let Some(mut stderr) = self.stderr.take() {
             let logs = self.logs.clone();
+            let tail = self.stderr_tail.clone();
             self.drains.push(tokio::spawn(async move {
-                drain_stream(&mut stderr, logs, LogSource::EngineStderr, LogLevel::Error).await;
+                drain_stream(
+                    &mut stderr,
+                    logs,
+                    LogSource::EngineStderr,
+                    LogLevel::Error,
+                    Some(tail),
+                )
+                .await;
             }));
         }
         Ok(line)
@@ -182,8 +203,16 @@ impl WslChild for TokioWslChild {
                 .try_wait()
                 .map_err(|e| WslError::Command(e.to_string()))?
             {
+                for drain in self.drains.drain(..) {
+                    let _ = tokio::time::timeout(Duration::from_secs(1), drain).await;
+                }
+                let tail = self.stderr_tail.lock().expect("stderr tail lock").clone();
+                if is_address_in_use(&tail) {
+                    return Err(WslError::AddressInUse);
+                }
                 return Err(WslError::Command(format!(
-                    "engine exited before readiness: {status}"
+                    "engine exited before readiness: {status}: {}",
+                    String::from_utf8_lossy(&tail)
                 )));
             }
             if tokio::net::TcpStream::connect(self.addr).await.is_ok() {
@@ -223,6 +252,23 @@ impl WslChild for TokioWslChild {
         }
         Ok(status.code().unwrap_or(-1))
     }
+    async fn is_running(&mut self) -> Result<bool, WslError> {
+        Ok(self
+            .child
+            .try_wait()
+            .map_err(|e| WslError::Command(e.to_string()))?
+            .is_none())
+    }
+    async fn abort_host(&mut self) -> Result<(), WslError> {
+        self.child
+            .start_kill()
+            .map_err(|e| WslError::Command(e.to_string()))?;
+        self.child
+            .wait()
+            .await
+            .map_err(|e| WslError::Command(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl TokioWslChild {
@@ -230,31 +276,37 @@ impl TokioWslChild {
         let pid = self
             .linux_pid
             .ok_or_else(|| WslError::Command("PID handshake not established".into()))?;
-        let port = format!(":{}", self.addr.port());
-        let output = Command::new("wsl.exe")
-            .args([
-                "-d",
-                &self.distribution,
-                "--",
-                "ss",
-                "-H",
-                "-ltnp",
-                "sport",
-                "=",
-                &port,
-            ])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|error| WslError::Command(error.to_string()))?;
-        if !output.status.success() {
-            return Err(WslError::Command(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
+        let output = self
+            .inspector
+            .output(
+                "wsl.exe",
+                &endpoint_owner_argv(&self.distribution, self.addr.port()),
+            )
+            .await?;
+        if !output.success {
+            return Err(WslError::Command(output.stderr));
         }
-        let needle = format!("pid={pid},");
-        Ok(String::from_utf8_lossy(&output.stdout).contains(&needle))
+        Ok(ss_output_owns_pid(&output.stdout, pid))
     }
+}
+pub fn endpoint_owner_argv(distribution: &str, port: u16) -> Vec<String> {
+    [
+        "-d",
+        distribution,
+        "--",
+        "ss",
+        "-H",
+        "-ltnp",
+        "sport",
+        "=",
+        &format!(":{port}"),
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+pub fn ss_output_owns_pid(output: &str, pid: u32) -> bool {
+    output.contains(&format!("pid={pid},"))
 }
 
 async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
@@ -262,31 +314,55 @@ async fn drain_stream<R: tokio::io::AsyncRead + Unpin>(
     logs: Option<(LogStore, Option<u64>, Option<ModelId>)>,
     source: LogSource,
     level: LogLevel,
+    tail: Option<Arc<Mutex<Vec<u8>>>>,
 ) {
-    let Some((store, generation, model_id)) = logs else {
-        let mut sink = tokio::io::sink();
-        let _ = tokio::io::copy(reader, &mut sink).await;
-        return;
-    };
-    let Ok(mut framer) = EngineLogFramer::new(
-        store,
-        source,
-        level,
-        generation,
-        model_id,
-        MAX_ENGINE_LOG_LINE_BYTES,
-    ) else {
-        return;
-    };
+    let mut framer = logs.and_then(|(store, generation, model_id)| {
+        EngineLogFramer::new(
+            store,
+            source,
+            level,
+            generation,
+            model_id,
+            MAX_ENGINE_LOG_LINE_BYTES,
+        )
+        .ok()
+    });
     let mut buffer = [0_u8; 8192];
     loop {
         match tokio::io::AsyncReadExt::read(reader, &mut buffer).await {
             Ok(0) => break,
-            Ok(count) => framer.push(now_ms(), &buffer[..count]),
+            Ok(count) => {
+                if let Some(tail) = &tail {
+                    append_bounded_tail(tail, &buffer[..count]);
+                }
+                if let Some(framer) = &mut framer {
+                    framer.push(now_ms(), &buffer[..count]);
+                }
+            }
             Err(_) => break,
         }
     }
-    framer.finish(now_ms());
+    if let Some(framer) = &mut framer {
+        framer.finish(now_ms());
+    }
+}
+const STDERR_TAIL_LIMIT: usize = 16 * 1024;
+fn append_bounded_tail(tail: &Mutex<Vec<u8>>, bytes: &[u8]) {
+    let mut tail = tail.lock().expect("stderr tail lock");
+    let bytes = &bytes[bytes.len().saturating_sub(STDERR_TAIL_LIMIT)..];
+    let overflow = tail
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(STDERR_TAIL_LIMIT);
+    if overflow != 0 {
+        let remove = overflow.min(tail.len());
+        tail.drain(..remove);
+    }
+    tail.extend_from_slice(bytes);
+}
+fn is_address_in_use(bytes: &[u8]) -> bool {
+    let diagnostic = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    diagnostic.contains("address already in use") || diagnostic.contains("eaddrinuse")
 }
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -362,6 +438,13 @@ pub struct ProbeCache {
     path: PathBuf,
     prober: WslProber,
 }
+#[derive(Debug, Error)]
+#[error("probe refresh failed: {source}")]
+pub struct ProbeRefreshError {
+    #[source]
+    pub source: WslError,
+    pub prior: Option<ProbeSnapshot>,
+}
 impl ProbeCache {
     #[must_use]
     pub fn new(path: PathBuf, prober: WslProber) -> Self {
@@ -373,15 +456,83 @@ impl ProbeCache {
         &self,
         distribution: &str,
         executable: &str,
-    ) -> Result<ProbeSnapshot, WslError> {
+    ) -> Result<ProbeSnapshot, ProbeRefreshError> {
         let cached = ProbeSnapshot::load(&self.path).ok();
-        let snapshot = self.prober.probe(distribution, executable, cached).await?;
-        let temporary = self.path.with_extension("tmp");
-        snapshot
-            .save(&temporary)
-            .map_err(|e| WslError::Command(e.to_string()))?;
-        std::fs::rename(&temporary, &self.path).map_err(|e| WslError::Command(e.to_string()))?;
+        let snapshot = self
+            .prober
+            .probe(distribution, executable, cached)
+            .await
+            .map_err(|source| ProbeRefreshError {
+                source,
+                prior: ProbeSnapshot::load(&self.path).ok(),
+            })?;
+        save_snapshot_atomic(&self.path, &snapshot).map_err(|error| ProbeRefreshError {
+            source: WslError::Command(error.to_string()),
+            prior: ProbeSnapshot::load(&self.path).ok(),
+        })?;
         Ok(snapshot)
+    }
+}
+
+static SNAPSHOT_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static SNAPSHOT_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn save_snapshot_atomic(path: &std::path::Path, snapshot: &ProbeSnapshot) -> io::Result<()> {
+    let _guard = SNAPSHOT_SAVE_LOCK.lock().expect("snapshot save lock");
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("snapshot path has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| io::Error::other("invalid snapshot filename"))?;
+    let sequence = SNAPSHOT_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let cleanup = Cleanup(temporary.clone());
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    serde_json::to_writer_pretty(&mut file, snapshot).map_err(io::Error::other)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    replace_file(&temporary, path)?;
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    std::mem::forget(cleanup);
+    Ok(())
+}
+#[cfg(not(windows))]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+#[cfg(windows)]
+fn replace_file(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -418,6 +569,18 @@ impl LlamaCppWslEngine {
 }
 fn app_error(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
     AppError::EngineProcess(Box::new(error))
+}
+async fn establish_pid(child: &mut dyn WslChild) -> Result<u32, WslError> {
+    let result = child.pid_control_line().await.and_then(|line| {
+        crate::parse_pid_control_line(&line).map_err(|error| WslError::Command(error.to_string()))
+    });
+    match result {
+        Ok(pid) => Ok(pid),
+        Err(error) => {
+            let _ = child.abort_host().await;
+            Err(error)
+        }
+    }
 }
 
 impl InferenceEngine for LlamaCppWslEngine {
@@ -489,13 +652,12 @@ impl InferenceEngine for LlamaCppWslEngine {
                 .spawn("wsl.exe", &argv)
                 .await
                 .map_err(app_error)?;
-            let line = child.pid_control_line().await.map_err(app_error)?;
-            let pid = crate::parse_pid_control_line(&line).map_err(app_error)?;
+            let pid = establish_pid(&mut *child).await.map_err(app_error)?;
             Ok(Box::new(WslEngineProcess {
                 distribution: self.distribution.clone(),
                 pid,
                 runner: self.runner.clone(),
-                child,
+                child: Some(child),
                 retry: Some(RetryContext {
                     executable: self.executable.clone(),
                     model_path,
@@ -512,7 +674,7 @@ struct WslEngineProcess {
     distribution: String,
     pid: u32,
     runner: Arc<dyn CommandRunner>,
-    child: Box<dyn WslChild>,
+    child: Option<Box<dyn WslChild>>,
     retry: Option<RetryContext>,
     owned_active: bool,
 }
@@ -528,7 +690,13 @@ impl EngineProcess for WslEngineProcess {
             let deadline = Instant::now() + timeout;
             for attempt in 1..=3 {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                match self.child.wait_ready(remaining).await {
+                match self
+                    .child
+                    .as_mut()
+                    .expect("owned child")
+                    .wait_ready(remaining)
+                    .await
+                {
                     Ok(()) => {
                         self.retry = None;
                         return Ok(());
@@ -547,7 +715,14 @@ impl EngineProcess for WslEngineProcess {
         })
     }
     fn check_health(&mut self) -> EngineFuture<'_, ()> {
-        Box::pin(async move { self.child.check_health().await.map_err(app_error) })
+        Box::pin(async move {
+            self.child
+                .as_mut()
+                .expect("owned child")
+                .check_health()
+                .await
+                .map_err(app_error)
+        })
     }
     fn graceful_shutdown(&mut self) -> EngineFuture<'_, ()> {
         Box::pin(async move {
@@ -585,9 +760,21 @@ impl EngineProcess for WslEngineProcess {
     }
     fn wait_for_exit(&mut self) -> EngineFuture<'_, i32> {
         Box::pin(async move {
-            let code = self.child.wait_for_exit().await.map_err(app_error)?;
+            let code = self
+                .child
+                .as_mut()
+                .expect("owned child")
+                .wait_for_exit()
+                .await
+                .map_err(app_error)?;
             let deadline = Instant::now() + Duration::from_secs(1);
-            while self.child.endpoint_responding().await {
+            while self
+                .child
+                .as_mut()
+                .expect("owned child")
+                .endpoint_responding()
+                .await
+            {
                 if Instant::now() >= deadline {
                     return Err(app_error(WslError::Command(
                         "old endpoint remained live after process exit".into(),
@@ -603,21 +790,25 @@ impl EngineProcess for WslEngineProcess {
 
 impl WslEngineProcess {
     async fn stop_attempt(&mut self) -> Result<(), AppError> {
-        let term = self
+        let term_ok = self
             .runner
             .output(
                 "wsl.exe",
                 &signal_argv(&self.distribution, self.pid, Signal::Term),
             )
             .await
-            .map_err(app_error)?;
-        if !term.success {
-            return Err(app_error(WslError::Command(term.stderr)));
-        }
-        if tokio::time::timeout(Duration::from_millis(250), self.child.wait_for_exit())
+            .is_ok_and(|output| output.success);
+        let graceful_exit = if term_ok {
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                self.child.as_mut().expect("owned child").wait_for_exit(),
+            )
             .await
-            .is_err()
-        {
+            .is_ok_and(|result| result.is_ok())
+        } else {
+            false
+        };
+        if !graceful_exit {
             let kill = self
                 .runner
                 .output(
@@ -629,13 +820,22 @@ impl WslEngineProcess {
             if !kill.success {
                 return Err(app_error(WslError::Command(kill.stderr)));
             }
-            tokio::time::timeout(Duration::from_secs(1), self.child.wait_for_exit())
-                .await
-                .map_err(|_| app_error(WslError::Command("owned process did not exit".into())))?
-                .map_err(app_error)?;
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                self.child.as_mut().expect("owned child").wait_for_exit(),
+            )
+            .await
+            .map_err(|_| app_error(WslError::Command("owned process did not exit".into())))?
+            .map_err(app_error)?;
         }
         let endpoint_deadline = Instant::now() + Duration::from_millis(250);
-        while self.child.endpoint_responding().await {
+        while self
+            .child
+            .as_mut()
+            .expect("owned child")
+            .endpoint_responding()
+            .await
+        {
             if Instant::now() >= endpoint_deadline {
                 return Err(app_error(WslError::Command(
                     "owned endpoint remained live".into(),
@@ -669,9 +869,8 @@ impl WslEngineProcess {
             .spawn("wsl.exe", &argv)
             .await
             .map_err(app_error)?;
-        let line = child.pid_control_line().await.map_err(app_error)?;
-        let pid = crate::parse_pid_control_line(&line).map_err(app_error)?;
-        self.child = child;
+        let pid = establish_pid(&mut *child).await.map_err(app_error)?;
+        self.child = Some(child);
         self.pid = pid;
         self.owned_active = true;
         Ok(())
@@ -686,15 +885,25 @@ impl Drop for WslEngineProcess {
         let runner = self.runner.clone();
         let distribution = self.distribution.clone();
         let pid = self.pid;
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = runner
                     .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Term))
                     .await;
-                tokio::time::sleep(Duration::from_millis(250)).await;
-                let _ = runner
-                    .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Kill))
-                    .await;
+                let exited =
+                    tokio::time::timeout(Duration::from_millis(250), child.wait_for_exit())
+                        .await
+                        .is_ok_and(|result| result.is_ok());
+                if !exited && child.is_running().await.unwrap_or(true) {
+                    let _ = runner
+                        .output("wsl.exe", &signal_argv(&distribution, pid, Signal::Kill))
+                        .await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(1), child.wait_for_exit()).await;
+                }
             });
         }
     }
@@ -770,6 +979,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("help failed"));
+        assert_eq!(error.prior.as_ref(), Some(&saved));
         assert_eq!(ProbeSnapshot::load(&cache_path).unwrap(), saved);
     }
 
@@ -779,6 +989,52 @@ mod tests {
         let engine =
             LlamaCppWslEngine::new("Ubuntu", "/bin/llama", Arc::new(FakeRunner::default()));
         accepts(&engine);
+    }
+
+    #[test]
+    fn classifies_only_known_address_in_use_diagnostics() {
+        for diagnostic in [
+            "bind: Address already in use",
+            "listen failed: EADDRINUSE",
+            "ADDRESS ALREADY IN USE",
+        ] {
+            assert!(is_address_in_use(diagnostic.as_bytes()));
+        }
+        assert!(!is_address_in_use(b"engine exited: invalid model"));
+    }
+    struct BadHandshakeChild {
+        aborted: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl WslChild for BadHandshakeChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            Ok("spoof MODEL_LAUNCHER_PID=42\n".into())
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            unreachable!()
+        }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(true)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            self.aborted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn invalid_pid_handshake_aborts_host_child_without_guessing_linux_pid() {
+        let aborted = Arc::new(AtomicBool::new(false));
+        let mut child = BadHandshakeChild {
+            aborted: aborted.clone(),
+        };
+        assert!(establish_pid(&mut child).await.is_err());
+        assert!(aborted.load(Ordering::SeqCst));
     }
 
     struct FakeLease(u16);
@@ -816,6 +1072,12 @@ mod tests {
         async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
             Ok(0)
         }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(false)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            Ok(())
+        }
     }
     struct AttemptRunner {
         children: Mutex<VecDeque<AttemptChild>>,
@@ -850,10 +1112,10 @@ mod tests {
             distribution: "Ubuntu".into(),
             pid: 11,
             runner: runner.clone(),
-            child: Box::new(AttemptChild {
+            child: Some(Box::new(AttemptChild {
                 pid: 11,
                 ready: Some(Err(WslError::NonOwnedEndpoint)),
-            }),
+            })),
             retry: Some(RetryContext {
                 executable: "/llama".into(),
                 model_path: "/model".into(),
@@ -892,10 +1154,10 @@ mod tests {
             distribution: "Ubuntu".into(),
             pid: 11,
             runner: runner.clone(),
-            child: Box::new(AttemptChild {
+            child: Some(Box::new(AttemptChild {
                 pid: 11,
                 ready: Some(Err(WslError::AddressInUse)),
-            }),
+            })),
             retry: Some(RetryContext {
                 executable: "/llama".into(),
                 model_path: "/model".into(),
@@ -927,10 +1189,10 @@ mod tests {
             distribution: "Ubuntu".into(),
             pid: 77,
             runner: runner.clone(),
-            child: Box::new(AttemptChild {
+            child: Some(Box::new(AttemptChild {
                 pid: 77,
                 ready: Some(Ok(())),
-            }),
+            })),
             retry: None,
             owned_active: true,
         };
@@ -939,9 +1201,55 @@ mod tests {
         tokio::time::advance(Duration::from_millis(251)).await;
         tokio::task::yield_now().await;
         let signals = runner.signals.lock().unwrap();
-        assert_eq!(signals.len(), 2);
+        assert_eq!(
+            signals.len(),
+            1,
+            "an exited owned child must never receive a PID-reuse-prone KILL"
+        );
         assert!(signals[0].ends_with(&["-TERM".into(), "--".into(), "77".into()]));
-        assert!(signals[1].ends_with(&["-KILL".into(), "--".into(), "77".into()]));
+    }
+    struct HangingChild;
+    #[async_trait]
+    impl WslChild for HangingChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            unreachable!()
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            std::future::pending().await
+        }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(true)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            Ok(())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn drop_force_kills_only_when_retained_owned_child_is_still_running() {
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        drop(WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 78,
+            runner: runner.clone(),
+            child: Some(Box::new(HangingChild)),
+            retry: None,
+            owned_active: true,
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(251)).await;
+        tokio::task::yield_now().await;
+        let signals = runner.signals.lock().unwrap();
+        assert_eq!(signals.len(), 2);
+        assert!(signals[1].ends_with(&["-KILL".into(), "--".into(), "78".into()]));
     }
 
     struct DelayedEndpointChild {
@@ -966,6 +1274,12 @@ mod tests {
         async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
             Ok(0)
         }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(false)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            Ok(())
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn wait_for_exit_waits_until_old_health_endpoint_is_down() {
@@ -977,7 +1291,7 @@ mod tests {
             distribution: "Ubuntu".into(),
             pid: 88,
             runner,
-            child: Box::new(DelayedEndpointChild { checks: 2 }),
+            child: Some(Box::new(DelayedEndpointChild { checks: 2 })),
             retry: None,
             owned_active: true,
         };
@@ -985,5 +1299,104 @@ mod tests {
         process.wait_for_exit().await.unwrap();
         assert!(!process.owned_active);
         assert!(tokio::time::Instant::now().duration_since(started) >= Duration::from_millis(50));
+    }
+
+    struct StopChild {
+        waits: VecDeque<Result<i32, WslError>>,
+    }
+    #[async_trait]
+    impl WslChild for StopChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            unreachable!()
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            Err(WslError::Command("down".into()))
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            self.waits.pop_front().unwrap_or(Ok(0))
+        }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(true)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            Ok(())
+        }
+    }
+    struct SignalRunner {
+        fail_term: bool,
+        fail_kill: bool,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+    #[async_trait]
+    impl CommandRunner for SignalRunner {
+        async fn output(&self, _: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            let fail = (self.fail_term && argv.contains(&"-TERM".into()))
+                || (self.fail_kill && argv.contains(&"-KILL".into()));
+            Ok(CommandOutput {
+                success: !fail,
+                stdout: String::new(),
+                stderr: if fail {
+                    "signal failed".into()
+                } else {
+                    String::new()
+                },
+            })
+        }
+    }
+    fn stopping_process(
+        runner: Arc<dyn CommandRunner>,
+        waits: VecDeque<Result<i32, WslError>>,
+    ) -> WslEngineProcess {
+        WslEngineProcess {
+            distribution: "Ubuntu".into(),
+            pid: 55,
+            runner,
+            child: Some(Box::new(StopChild { waits })),
+            retry: None,
+            owned_active: true,
+        }
+    }
+    #[tokio::test]
+    async fn term_failure_and_wait_error_both_force_exact_pid_kill() {
+        for (fail_term, waits) in [
+            (true, VecDeque::new()),
+            (
+                false,
+                VecDeque::from([Err(WslError::Command("wait failed".into())), Ok(0)]),
+            ),
+        ] {
+            let runner = Arc::new(SignalRunner {
+                fail_term,
+                fail_kill: false,
+                calls: Mutex::new(Vec::new()),
+            });
+            stopping_process(runner.clone(), waits)
+                .stop_attempt()
+                .await
+                .unwrap();
+            assert!(
+                runner
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|argv| argv.ends_with(&["-KILL".into(), "--".into(), "55".into()]))
+            );
+        }
+    }
+    #[tokio::test]
+    async fn kill_failure_blocks_cleanup_and_retry() {
+        let runner = Arc::new(SignalRunner {
+            fail_term: true,
+            fail_kill: true,
+            calls: Mutex::new(Vec::new()),
+        });
+        let mut process = stopping_process(runner, VecDeque::new());
+        assert!(process.stop_attempt().await.is_err());
+        assert!(process.owned_active);
     }
 }

@@ -219,8 +219,28 @@ mod tests {
         let snapshot = ProbeSnapshot::new("Ubuntu", "/bin/llama", id.clone(), "v1", "--ctx-size");
         assert!(snapshot.is_valid_for("Ubuntu", "/bin/llama", &id));
         assert!(!snapshot.is_valid_for("ubuntu", "/bin/llama", &id));
-        let mut changed = id;
+        let mut changed = id.clone();
         changed.size += 1;
         assert!(!snapshot.is_valid_for("Ubuntu", "/bin/llama", &changed));
+        for changed in [
+            ExecutableIdentity {
+                device: 9,
+                ..id.clone()
+            },
+            ExecutableIdentity {
+                inode: 9,
+                ..id.clone()
+            },
+            ExecutableIdentity {
+                size: 9,
+                ..id.clone()
+            },
+            ExecutableIdentity {
+                modified_seconds: 9,
+                ..id.clone()
+            },
+        ] {
+            assert!(!snapshot.is_valid_for("Ubuntu", "/bin/llama", &changed));
+        }
     }
 }
