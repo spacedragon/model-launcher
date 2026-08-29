@@ -60,11 +60,20 @@ pub fn run_desktop(
     });
     window.on_save_settings({
         let actions = actions.clone();
-        move |model_directory, distribution, executable| {
+        move |model_directory,
+              distribution,
+              executable,
+              context,
+              gpu,
+              threads,
+              batch,
+              parallel,
+              flash| {
             (actions.save_settings)(EngineSettings {
                 model_directory: model_directory.into(),
                 distribution: distribution.into(),
                 executable: executable.into(),
+                defaults: launch_settings(context, gpu, threads, batch, parallel, flash),
             })
         }
     });
@@ -201,11 +210,20 @@ fn create_window(
     });
     window.on_save_settings({
         let actions = actions.clone();
-        move |model_directory, distribution, executable| {
+        move |model_directory,
+              distribution,
+              executable,
+              context,
+              gpu,
+              threads,
+              batch,
+              parallel,
+              flash| {
             (actions.save_settings)(EngineSettings {
                 model_directory: model_directory.into(),
                 distribution: distribution.into(),
                 executable: executable.into(),
+                defaults: launch_settings(context, gpu, threads, batch, parallel, flash),
             })
         }
     });
@@ -319,6 +337,46 @@ fn hydrate_engine_settings(window: &MainWindow, settings: EngineSettings) {
     window.set_model_directory(settings.model_directory.into());
     window.set_engine_distribution(settings.distribution.into());
     window.set_engine_executable(settings.executable.into());
+    window.set_default_context(
+        settings
+            .defaults
+            .context_length
+            .map_or(4096, |value| value.get()) as i32,
+    );
+    window.set_default_gpu(settings.defaults.gpu_layers.map_or(0, |value| value.get()) as i32);
+    window.set_default_threads(settings.defaults.cpu_threads.map_or(0, |value| value.get()) as i32);
+    window.set_default_batch(
+        settings
+            .defaults
+            .batch_size
+            .map_or(512, |value| value.get()) as i32,
+    );
+    window.set_default_parallel(
+        settings
+            .defaults
+            .parallel_slots
+            .map_or(1, |value| value.get()) as i32,
+    );
+    window.set_default_flash(settings.defaults.flash_attention.unwrap_or(false));
+}
+
+fn launch_settings(
+    context: i32,
+    gpu: i32,
+    threads: i32,
+    batch: i32,
+    parallel: i32,
+    flash: bool,
+) -> LaunchSettings {
+    LaunchSettings {
+        context_length: model_launcher_core::ContextLength::new(context.max(1) as u32).ok(),
+        gpu_layers: Some(model_launcher_core::GpuLayers::new(gpu.max(0) as u32)),
+        cpu_threads: model_launcher_core::CpuThreads::new(threads.max(0) as u32).ok(),
+        batch_size: model_launcher_core::BatchSize::new(batch.max(1) as u32).ok(),
+        parallel_slots: model_launcher_core::ParallelSlots::new(parallel.max(1) as u32).ok(),
+        flash_attention: Some(flash),
+        kv_cache_type: None,
+    }
 }
 
 fn hydrate_capabilities(window: &MainWindow, caps: &EngineCapabilities) {
@@ -395,8 +453,26 @@ pub fn request_refresh() {
     });
 }
 
+#[cfg(windows)]
+pub fn report_status(message: impl Into<String>) {
+    let message = message.into();
+    let _ = slint::invoke_from_event_loop(move || {
+        DESKTOP.with_borrow(|desktop| {
+            if let Some(window) = desktop
+                .as_ref()
+                .and_then(|desktop| desktop.windows.window.as_ref())
+            {
+                window.set_operation_status(message.into());
+            }
+        });
+    });
+}
+
 #[cfg(not(windows))]
 pub fn request_refresh() {}
+
+#[cfg(not(windows))]
+pub fn report_status(_message: impl Into<String>) {}
 
 #[cfg(windows)]
 fn dispatch_windows(command: TrayCommand) {
@@ -698,6 +774,7 @@ pub struct EngineSettings {
     pub distribution: String,
     pub executable: String,
     pub model_directory: String,
+    pub defaults: LaunchSettings,
 }
 
 type Validate = dyn Fn(&EngineSettings) -> Result<(), String> + Send + Sync;

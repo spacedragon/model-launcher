@@ -60,6 +60,14 @@ pub struct ServiceSnapshot {
     pub lifecycle: LifecycleSnapshot,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LauncherSettings {
+    pub catalog_directory: PathBuf,
+    pub engine_distribution: String,
+    pub engine_executable: String,
+    pub default_launch_settings: model_launcher_core::LaunchSettings,
+}
+
 pub struct Service {
     handle: ServiceHandle,
 }
@@ -173,7 +181,12 @@ impl Service {
         watcher_barrier: Option<Arc<WatcherBarrier>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
-        let catalog = CatalogService::new(&options.catalog_dir, store.clone());
+        let persisted = store.load()?;
+        let catalog_root = persisted
+            .catalog_directory
+            .clone()
+            .unwrap_or_else(|| options.catalog_dir.clone());
+        let catalog = CatalogService::new(&catalog_root, store.clone());
         let initial = catalog.reconcile_now()?;
         if let (Some(manager), Some(distribution), Some(executable)) = (
             settings.as_ref(),
@@ -194,7 +207,7 @@ impl Service {
         let (changes, _) = watch::channel(0_u64);
         let watcher = options
             .watch_catalog
-            .then(|| CatalogWatcher::watch(&options.catalog_dir, Duration::from_millis(250)))
+            .then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
             .transpose()
             .map_err(|error| ServiceError::Watcher(error.to_string()))?;
         let capabilities = Arc::new(RwLock::new(engine.probe_capabilities().await?));
@@ -284,6 +297,8 @@ impl Service {
             settings,
             engine,
             models,
+            catalog_root: RwLock::new(catalog_root),
+            watch_catalog: options.watch_catalog,
             recent: RwLock::new(VecDeque::new()),
             store,
             shutdown_timeout: options.shutdown_timeout,
@@ -369,6 +384,20 @@ impl ServiceHandle {
             config.engine_executable.clone(),
         )
     }
+    pub fn launcher_settings(&self) -> LauncherSettings {
+        let config = self.inner.models.read().expect("model lock poisoned");
+        LauncherSettings {
+            catalog_directory: self
+                .inner
+                .catalog_root
+                .read()
+                .expect("catalog root lock poisoned")
+                .clone(),
+            engine_distribution: config.engine_distribution.clone().unwrap_or_default(),
+            engine_executable: config.engine_executable.clone().unwrap_or_default(),
+            default_launch_settings: config.default_launch_settings.clone(),
+        }
+    }
     pub fn log_store(&self) -> LogStore {
         self.inner.logs.clone()
     }
@@ -431,6 +460,44 @@ impl ServiceHandle {
         config.engine_executable = latest.engine_executable;
         manager.apply(distribution, executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
+        self.inner.changed();
+        Ok(caps)
+    }
+    pub async fn save_launcher_settings(
+        &self,
+        settings: LauncherSettings,
+    ) -> Result<EngineCapabilities, ServiceError> {
+        if !settings.catalog_directory.is_dir() {
+            return Err(ServiceError::Authentication(
+                "model directory must be an existing directory".into(),
+            ));
+        }
+        let manager = self.inner.settings.as_ref().ok_or_else(|| {
+            ServiceError::Authentication("engine settings are not configurable".into())
+        })?;
+        let caps = manager
+            .validate(&settings.engine_distribution, &settings.engine_executable)
+            .await
+            .map_err(ServiceError::Authentication)?;
+        let root = settings.catalog_directory.clone();
+        let latest = self.inner.store.update(|config| {
+            config.catalog_directory = Some(root.clone());
+            config.engine_distribution = Some(settings.engine_distribution.clone());
+            config.engine_executable = Some(settings.engine_executable.clone());
+            config.default_launch_settings = settings.default_launch_settings.clone();
+            Ok(())
+        })?;
+        let result = CatalogService::new(&root, self.inner.store.clone()).reconcile_now()?;
+        *self.inner.models.write().expect("model lock poisoned") = result.config;
+        *self
+            .inner
+            .catalog_root
+            .write()
+            .expect("catalog root lock poisoned") = root;
+        self.inner.restart_watcher().await?;
+        manager.apply(settings.engine_distribution, settings.engine_executable);
+        *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
+        let _ = latest;
         self.inner.changed();
         Ok(caps)
     }
@@ -576,6 +643,8 @@ struct Inner {
     settings: Option<Arc<dyn EngineSettingsManager>>,
     engine: Arc<dyn InferenceEngine>,
     models: Arc<RwLock<LauncherConfig>>,
+    catalog_root: RwLock<PathBuf>,
+    watch_catalog: bool,
     recent: RwLock<VecDeque<model_launcher_core::ModelId>>,
     store: ConfigStore,
     shutdown_timeout: Duration,
@@ -591,6 +660,50 @@ impl Inner {
     fn changed(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    async fn restart_watcher(&self) -> Result<(), ServiceError> {
+        if !self.watch_catalog {
+            return Ok(());
+        }
+        let root = self
+            .catalog_root
+            .read()
+            .expect("catalog root lock poisoned")
+            .clone();
+        let mut watcher = CatalogWatcher::watch(&root, Duration::from_millis(250))
+            .map_err(|error| ServiceError::Watcher(error.to_string()))?;
+        let (stop, mut stopped) = watch::channel(false);
+        let catalog = CatalogService::new(root, self.store.clone());
+        let models = self.models.clone();
+        let mutation = self.mutation.clone();
+        let shutdown = self.shutdown.clone();
+        let changes = self.changes.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    changed = stopped.changed() => if changed.is_err() || *stopped.borrow() { break; },
+                    batch = watcher.wait_next_batch() => {
+                        let Some(batch) = batch else { break; };
+                        let _gate = mutation.lock().await;
+                        if !matches!(*shutdown.lock().await, ShutdownState::Running) { break; }
+                        if let Ok(result) = catalog.process_batch(batch) {
+                            *models.write().expect("model lock poisoned") = result.config;
+                            changes.send_modify(|generation| *generation = generation.wrapping_add(1));
+                        }
+                    }
+                }
+            }
+        });
+        let mut resources = self.resources.lock().await;
+        if let Some(old_stop) = resources.watch_stop.replace(stop) {
+            let _ = old_stop.send(true);
+        }
+        if let Some(old_task) = resources.watcher_task.replace(task) {
+            old_task.abort();
+            let _ = old_task.await;
+        }
+        Ok(())
     }
 
     fn record_recent(&self, id: model_launcher_core::ModelId) {

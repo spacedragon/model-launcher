@@ -8,7 +8,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{AppError, ModelRecord};
+use crate::{AppError, LaunchSettings, ModelRecord};
 
 const CURRENT_VERSION: u32 = 1;
 const CONFIG_FILE: &str = "config.json";
@@ -24,6 +24,10 @@ pub struct LauncherConfig {
     pub engine_distribution: Option<String>,
     #[serde(default)]
     pub engine_executable: Option<String>,
+    #[serde(default)]
+    pub catalog_directory: Option<PathBuf>,
+    #[serde(default)]
+    pub default_launch_settings: LaunchSettings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

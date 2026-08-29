@@ -1,6 +1,6 @@
 use model_launcher::{
-    EngineSettingsManager, Service, ServiceError, ServiceOptions, ShutdownEvent, ShutdownPhase,
-    WatcherBarrier, WatcherBarrierPoint,
+    EngineSettingsManager, LauncherSettings, Service, ServiceError, ServiceOptions, ShutdownEvent,
+    ShutdownPhase, WatcherBarrier, WatcherBarrierPoint,
 };
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{
@@ -168,6 +168,93 @@ async fn service_change_subscription_observes_catalog_and_profile_mutations() {
         .unwrap();
     changes.changed().await.unwrap();
     assert!(*changes.borrow() > 0);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn launcher_settings_persist_root_and_defaults_for_new_models() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("models");
+    let replacement = temp.path().join("replacement");
+    std::fs::create_dir(&initial).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(replacement.join("new.gguf"), b"GGUFtiny").unwrap();
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        Arc::new(RecordingSettings(order)),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let defaults = LaunchSettings {
+        context_length: Some(model_launcher_core::ContextLength::new(6144).unwrap()),
+        ..LaunchSettings::default()
+    };
+    handle
+        .save_launcher_settings(LauncherSettings {
+            catalog_directory: replacement.clone(),
+            engine_distribution: "Ubuntu".into(),
+            engine_executable: "/opt/llama-server".into(),
+            default_launch_settings: defaults.clone(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(handle.launcher_settings().catalog_directory, replacement);
+    assert_eq!(
+        handle.snapshot().models[0].launch_profile.settings,
+        defaults
+    );
+    let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    assert_eq!(saved.catalog_directory, Some(replacement));
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn catalog_watcher_follows_a_saved_root_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("models");
+    let replacement = temp.path().join("replacement");
+    std::fs::create_dir(&initial).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    let mut opts = options(temp.path(), "http://127.0.0.1:1".into());
+    opts.watch_catalog = true;
+    let service = Service::start_with_desktop_dependencies(
+        opts,
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        Arc::new(RecordingSettings(Arc::new(std::sync::Mutex::new(
+            Vec::new(),
+        )))),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    handle
+        .save_launcher_settings(LauncherSettings {
+            catalog_directory: replacement.clone(),
+            engine_distribution: "Ubuntu".into(),
+            engine_executable: "/opt/llama-server".into(),
+            default_launch_settings: LaunchSettings::default(),
+        })
+        .await
+        .unwrap();
+    let mut changes = handle.subscribe_changes();
+    std::fs::write(replacement.join("watched.gguf"), b"GGUFtiny").unwrap();
+    tokio::time::timeout(Duration::from_secs(3), changes.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(handle.snapshot().models.len(), 1);
     handle.shutdown().await.unwrap();
 }
 

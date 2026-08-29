@@ -7,10 +7,10 @@ use std::{
 use gguf_rs_lib::{builder::GGUFBuilder, format::MetadataValue};
 use model_launcher_core::{
     CatalogDebouncer, CatalogDiagnosticKind, CatalogIdentity, CatalogService, CatalogWatchEvent,
-    CatalogWatcher, ConfigStore, ContextLength, LauncherConfig, MAX_CATALOG_DIAGNOSTICS,
-    MAX_DISCOVERED_GGUF_FILES, MAX_DISCOVERED_MODELS, MAX_TOTAL_CATALOG_TENSORS, ModelKey,
-    ModelState, ReconcileOptions, WATCH_MAX_BATCH_DIAGNOSTICS, catalog_watch_channel,
-    catalog_watch_channel_with_limits, reconcile_catalog, scan,
+    CatalogWatcher, ConfigStore, ContextLength, LaunchSettings, LauncherConfig,
+    MAX_CATALOG_DIAGNOSTICS, MAX_DISCOVERED_GGUF_FILES, MAX_DISCOVERED_MODELS,
+    MAX_TOTAL_CATALOG_TENSORS, ModelKey, ModelState, ReconcileOptions, WATCH_MAX_BATCH_DIAGNOSTICS,
+    catalog_watch_channel, catalog_watch_channel_with_limits, reconcile_catalog, scan,
 };
 use uuid::Uuid;
 
@@ -710,6 +710,25 @@ fn incomplete_scan_preserves_existing_availability() {
     let failed = scan(&root.path().join("missing"));
     let output = reconcile_catalog(&first.config, failed, Default::default());
     assert_eq!(output.config, first.config);
+}
+
+#[test]
+fn newly_discovered_models_inherit_global_launch_defaults() {
+    let root = TestDir::new();
+    root.file("model.gguf", &tiny_gguf("Defaults"));
+    let defaults = LaunchSettings {
+        context_length: Some(ContextLength::new(8192).unwrap()),
+        flash_attention: Some(true),
+        ..LaunchSettings::default()
+    };
+    let saved = LauncherConfig {
+        default_launch_settings: defaults.clone(),
+        ..LauncherConfig::default()
+    };
+
+    let output = reconcile_catalog(&saved, scan(root.path()), Default::default());
+
+    assert_eq!(output.config.models[0].launch_profile.settings, defaults);
 }
 
 #[test]

@@ -1066,7 +1066,9 @@ pub fn reconcile_catalog(
                 file_identity: model.identity,
                 size_bytes: model.size_bytes,
                 state: ModelState::Available,
-                launch_profile: LaunchProfile::default(),
+                launch_profile: LaunchProfile {
+                    settings: saved.default_launch_settings.clone(),
+                },
             });
         }
     }

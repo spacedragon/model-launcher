@@ -1,4 +1,4 @@
-use model_launcher::{EngineSettingsManager, Service, ServiceOptions};
+use model_launcher::{EngineSettingsManager, LauncherSettings, Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
@@ -59,9 +59,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             move |request: model_launcher_ui::UiLoadRequest| {
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
-                    let _ = handle
+                    let result = handle
                         .load_model_with_profile(request.id, request.key, request.settings)
                         .await;
+                    if let Err(error) = result {
+                        model_launcher_ui::report_status(format!("Load failed: {error}"));
+                    }
                 });
             }
         }),
@@ -78,12 +81,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rescan: Arc::new({
             let handle = handle.clone();
             let runtime_handle = runtime_handle.clone();
-            let catalog = options.catalog_dir.clone();
             move || {
                 let handle = handle.clone();
-                let catalog = catalog.clone();
                 runtime_handle.spawn(async move {
-                    let _ = handle.rescan(catalog).await;
+                    let catalog = handle.launcher_settings().catalog_directory;
+                    match handle.rescan(catalog).await {
+                        Ok(_) => model_launcher_ui::report_status("Catalog rescanned"),
+                        Err(error) => {
+                            model_launcher_ui::report_status(format!("Rescan failed: {error}"))
+                        }
+                    }
                 });
             }
         }),
@@ -127,9 +134,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             move |settings| {
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
-                    let _ = handle
-                        .save_engine_settings(settings.distribution, settings.executable)
+                    let result = handle
+                        .save_launcher_settings(LauncherSettings {
+                            catalog_directory: settings.model_directory.into(),
+                            engine_distribution: settings.distribution,
+                            engine_executable: settings.executable,
+                            default_launch_settings: settings.defaults,
+                        })
                         .await;
+                    match result {
+                        Ok(_) => model_launcher_ui::report_status("Settings saved"),
+                        Err(error) => {
+                            model_launcher_ui::report_status(format!("Settings failed: {error}"))
+                        }
+                    }
                 });
             }
         }),
@@ -150,13 +168,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         engine_settings: Arc::new({
             let handle = handle.clone();
-            let directory = options.catalog_dir.display().to_string();
             move || {
-                let (distribution, executable) = handle.engine_settings();
+                let settings = handle.launcher_settings();
                 model_launcher_ui::EngineSettings {
-                    model_directory: directory.clone(),
-                    distribution: distribution.unwrap_or_else(|| "Ubuntu".into()),
-                    executable: executable.unwrap_or_else(|| "/usr/local/bin/llama-server".into()),
+                    model_directory: settings.catalog_directory.display().to_string(),
+                    distribution: if settings.engine_distribution.is_empty() {
+                        "Ubuntu".into()
+                    } else {
+                        settings.engine_distribution
+                    },
+                    executable: if settings.engine_executable.is_empty() {
+                        "/usr/local/bin/llama-server".into()
+                    } else {
+                        settings.engine_executable
+                    },
+                    defaults: settings.default_launch_settings,
                 }
             }
         }),
