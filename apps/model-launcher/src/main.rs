@@ -164,7 +164,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         generate_token: Arc::new({
             let handle = handle.clone();
-            move || handle.generate_token().ok().map(|token| token.plaintext)
+            let runtime_handle = runtime_handle.clone();
+            move || {
+                let handle = handle.clone();
+                runtime_handle.spawn(async move {
+                    match tokio::task::spawn_blocking(move || handle.generate_token()).await {
+                        Ok(Ok(token)) => model_launcher_ui::report_generated_token(token.plaintext),
+                        Ok(Err(error)) => model_launcher_ui::report_status(format!(
+                            "Token generation failed: {error}"
+                        )),
+                        Err(error) => model_launcher_ui::report_status(format!(
+                            "Token generation failed: {error}"
+                        )),
+                    }
+                });
+            }
         }),
         engine_settings: Arc::new({
             let handle = handle.clone();

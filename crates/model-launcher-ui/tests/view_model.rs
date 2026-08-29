@@ -136,6 +136,10 @@ fn close_notice_and_plaintext_token_are_each_consumed_once() {
     assert!(notice.take().is_some());
     assert!(notice.take().is_none());
     let mut token = TokenReveal::new("secret-token");
+    assert_eq!(token.expose(), Some("secret-token"));
+    token.clear();
+    assert_eq!(token.expose(), None);
+    let mut token = TokenReveal::new("secret-token");
     assert_eq!(token.take().as_deref(), Some("secret-token"));
     assert!(token.take().is_none());
     assert!(!format!("{token:?}").contains("secret-token"));

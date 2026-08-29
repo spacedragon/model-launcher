@@ -21,7 +21,7 @@ pub struct UiActions {
     pub save_settings: Arc<dyn Fn(EngineSettings) + Send + Sync>,
     pub logs: Arc<dyn Fn(LogFilter) -> Vec<LogRecord> + Send + Sync>,
     pub export_logs: Arc<dyn Fn() + Send + Sync>,
-    pub generate_token: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    pub generate_token: Arc<dyn Fn() + Send + Sync>,
     pub engine_settings: Arc<dyn Fn() -> EngineSettings + Send + Sync>,
 }
 
@@ -84,13 +84,13 @@ pub fn run_desktop(
     let weak = window.as_weak();
     window.on_generate_token({
         let actions = actions.clone();
-        move || {
-            if let Some(token) = (actions.generate_token)()
-                && let Some(window) = weak.upgrade()
-            {
-                window.set_generated_token(token.into());
-            }
+        move || (actions.generate_token)()
+    });
+    window.on_dismiss_token(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_generated_token("".into());
         }
+        clear_token_reveal();
     });
     window.on_copy_text(|text| {
         use copypasta::{ClipboardContext, ClipboardProvider as _};
@@ -107,6 +107,8 @@ pub struct WindowManager {
     last_closed: slint::Weak<MainWindow>,
     address: String,
     actions: UiActions,
+    token_reveal: Option<TokenReveal>,
+    token_timeout: slint::Timer,
 }
 
 impl WindowManager {
@@ -116,6 +118,8 @@ impl WindowManager {
             last_closed: slint::Weak::default(),
             address,
             actions,
+            token_reveal: None,
+            token_timeout: slint::Timer::default(),
         }
     }
 
@@ -132,17 +136,31 @@ impl WindowManager {
         )?;
         #[cfg(windows)]
         window.window().on_close_requested(|| {
-            let _ = slint::invoke_from_event_loop(|| {
-                DESKTOP.with_borrow_mut(|desktop| {
-                    if let Some(desktop) = desktop.as_mut() {
-                        if let Some(message) = (desktop.windows.actions.close_notice)() {
-                            desktop.tray.show_close_notice(&message);
-                        }
-                        let _ = desktop.windows.close();
-                    }
-                })
+            let show_notice = DESKTOP.with_borrow(|desktop| {
+                let Some(desktop) = desktop.as_ref() else {
+                    return false;
+                };
+                let Some(message) = (desktop.windows.actions.close_notice)() else {
+                    return false;
+                };
+                if let Some(window) = desktop.windows.window.as_ref() {
+                    window.set_close_notice_message(message.into());
+                    window.set_close_notice_open(true);
+                }
+                true
             });
-            slint::CloseRequestResponse::HideWindow
+            if show_notice {
+                slint::CloseRequestResponse::KeepWindowShown
+            } else {
+                let _ = slint::invoke_from_event_loop(|| {
+                    DESKTOP.with_borrow_mut(|desktop| {
+                        if let Some(desktop) = desktop.as_mut() {
+                            let _ = desktop.windows.close();
+                        }
+                    })
+                });
+                slint::CloseRequestResponse::HideWindow
+            }
         });
         let weak = window.as_weak();
         window.show()?;
@@ -153,12 +171,41 @@ impl WindowManager {
     pub fn close(&mut self) -> Result<(), slint::PlatformError> {
         use slint::ComponentHandle as _;
         if let Some(window) = self.window.take() {
+            self.clear_token();
             self.last_closed = window.as_weak();
             window.hide()?;
             drop(window);
         }
         debug_assert!(self.last_closed.upgrade().is_none());
         Ok(())
+    }
+
+    #[cfg(windows)]
+    fn reveal_token(&mut self, token: String) {
+        self.clear_token();
+        self.token_reveal = Some(TokenReveal::new(token));
+        if let (Some(window), Some(token)) = (
+            self.window.as_ref(),
+            self.token_reveal.as_ref().and_then(TokenReveal::expose),
+        ) {
+            window.set_generated_token(token.into());
+        }
+        self.token_timeout.start(
+            slint::TimerMode::SingleShot,
+            std::time::Duration::from_secs(60),
+            clear_token_reveal,
+        );
+    }
+
+    fn clear_token(&mut self) {
+        self.token_timeout.stop();
+        if let Some(window) = self.window.as_ref() {
+            window.set_generated_token("".into());
+        }
+        if let Some(token) = self.token_reveal.as_mut() {
+            token.clear();
+        }
+        self.token_reveal = None;
     }
 
     pub fn refresh(&self) {
@@ -231,17 +278,31 @@ fn create_window(
         let actions = actions.clone();
         move || (actions.export_logs)()
     });
-    let weak = window.as_weak();
     window.on_generate_token({
         let actions = actions.clone();
+        move || (actions.generate_token)()
+    });
+    window.on_dismiss_token({
+        let weak = window.as_weak();
         move || {
-            if let Some(token) = (actions.generate_token)()
-                && let Some(window) = weak.upgrade()
-            {
-                window.set_generated_token(token.into());
+            if let Some(window) = weak.upgrade() {
+                window.set_generated_token("".into());
             }
+            clear_token_reveal();
         }
     });
+    #[cfg(windows)]
+    window.on_confirm_close_to_tray(|| {
+        let _ = slint::invoke_from_event_loop(|| {
+            DESKTOP.with_borrow_mut(|desktop| {
+                if let Some(desktop) = desktop.as_mut() {
+                    let _ = desktop.windows.close();
+                }
+            })
+        });
+    });
+    #[cfg(not(windows))]
+    window.on_confirm_close_to_tray(|| {});
     window.on_copy_text(|text| {
         use copypasta::{ClipboardContext, ClipboardProvider as _};
         if let Ok(mut clipboard) = ClipboardContext::new() {
@@ -468,11 +529,37 @@ pub fn report_status(message: impl Into<String>) {
     });
 }
 
+#[cfg(windows)]
+pub fn report_generated_token(token: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        DESKTOP.with_borrow_mut(|desktop| {
+            if let Some(desktop) = desktop.as_mut() {
+                desktop.windows.reveal_token(token);
+            }
+        });
+    });
+}
+
+#[cfg(windows)]
+fn clear_token_reveal() {
+    DESKTOP.with_borrow_mut(|desktop| {
+        if let Some(desktop) = desktop.as_mut() {
+            desktop.windows.clear_token();
+        }
+    });
+}
+
 #[cfg(not(windows))]
 pub fn request_refresh() {}
 
 #[cfg(not(windows))]
 pub fn report_status(_message: impl Into<String>) {}
+
+#[cfg(not(windows))]
+pub fn report_generated_token(_token: String) {}
+
+#[cfg(not(windows))]
+fn clear_token_reveal() {}
 
 #[cfg(windows)]
 fn dispatch_windows(command: TrayCommand) {
@@ -751,6 +838,18 @@ impl TokenReveal {
     pub fn take(&mut self) -> Option<String> {
         self.0.take()
     }
+    #[must_use]
+    pub fn expose(&self) -> Option<&str> {
+        self.0.as_deref()
+    }
+    pub fn clear(&mut self) {
+        if let Some(value) = self.0.as_mut() {
+            unsafe {
+                value.as_bytes_mut().fill(0);
+            }
+        }
+        self.0 = None;
+    }
 }
 impl fmt::Debug for TokenReveal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -761,11 +860,7 @@ impl fmt::Debug for TokenReveal {
 }
 impl Drop for TokenReveal {
     fn drop(&mut self) {
-        if let Some(value) = self.0.as_mut() {
-            unsafe {
-                value.as_bytes_mut().fill(0);
-            }
-        }
+        self.clear();
     }
 }
 

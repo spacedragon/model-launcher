@@ -25,7 +25,7 @@ fn real_main_window_weak_reference_dies_for_fifty_recreate_cycles() {
         save_settings: Arc::new(|_| {}),
         logs: Arc::new(|_: LogFilter| vec![]),
         export_logs: Arc::new(|| {}),
-        generate_token: Arc::new(|| None),
+        generate_token: Arc::new(|| {}),
         engine_settings: Arc::new(EngineSettings::default),
     };
     let mut windows = WindowManager::new("127.0.0.1:1234".into(), actions);
