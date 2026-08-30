@@ -1,6 +1,6 @@
 # Model Launcher MVP verification evidence
 
-Verified 2026-08-30 on commit `8717042bd04e5ab2533345357d203635fd607d39` before this evidence commit.
+Verified 2026-08-30 on commit `068d09adb09a87e1c2d84ae1463db27cc47047ff` before this evidence update.
 
 ## Status vocabulary
 
@@ -17,12 +17,12 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 
 | Command | Result | Duration / count | Notes |
 |---|---|---|---|
-| `cargo clean` | Compile PASS, exit 0 | 0.04 s on the evidentiary rerun | Cargo metadata identified the sole target directory as repository-local `target`; the initial removal completed and left `target` absent, then the exact evidentiary rerun reported `Removed 0 files`. No source/user path was targeted. |
-| `cargo fmt --all --check` | Compile PASS, exit 0 | 0.24 s | No diff. |
-| `cargo clippy --workspace --all-targets -- -D warnings` | Compile PASS, exit 0 | 62.34 s | Clean rebuild; warnings denied. |
-| `cargo test --workspace --all-targets` | Automated PASS, exit 0 | All test binaries passed; 0 failed | Final rerun outside the restricted socket sandbox included 34/34 headless, 32/32 API contracts, 1/1 proxy unit, and 17/17 UI view-model tests. An earlier restricted run was denied loopback/socket operations (`Operation not permitted`); it was environmental and is not counted as a pass. Windows-gated native-window tests compiled but ran 0 tests on macOS. |
-| `cargo build -p model-launcher --release` | Compile PASS, exit 0 | 122.03 s | Release profile completed. |
-| `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` | Compile PASS, exit 0 | 66.81 s | Cross-target compilation only; no Windows execution. |
+| `cargo clean` | Compile PASS, exit 0 | Removed 39,616 files / 13.1 GiB | Cargo metadata identified the sole target directory as repository-local `target`; no source/user path was targeted. |
+| `cargo fmt --all --check` | Compile PASS, exit 0 | not timed | No diff. |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Compile PASS, exit 0 | about 52 s | Clean rebuild; warnings denied. |
+| `cargo test --workspace --all-targets` | Automated PASS, exit 0 | 239 passed; 0 failed | Final rerun outside the restricted socket sandbox included 36/36 headless, 32/32 API contracts, 1/1 proxy unit, 18/18 UI view-model, and all remaining workspace tests. An earlier restricted run was denied loopback/socket operations (`Operation not permitted`); it was environmental and is not counted as a pass. Windows-gated native-window tests compiled but ran 0 tests on macOS. |
+| `cargo build -p model-launcher --release` | Compile PASS, exit 0 | 2 min 21 s | Release profile completed. |
+| `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` | Compile PASS, exit 0 | 1 min 52 s | Cross-target compilation only; no Windows execution. |
 | `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` | BLOCKED, exit 101 | 1.11 s | Target not installed. The installed MSVC check above is the relevant Windows cross-target evidence. |
 | `ruby tests/windows-wsl/validate.rb` | Automated PASS, exit 0 | not timed | Printed `Windows packaging contracts passed`. |
 
@@ -84,7 +84,7 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 | Quiet Native top title/navigation layout and full-width responsive Models page | `crates/model-launcher-ui/ui/{app.slint,components/*.slint}` | `modal_layout_stays_inside_compact_and_narrow_viewports`; `snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata`; `model_search_matches_name_key_and_path_case_insensitively` | Automated PASS for view model/compile; visual Windows inspection NOT RUN |
 | Load modal exposes editable key and supported settings, defaults from global profile, retains unsupported saved values visibly/read-only | UI Slint + adapter; core capability/profile | `load_dialog_adapter_hydrates_every_saved_profile_value`; `load_dialog_adapter_keeps_unsupported_saved_fields_visible_and_read_only`; `newly_discovered_models_inherit_global_launch_defaults` | Automated PASS |
 | Server/log/settings actions, filtered bounded redacted logs, save performs validation/probe | UI adapter + service + core log/config | `log_commands_use_bounded_filtered_redacted_snapshots`; `filters_use_typed_source_and_minimum_level`; `engine_settings_validate_persist_then_apply_exact_inputs`; `launcher_settings_saves_are_serialized_across_async_validation`; `launcher_settings_save_aborts_after_validation_when_shutdown_starts` | Automated PASS |
-| Server form preserves unsaved drafts during refresh while live auth/token state stays current | `crates/model-launcher-ui/src/lib.rs`; `crates/model-launcher-ui/ui/app.slint` | UI view-model suite 17/17, including server-setting hydration and refresh behavior | Automated PASS |
+| Server form preserves unsaved drafts during refresh while live auth/token state stays current | `crates/model-launcher-ui/src/lib.rs`; `crates/model-launcher-ui/ui/app.slint` | UI view-model suite 18/18, including server-setting hydration and refresh behavior | Automated PASS |
 | Tray status/open/eject/recent/quit; reactive stable recent IDs; ordered shutdown | `crates/model-launcher-ui/src/tray.rs`; `apps/model-launcher/src/{main,service}.rs` | `tray_maps_commands_without_opening_a_real_window_and_drops_windows`; `tray_recent_request_resolves_stable_id_after_catalog_reordering`; `recent_models_are_successful_mru_entries_with_stable_ids`; headless shutdown tests | Automated PASS; real tray NOT RUN |
 | Close destroys/recreates window, one-time continued-in-tray notice, snapshots hydrate fresh state | `crates/model-launcher-ui/src/lib.rs` | `close_notice_and_plaintext_token_are_each_consumed_once`; `close_notice_consumption_is_persisted`; Windows test `real_main_window_weak_reference_dies_for_fifty_recreate_cycles` compiled but did not run | Automated PASS for state logic; native lifecycle NOT RUN |
 | Versioned JSON config; atomic replace/backup; migrations; quarantine corrupt/unsupported; failures do not claim persistence | `crates/model-launcher-core/src/config.rs` | config tests `configuration_round_trips`, `save_atomically_replaces_the_main_file`, `replacement_retains_the_last_valid_backup`, `migrates_a_version_zero_fixture`, `corrupt_file_is_quarantined_without_being_overwritten`, `unsupported_version_is_quarantined`, `replacement_failure_preserves_main_and_cleans_temporary_file` | Automated PASS |
@@ -112,9 +112,9 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 |---|---|---|
 | Automated unit: help/capabilities, paths, shards/identity, lifecycle/cancellation/backoff | Named tests above; fresh workspace suite | Automated PASS |
 | API contracts: list/load/unload, forwarding, errors, auth, raw SSE | `contracts.rs` 32/32 plus proxy unit 1/1 | Automated PASS |
-| Fake-engine/headless lifecycle integration including readiness/crash/timeout/replacement/shared JIT | lifecycle 30/30 and headless 34/34 | Automated PASS |
+| Fake-engine/headless lifecycle integration including readiness/crash/timeout/replacement/shared JIT | lifecycle 31/31 and headless 36/36 | Automated PASS |
 | Persistence: atomic writes, migration, corruption, missing/moved | config 20/20 and catalog 37/37 | Automated PASS |
-| Slint view-model responsiveness and action availability | view-model 17/17 | Automated PASS |
+| Slint view-model responsiveness and action availability | view-model 18/18 | Automated PASS |
 | Windows package metadata and harness contract | release build, MSVC cross-check, Ruby validator; `apps/model-launcher/resources/*`, workflows, README | Compile PASS / Automated PASS |
 | Real Windows acceptance steps 1–10 (probe, discover/edit key, UI load + streamed chat, LM unload, JIT, busy, crash/backoff, eject-backoff, tray reopen, restart/no auto-load) | `tests/windows-wsl/smoke.ps1` and its README define executable evidence capture, but no Windows/WSL/model was available | NOT RUN |
 | Resource: destroyed window/component while tray/core remain | Windows weak-reference test and `-ManualResourceChecks` harness exist | NOT RUN |
