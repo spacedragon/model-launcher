@@ -102,6 +102,10 @@ fn missing_config_loads_as_default() {
         LauncherConfig::default()
     );
     assert!(!store.config_path().exists());
+    let defaults = LauncherConfig::default();
+    assert_eq!(defaults.bind_address, "127.0.0.1");
+    assert_eq!(defaults.port, 1234);
+    assert!(!defaults.auth_enabled);
 }
 
 #[test]
@@ -478,7 +482,7 @@ fn migrates_a_version_zero_fixture() {
     assert_eq!(migrated.models, vec![model(ModelState::Missing)]);
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(store.config_path()).unwrap()).unwrap();
-    assert_eq!(persisted["version"], 1);
+    assert_eq!(persisted["version"], 2);
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use model_launcher::{EngineSettingsManager, LauncherSettings, Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
-use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
+use model_launcher_core::{ConfigStore, LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
 use model_launcher_wsl::{LlamaCppWslEngine, ProbeCache, TokioCommandRunner, WslProber};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -10,13 +10,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let base = platform_data_dir();
+    let persisted = ConfigStore::new(base.join("config")).load_with_diagnostic()?.config;
     let token_store = Arc::new(TokenStore::default());
+    let authentication = if persisted.auth_enabled {
+        Authentication::Tokens(token_store)
+    } else {
+        Authentication::Disabled
+    };
+    let bind: std::net::SocketAddr =
+        format!("{}:{}", persisted.bind_address, persisted.port).parse()?;
+    let auth_enabled = persisted.auth_enabled;
+    let lan_warning = if !bind.ip().is_loopback() {
+        "Warning: the server is exposed to the local network."
+    } else {
+        ""
+    }
+    .to_owned();
     let options = ServiceOptions {
         config_dir: base.join("config"),
         catalog_dir: base.join("models"),
         gateway: GatewayConfig {
-            bind: "127.0.0.1:1234".parse()?,
-            authentication: Authentication::Tokens(token_store),
+            bind,
+            authentication,
             limits: GatewayLimits::default(),
         },
         watch_catalog: true,
@@ -45,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
     let handle = service.handle();
     let snapshot = handle.snapshot();
+    let snapshot_lan_warning = lan_warning.clone();
     let runtime_handle = runtime.handle().clone();
     let close_notice = Arc::new(std::sync::Mutex::new((
         CloseNoticeStore::new(base.join("close-to-tray-notice")),
@@ -101,8 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recent_models: handle.recent_models(),
                     lifecycle: snapshot.lifecycle,
                     capabilities: handle.capabilities(),
-                    authentication_status: "Token authentication enabled".into(),
-                    server_warning: String::new(),
+                    authentication_status: if auth_enabled { "Token authentication enabled" } else { "Authentication disabled" }.into(),
+                    server_warning: snapshot_lan_warning.clone(),
                     engine_valid: snapshot.engine_valid,
                     engine_diagnostic: snapshot.engine_diagnostic,
                 }
@@ -251,8 +267,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             recent_models: handle.recent_models(),
             lifecycle: snapshot.lifecycle,
             capabilities: handle.capabilities(),
-            authentication_status: "Token authentication enabled".into(),
-            server_warning: String::new(),
+            authentication_status: if auth_enabled { "Token authentication enabled" } else { "Authentication disabled" }.into(),
+            server_warning: lan_warning,
             engine_valid: snapshot.engine_valid,
             engine_diagnostic: snapshot.engine_diagnostic,
         },

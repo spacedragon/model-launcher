@@ -10,11 +10,11 @@ use uuid::Uuid;
 
 use crate::{AppError, LaunchSettings, ModelRecord};
 
-const CURRENT_VERSION: u32 = 1;
+const CURRENT_VERSION: u32 = 2;
 const CONFIG_FILE: &str = "config.json";
 const BACKUP_FILE: &str = "config.json.backup";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LauncherConfig {
     #[serde(default)]
     pub models: Vec<ModelRecord>,
@@ -28,6 +28,34 @@ pub struct LauncherConfig {
     pub catalog_directory: Option<PathBuf>,
     #[serde(default)]
     pub default_launch_settings: LaunchSettings,
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub auth_enabled: bool,
+}
+
+fn default_bind_address() -> String {
+    "127.0.0.1".into()
+}
+const fn default_port() -> u16 {
+    1234
+}
+impl Default for LauncherConfig {
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            auth_token_hashes: Vec::new(),
+            engine_distribution: None,
+            engine_executable: None,
+            catalog_directory: None,
+            default_launch_settings: LaunchSettings::default(),
+            bind_address: default_bind_address(),
+            port: default_port(),
+            auth_enabled: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -296,6 +324,10 @@ impl ConfigStore {
             CURRENT_VERSION => {
                 let envelope: Envelope = serde_json::from_slice(&bytes).map_err(config_format)?;
                 Ok((envelope.config, false))
+            }
+            1 => {
+                let old: Envelope = serde_json::from_slice(&bytes).map_err(config_format)?;
+                Ok((old.config, true))
             }
             0 => {
                 let old: VersionZero = serde_json::from_slice(&bytes).map_err(config_format)?;
