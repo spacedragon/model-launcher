@@ -15,7 +15,10 @@ export component LoadDialog inherits Rectangle {
     in property <bool> show-threads: true; in property <bool> show-batch: true;
     in property <bool> show-parallel: true; in property <bool> show-flash: true;
     in property <bool> show-kv: true;
-    callback confirm(string, int, int, int, int, int, bool, string);
+    in property <bool> unsupported-context; in property <bool> unsupported-gpu; in property <bool> unsupported-threads;
+    in property <bool> unsupported-batch; in property <bool> unsupported-parallel; in property <bool> unsupported-flash; in property <bool> unsupported-kv;
+    in-out property <bool> clear-context; in-out property <bool> clear-gpu; in-out property <bool> clear-threads; in-out property <bool> clear-batch; in-out property <bool> clear-parallel; in-out property <bool> clear-flash; in-out property <bool> clear-kv;
+    callback confirm(string, int, int, int, int, int, bool, string, bool, bool, bool, bool, bool, bool, bool);
     visible: open; background: #88000000;
     Rectangle {
         width: min(440px, parent.width - 32px); height: 500px; x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
@@ -24,14 +27,14 @@ export component LoadDialog inherits Rectangle {
             Text { text: "Load model"; color: #1F2937; font-family: "Segoe UI"; font-size: 18px; font-weight: 600; }
             Text { text: "Model key"; color: #667085; font-family: "Segoe UI"; font-size: 12px; }
             key := LineEdit { text <=> root.model-key; accessible-label: "Model key"; }
-            ctx := SpinBox { visible: root.show-context; value <=> root.context-value; minimum: 1; maximum: 1048576; accessible-label: "Context length"; }
-            gpu := SpinBox { visible: root.show-gpu; value <=> root.gpu-value; minimum: 0; maximum: 999; accessible-label: "GPU layers"; }
-            threads := SpinBox { visible: root.show-threads; value <=> root.threads-value; minimum: 1; maximum: 1024; accessible-label: "CPU threads"; }
-            batch := SpinBox { visible: root.show-batch; value <=> root.batch-value; minimum: 1; maximum: 1048576; accessible-label: "Batch size"; }
-            parallel := SpinBox { visible: root.show-parallel; value <=> root.parallel-value; minimum: 1; maximum: 1024; accessible-label: "Parallel slots"; }
-            flash := CheckBox { visible: root.show-flash; checked <=> root.flash-value; text: "Flash attention"; accessible-label: "Flash attention"; }
-            kv := ComboBox { visible: root.show-kv; current-value <=> root.kv-value; model: ["f16", "q8_0", "q4_0"]; accessible-label: "KV cache type"; }
-            HorizontalLayout { spacing: 8px; Rectangle { horizontal-stretch: 1; } Button { text: "Cancel"; clicked => { root.open=false; } } Button { text: "Load"; primary: true; clicked => { root.confirm(root.model-key, ctx.value, gpu.value, threads.value, batch.value, parallel.value, flash.checked, kv.current-value); } } }
+            HorizontalLayout { visible: root.show-context; ctx := SpinBox { enabled: !root.unsupported-context; value <=> root.context-value; minimum: 1; maximum: 1048576; accessible-label: "Context length"; } Text { visible: root.unsupported-context; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-context; text: "Clear"; clicked => { root.clear-context=true; } } }
+            HorizontalLayout { visible: root.show-gpu; gpu := SpinBox { enabled: !root.unsupported-gpu; value <=> root.gpu-value; minimum: 0; maximum: 999; accessible-label: "GPU layers"; } Text { visible: root.unsupported-gpu; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-gpu; text: "Clear"; clicked => { root.clear-gpu=true; } } }
+            HorizontalLayout { visible: root.show-threads; threads := SpinBox { enabled: !root.unsupported-threads; value <=> root.threads-value; minimum: 1; maximum: 1024; accessible-label: "CPU threads"; } Text { visible: root.unsupported-threads; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-threads; text: "Clear"; clicked => { root.clear-threads=true; } } }
+            HorizontalLayout { visible: root.show-batch; batch := SpinBox { enabled: !root.unsupported-batch; value <=> root.batch-value; minimum: 1; maximum: 1048576; accessible-label: "Batch size"; } Text { visible: root.unsupported-batch; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-batch; text: "Clear"; clicked => { root.clear-batch=true; } } }
+            HorizontalLayout { visible: root.show-parallel; parallel := SpinBox { enabled: !root.unsupported-parallel; value <=> root.parallel-value; minimum: 1; maximum: 1024; accessible-label: "Parallel slots"; } Text { visible: root.unsupported-parallel; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-parallel; text: "Clear"; clicked => { root.clear-parallel=true; } } }
+            HorizontalLayout { visible: root.show-flash; flash := CheckBox { enabled: !root.unsupported-flash; checked <=> root.flash-value; text: "Flash attention"; accessible-label: "Flash attention"; } Text { visible: root.unsupported-flash; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-flash; text: "Clear"; clicked => { root.clear-flash=true; } } }
+            HorizontalLayout { visible: root.show-kv; kv := ComboBox { enabled: !root.unsupported-kv; current-value <=> root.kv-value; model: ["f16", "q8_0", "q4_0"]; accessible-label: "KV cache type"; } Text { visible: root.unsupported-kv; text: "Saved but unsupported; omitted at launch"; color: #B54708; } Button { visible: root.unsupported-kv; text: "Clear"; clicked => { root.clear-kv=true; } } }
+            HorizontalLayout { spacing: 8px; Rectangle { horizontal-stretch: 1; } Button { text: "Cancel"; clicked => { root.open=false; } } Button { text: "Load"; primary: true; clicked => { root.confirm(root.model-key, ctx.value, gpu.value, threads.value, batch.value, parallel.value, flash.checked, kv.current-value, root.clear-context, root.clear-gpu, root.clear-threads, root.clear-batch, root.clear-parallel, root.clear-flash, root.clear-kv); } } }
         }
     }
 }

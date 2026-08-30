@@ -50,6 +50,15 @@ pub fn load_dialog_values_for(snapshot: &AppSnapshot, id: ModelId) -> Option<UiL
     load_request_for(snapshot, id)
 }
 
+#[must_use]
+pub fn load_dialog_fields_for(snapshot: &AppSnapshot, id: ModelId) -> Option<Vec<SettingField>> {
+    let model = snapshot.models.iter().find(|model| model.id == id)?;
+    Some(ViewModel::setting_fields(
+        &model.launch_profile.settings,
+        &snapshot.capabilities,
+    ))
+}
+
 #[cfg(not(windows))]
 pub fn run_desktop(
     snapshot: AppSnapshot,
@@ -403,8 +412,12 @@ fn install_prepare_load(window: &MainWindow, actions: UiActions) {
         let Ok(uuid) = uuid::Uuid::parse_str(&raw) else {
             return;
         };
-        let Some(values) = load_dialog_values_for(&(actions.snapshot)(), ModelId::from_uuid(uuid))
-        else {
+        let snapshot = (actions.snapshot)();
+        let id = ModelId::from_uuid(uuid);
+        let Some(values) = load_dialog_values_for(&snapshot, id) else {
+            return;
+        };
+        let Some(fields) = load_dialog_fields_for(&snapshot, id) else {
             return;
         };
         let Some(window) = weak.upgrade() else {
@@ -431,6 +444,47 @@ fn install_prepare_load(window: &MainWindow, actions: UiActions) {
             }
             .into(),
         );
+        for field in fields {
+            let (visible, unsupported) = (field.visible, field.retained_unsupported);
+            match field.id {
+                "context_length" => {
+                    window.set_selected_show_context(visible);
+                    window.set_selected_unsupported_context(unsupported);
+                    window.set_selected_clear_context(false);
+                }
+                "gpu_layers" => {
+                    window.set_selected_show_gpu(visible);
+                    window.set_selected_unsupported_gpu(unsupported);
+                    window.set_selected_clear_gpu(false);
+                }
+                "cpu_threads" => {
+                    window.set_selected_show_threads(visible);
+                    window.set_selected_unsupported_threads(unsupported);
+                    window.set_selected_clear_threads(false);
+                }
+                "batch_size" => {
+                    window.set_selected_show_batch(visible);
+                    window.set_selected_unsupported_batch(unsupported);
+                    window.set_selected_clear_batch(false);
+                }
+                "parallel_slots" => {
+                    window.set_selected_show_parallel(visible);
+                    window.set_selected_unsupported_parallel(unsupported);
+                    window.set_selected_clear_parallel(false);
+                }
+                "flash_attention" => {
+                    window.set_selected_show_flash(visible);
+                    window.set_selected_unsupported_flash(unsupported);
+                    window.set_selected_clear_flash(false);
+                }
+                "kv_cache_type" => {
+                    window.set_selected_show_kv(visible);
+                    window.set_selected_unsupported_kv(unsupported);
+                    window.set_selected_clear_kv(false);
+                }
+                _ => {}
+            }
+        }
         window.set_load_dialog_open(true);
     });
 }
@@ -588,22 +642,45 @@ fn hydrate_capabilities(window: &MainWindow, caps: &EngineCapabilities) {
 
 fn install_load_callback(window: &MainWindow, actions: UiActions) {
     window.on_load_model(
-        move |raw, key, context, gpu, threads, batch, parallel, flash, kv| {
+        move |raw,
+              key,
+              context,
+              gpu,
+              threads,
+              batch,
+              parallel,
+              flash,
+              kv,
+              clear_context,
+              clear_gpu,
+              clear_threads,
+              clear_batch,
+              clear_parallel,
+              clear_flash,
+              clear_kv| {
             let Ok(uuid) = uuid::Uuid::parse_str(&raw) else {
                 return;
             };
             let settings = LaunchSettings {
-                context_length: model_launcher_core::ContextLength::new(context as u32).ok(),
-                gpu_layers: Some(model_launcher_core::GpuLayers::new(gpu as u32)),
-                cpu_threads: model_launcher_core::CpuThreads::new(threads as u32).ok(),
-                batch_size: model_launcher_core::BatchSize::new(batch as u32).ok(),
-                parallel_slots: model_launcher_core::ParallelSlots::new(parallel as u32).ok(),
-                flash_attention: Some(flash),
-                kv_cache_type: match kv.as_str() {
-                    "q8_0" => Some(model_launcher_core::KvCacheType::Q8_0),
-                    "q4_0" => Some(model_launcher_core::KvCacheType::Q4_0),
-                    _ => Some(model_launcher_core::KvCacheType::F16),
-                },
+                context_length: (!clear_context)
+                    .then(|| model_launcher_core::ContextLength::new(context as u32).ok())
+                    .flatten(),
+                gpu_layers: (!clear_gpu).then(|| model_launcher_core::GpuLayers::new(gpu as u32)),
+                cpu_threads: (!clear_threads)
+                    .then(|| model_launcher_core::CpuThreads::new(threads as u32).ok())
+                    .flatten(),
+                batch_size: (!clear_batch)
+                    .then(|| model_launcher_core::BatchSize::new(batch as u32).ok())
+                    .flatten(),
+                parallel_slots: (!clear_parallel)
+                    .then(|| model_launcher_core::ParallelSlots::new(parallel as u32).ok())
+                    .flatten(),
+                flash_attention: (!clear_flash).then_some(flash),
+                kv_cache_type: (!clear_kv).then(|| match kv.as_str() {
+                    "q8_0" => model_launcher_core::KvCacheType::Q8_0,
+                    "q4_0" => model_launcher_core::KvCacheType::Q4_0,
+                    _ => model_launcher_core::KvCacheType::F16,
+                }),
             };
             (actions.load)(UiLoadRequest {
                 id: ModelId::from_uuid(uuid),
@@ -932,10 +1009,10 @@ impl ViewModel {
     }
 }
 
-fn field(id: &'static str, visible: bool, retained_unsupported: bool) -> SettingField {
+fn field(id: &'static str, supported: bool, retained_unsupported: bool) -> SettingField {
     SettingField {
         id,
-        visible,
+        visible: supported || retained_unsupported,
         retained_unsupported,
     }
 }

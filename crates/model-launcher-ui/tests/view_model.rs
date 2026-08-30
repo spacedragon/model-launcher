@@ -14,7 +14,7 @@ use model_launcher_core::{
 use model_launcher_ui::{
     AppSnapshot, CloseNotice, CloseNoticeStore, EngineSettings, LogCommands, MetadataVisibility,
     ModelAction, RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
-    load_dialog_values_for, load_request_for,
+    load_dialog_fields_for, load_dialog_values_for, load_request_for,
 };
 
 fn model(name: &str, size: u64) -> ModelRecord {
@@ -157,7 +157,7 @@ fn capability_visibility_retains_and_reports_unsupported_values() {
     assert!(
         fields
             .iter()
-            .any(|field| field.id == "gpu_layers" && !field.visible && field.retained_unsupported)
+            .any(|field| field.id == "gpu_layers" && field.visible && field.retained_unsupported)
     );
     assert_eq!(settings.gpu_layers.unwrap().get(), 20);
 }
@@ -335,4 +335,39 @@ fn load_dialog_adapter_hydrates_every_saved_profile_value() {
     let values = load_dialog_values_for(&snapshot, alpha.id).unwrap();
     assert_eq!(values.key, alpha.key.to_string());
     assert_eq!(values.settings, alpha.launch_profile.settings);
+}
+
+#[test]
+fn load_dialog_adapter_keeps_unsupported_saved_fields_visible_and_read_only() {
+    let mut alpha = model("Alpha", 1);
+    alpha.launch_profile.settings.gpu_layers = Some(model_launcher_core::GpuLayers::new(23));
+    let snapshot = AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities {
+            context_length: true,
+            ..EngineCapabilities::default()
+        },
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+    };
+
+    let gpu = load_dialog_fields_for(&snapshot, alpha.id)
+        .unwrap()
+        .into_iter()
+        .find(|field| field.id == "gpu_layers")
+        .unwrap();
+    assert!(gpu.visible);
+    assert!(gpu.retained_unsupported);
+    assert_eq!(
+        alpha
+            .launch_profile
+            .settings
+            .render(&snapshot.capabilities)
+            .unsupported,
+        vec![model_launcher_core::SettingId::GpuLayers]
+    );
 }
