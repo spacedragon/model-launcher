@@ -67,7 +67,7 @@ impl CatalogIdentity {
                     + i128::from(metadata.st_birthtime_nsec())
             };
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-            let change_nanos = 0;
+            let change_nanos = 0_i128;
             Self::Unix {
                 device: metadata.dev(),
                 inode_fingerprint: stable_fingerprint(&[
