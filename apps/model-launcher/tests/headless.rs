@@ -129,6 +129,44 @@ async fn launcher_settings_saves_are_serialized_across_async_validation() {
 }
 
 #[tokio::test]
+async fn engine_settings_saves_are_serialized_across_async_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let settings = Arc::new(BlockingSettings {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+        first_entered: tokio::sync::Notify::new(),
+        release_first: tokio::sync::Notify::new(),
+    });
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), String::new()),
+        idle_engine(),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let first = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.save_engine_settings("First".into(), "/first".into()).await }
+    });
+    settings.first_entered.notified().await;
+    let second = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.save_engine_settings("Second".into(), "/second".into()).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(settings.max_active.load(Ordering::SeqCst), 1);
+    settings.release_first.notify_one();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(handle.engine_settings().0.as_deref(), Some("Second"));
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn engine_settings_validate_persist_then_apply_exact_inputs() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();
@@ -390,7 +428,7 @@ async fn service_persists_live_tokens_and_exposes_redacted_logs() {
     };
     let service = Service::start(first_options, engine()).await.unwrap();
     let handle = service.handle();
-    let plaintext = handle.generate_token().unwrap().plaintext;
+    let plaintext = handle.generate_token().await.unwrap().plaintext;
     handle.log_store().append(LogRecord {
         timestamp_ms: 1,
         source: LogSource::Application,

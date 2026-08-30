@@ -175,11 +175,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             move || {
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
-                    match tokio::task::spawn_blocking(move || handle.generate_token()).await {
-                        Ok(Ok(token)) => model_launcher_ui::report_generated_token(token.plaintext),
-                        Ok(Err(error)) => model_launcher_ui::report_status(format!(
-                            "Token generation failed: {error}"
-                        )),
+                    match handle.generate_token().await {
+                        Ok(token) => model_launcher_ui::report_generated_token(token.plaintext),
                         Err(error) => model_launcher_ui::report_status(format!(
                             "Token generation failed: {error}"
                         )),

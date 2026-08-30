@@ -511,7 +511,11 @@ impl ServiceHandle {
         self.inner.logs.export_json_lines(file)?;
         Ok(())
     }
-    pub fn generate_token(&self) -> Result<CreatedToken, ServiceError> {
+    pub async fn generate_token(&self) -> Result<CreatedToken, ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         let tokens = self
             .inner
             .tokens
@@ -545,6 +549,10 @@ impl ServiceHandle {
         distribution: String,
         executable: String,
     ) -> Result<EngineCapabilities, ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         let manager = self.inner.settings.as_ref().ok_or_else(|| {
             ServiceError::Authentication("engine settings are not configurable".into())
         })?;
@@ -552,6 +560,9 @@ impl ServiceHandle {
             .validate(&distribution, &executable)
             .await
             .map_err(ServiceError::Authentication)?;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         let latest = self.inner.store.update(|config| {
             config.engine_distribution = Some(distribution.clone());
             config.engine_executable = Some(executable.clone());
