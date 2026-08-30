@@ -15,6 +15,9 @@ export component MainWindow inherits Window {
     in property <string> base-url: "http://127.0.0.1:1234";
     in property <string> authentication-status;
     in property <string> server-warning;
+    in-out property <string> server-bind-address: "127.0.0.1";
+    in-out property <int> server-port: 1234;
+    in-out property <bool> server-auth-enabled;
     in property <string> engine-diagnostic;
     in property <[string]> logs;
     in property <string> log-copy-text;
@@ -46,6 +49,7 @@ export component MainWindow inherits Window {
     callback eject-model(string);
     callback rescan(); callback copy-text(string); callback copy-token(string); callback export-logs(); callback save-settings(string, string, string, int, int, int, int, int, bool, string);
     callback generate-token();
+    callback save-server-settings(string, int, bool);
     callback dismiss-token();
     callback confirm-close-to-tray();
     callback filter-logs(string, string);
@@ -83,7 +87,24 @@ export component MainWindow inherits Window {
                     ScrollView { VerticalLayout { spacing: 0px; for row in root.models: ModelRow { model: row; show-size: root.width >= 500px; show-path: root.width >= 720px; action(id) => { if row.action == "Eject" { root.eject-model(id); } else { root.prepare-load(id); } } } } }
                 }
             }
-            if root.page == 1: VerticalLayout { padding: 20px; spacing: 12px; Text { text: "Server"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; } Text { text: "Listener address"; color: #667085; font-family: "Segoe UI"; } HorizontalLayout { Text { text: root.base-url; color: #1F2937; font-family: "Segoe UI"; } Button { text: "Copy"; clicked => { root.copy-text(root.base-url); } } } Text { text: root.authentication-status; color: #1F2937; font-family: "Segoe UI"; } Text { visible: root.server-warning != ""; text: root.server-warning; color: #B54708; font-family: "Segoe UI"; wrap: word-wrap; } Text { text: "Authentication tokens are shown once and cannot be recovered."; color: #667085; font-family: "Segoe UI"; } Button { text: "Generate token"; clicked => { root.generate-token(); } } HorizontalLayout { visible: root.generated-token != ""; LineEdit { text: root.generated-token; read-only: true; accessible-label: "New authentication token"; } Button { text: "Copy token"; clicked => { root.copy-token(root.generated-token); } } Button { text: "Dismiss"; clicked => { root.dismiss-token(); } } } Rectangle { vertical-stretch: 1; } }
+            if root.page == 1: VerticalLayout { padding: 20px; spacing: 12px;
+                Text { text: "Server"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; }
+                ScrollView { vertical-stretch: 1; VerticalLayout { spacing: 12px;
+                Text { text: "Bind address"; color: #667085; font-family: "Segoe UI"; }
+                bind := LineEdit { text <=> root.server-bind-address; accessible-label: "Server bind address"; }
+                Text { text: "Port"; color: #667085; font-family: "Segoe UI"; }
+                port := SpinBox { value <=> root.server-port; minimum: 1; maximum: 65535; accessible-label: "Server port"; }
+                CheckBox { text: "Require bearer token authentication"; checked <=> root.server-auth-enabled; accessible-label: "Require bearer token authentication"; }
+                Button { text: "Save server settings"; primary: true; clicked => { root.save-server-settings(bind.text, port.value, root.server-auth-enabled); } }
+                Text { text: "Listener address"; color: #667085; font-family: "Segoe UI"; }
+                HorizontalLayout { Text { text: root.base-url; color: #1F2937; font-family: "Segoe UI"; } Button { text: "Copy"; clicked => { root.copy-text(root.base-url); } } }
+                Text { text: root.authentication-status; color: #1F2937; font-family: "Segoe UI"; }
+                Text { visible: root.server-warning != ""; text: root.server-warning; color: #B54708; font-family: "Segoe UI"; wrap: word-wrap; }
+                Text { text: "Authentication tokens are shown once and cannot be recovered."; color: #667085; font-family: "Segoe UI"; }
+                Button { text: "Generate token"; enabled: root.server-auth-enabled; clicked => { root.generate-token(); } }
+                HorizontalLayout { visible: root.generated-token != ""; LineEdit { text: root.generated-token; read-only: true; accessible-label: "New authentication token"; } Button { text: "Copy token"; clicked => { root.copy-token(root.generated-token); } } Button { text: "Dismiss"; clicked => { root.dismiss-token(); } } }
+                } }
+            }
             if root.page == 2: VerticalLayout { padding: 16px; spacing: 8px; HorizontalLayout { source-filter := ComboBox { model: ["All sources", "Application", "Engine stdout", "Engine stderr"]; } level-filter := ComboBox { model: ["Trace", "Debug", "Info", "Warn", "Error"]; } Button { text: "Apply filters"; clicked => { root.filter-logs(source-filter.current-value, level-filter.current-value); } } Rectangle { horizontal-stretch: 1; } Button { text: "Copy current"; clicked => { root.copy-text(root.log-copy-text); } } Button { text: "Export"; clicked => { root.export-logs(); } } } Rectangle { background: #FFFFFF; border-width: 1px; border-color: #E5E7EB; ScrollView { VerticalLayout { for line in root.logs: Text { text: line; color: #1F2937; font-family: "Cascadia Mono"; font-size: 11px; wrap: word-wrap; } } } } }
             if root.page == 3: VerticalLayout { padding: 20px; spacing: 8px;
                 Text { text: "Settings"; font-family: "Segoe UI"; font-size: 20px; color: #1F2937; }

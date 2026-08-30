@@ -15,8 +15,31 @@ use model_launcher_ui::{
     AppSnapshot, Clipboard, ClipboardExpiry, CloseNotice, CloseNoticeStore, EngineSettings,
     LogCommands, MetadataVisibility, ModelAction, RecentModels, SaveSettings, TokenReveal,
     TrayCommand, TrayController, ViewModel, load_dialog_fields_for, load_dialog_values_for,
-    load_request_for, modal_layout,
+    load_request_for, modal_layout, parse_server_settings, server_authentication_status,
+    server_base_url, server_lan_warning,
 };
+
+#[test]
+fn server_settings_validate_inputs_and_derive_live_security_copy() {
+    let loopback = parse_server_settings("127.0.0.1", 1234, false).unwrap();
+    assert_eq!(loopback.bind_address, "127.0.0.1");
+    assert_eq!(loopback.port, 1234);
+    assert_eq!(
+        server_authentication_status(&loopback),
+        "Authentication disabled"
+    );
+    assert_eq!(server_lan_warning(&loopback), "");
+
+    let lan = parse_server_settings("0.0.0.0", 8080, false).unwrap();
+    assert_eq!(
+        server_lan_warning(&lan),
+        "Warning: the server is exposed to the local network without authentication."
+    );
+    assert!(parse_server_settings("localhost", 1234, true).is_err());
+    assert!(parse_server_settings("127.0.0.1", 0, true).is_err());
+    let ipv6 = parse_server_settings("::1", 1234, true).unwrap();
+    assert_eq!(server_base_url(&ipv6), "http://[::1]:1234");
+}
 
 #[test]
 fn modal_layout_stays_inside_compact_and_narrow_viewports() {

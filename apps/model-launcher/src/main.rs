@@ -1,7 +1,10 @@
 use model_launcher::{EngineSettingsManager, LauncherSettings, Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{ConfigStore, LogFilter, LogStore, LogStoreLimits};
-use model_launcher_ui::{AppSnapshot, CloseNoticeStore, UiActions, run_desktop};
+use model_launcher_ui::{
+    AppSnapshot, CloseNoticeStore, UiActions, UiServerSettings, run_desktop,
+    server_authentication_status, server_lan_warning,
+};
 use model_launcher_wsl::{LlamaCppWslEngine, ProbeCache, TokioCommandRunner, WslProber};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -21,13 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let bind: std::net::SocketAddr =
         format!("{}:{}", persisted.bind_address, persisted.port).parse()?;
-    let auth_enabled = persisted.auth_enabled;
-    let lan_warning = if !bind.ip().is_loopback() {
-        "Warning: the server is exposed to the local network."
-    } else {
-        ""
-    }
-    .to_owned();
     let options = ServiceOptions {
         config_dir: base.join("config"),
         catalog_dir: base.join("models"),
@@ -63,7 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ))?;
     let handle = service.handle();
     let snapshot = handle.snapshot();
-    let snapshot_lan_warning = lan_warning.clone();
     let runtime_handle = runtime.handle().clone();
     let close_notice = Arc::new(std::sync::Mutex::new((
         CloseNoticeStore::new(base.join("close-to-tray-notice")),
@@ -115,18 +110,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let handle = handle.clone();
             move || {
                 let snapshot = handle.snapshot();
+                let (address, auth_enabled) = handle.server_settings();
+                let server = UiServerSettings {
+                    bind_address: address.ip().to_string(),
+                    port: address.port(),
+                    auth_enabled,
+                };
                 AppSnapshot {
                     models: snapshot.models,
                     recent_models: handle.recent_models(),
                     lifecycle: snapshot.lifecycle,
                     capabilities: handle.capabilities(),
-                    authentication_status: if auth_enabled {
-                        "Token authentication enabled"
-                    } else {
-                        "Authentication disabled"
-                    }
-                    .into(),
-                    server_warning: snapshot_lan_warning.clone(),
+                    authentication_status: server_authentication_status(&server).into(),
+                    server_warning: server_lan_warning(&server).into(),
                     engine_valid: snapshot.engine_valid,
                     engine_diagnostic: snapshot.engine_diagnostic,
                 }
@@ -228,6 +224,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }),
+        server_settings: Arc::new({
+            let handle = handle.clone();
+            move || {
+                let (address, auth_enabled) = handle.server_settings();
+                UiServerSettings {
+                    bind_address: address.ip().to_string(),
+                    port: address.port(),
+                    auth_enabled,
+                }
+            }
+        }),
+        save_server_settings: Arc::new({
+            let handle = handle.clone();
+            let runtime_handle = runtime_handle.clone();
+            move |settings| {
+                let handle = handle.clone();
+                runtime_handle.spawn(async move {
+                    let bind = settings
+                        .bind_address
+                        .parse()
+                        .expect("UI validates server bind addresses");
+                    match handle
+                        .save_server_settings(bind, settings.port, settings.auth_enabled)
+                        .await
+                    {
+                        Ok(()) => model_launcher_ui::report_status("Server settings saved"),
+                        Err(error) => model_launcher_ui::report_status(format!(
+                            "Server settings failed: {error}"
+                        )),
+                    }
+                });
+            }
+        }),
     };
     runtime_handle.spawn({
         let handle = handle.clone();
@@ -269,19 +298,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    let (address, auth_enabled) = handle.server_settings();
+    let server = UiServerSettings {
+        bind_address: address.ip().to_string(),
+        port: address.port(),
+        auth_enabled,
+    };
     run_desktop(
         AppSnapshot {
             models: snapshot.models,
             recent_models: handle.recent_models(),
             lifecycle: snapshot.lifecycle,
             capabilities: handle.capabilities(),
-            authentication_status: if auth_enabled {
-                "Token authentication enabled"
-            } else {
-                "Authentication disabled"
-            }
-            .into(),
-            server_warning: lan_warning,
+            authentication_status: server_authentication_status(&server).into(),
+            server_warning: server_lan_warning(&server).into(),
             engine_valid: snapshot.engine_valid,
             engine_diagnostic: snapshot.engine_diagnostic,
         },

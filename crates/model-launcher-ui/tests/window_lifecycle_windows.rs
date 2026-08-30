@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use model_launcher_core::{EngineCapabilities, LifecycleSnapshot, LogFilter, LogLevel};
-use model_launcher_ui::{AppSnapshot, EngineSettings, UiActions, WindowManager};
+use model_launcher_ui::{AppSnapshot, EngineSettings, UiActions, UiServerSettings, WindowManager};
 use std::sync::Arc;
 
 /// Requires an interactive Windows desktop. Slint 1.16.1's published testing backend omits its
@@ -31,6 +31,12 @@ fn real_main_window_weak_reference_dies_for_fifty_recreate_cycles() {
         export_logs: Arc::new(|| {}),
         generate_token: Arc::new(|| {}),
         engine_settings: Arc::new(EngineSettings::default),
+        server_settings: Arc::new(|| UiServerSettings {
+            bind_address: "127.0.0.1".into(),
+            port: 1234,
+            auth_enabled: false,
+        }),
+        save_server_settings: Arc::new(|_| {}),
     };
     let mut windows = WindowManager::new("127.0.0.1:1234".into(), actions);
     for _ in 0..50 {
@@ -74,18 +80,28 @@ fn dynamic_refresh_preserves_unsaved_settings_and_current_log_filter() {
         export_logs: Arc::new(|| {}),
         generate_token: Arc::new(|| {}),
         engine_settings: Arc::new(EngineSettings::default),
+        server_settings: Arc::new(|| UiServerSettings {
+            bind_address: "127.0.0.1".into(),
+            port: 1234,
+            auth_enabled: false,
+        }),
+        save_server_settings: Arc::new(|_| {}),
     };
     let mut windows = WindowManager::new("127.0.0.1:1234".into(), actions);
     let weak = windows.open().unwrap();
     let window = weak.upgrade().unwrap();
     window.set_model_directory("unsaved/directory".into());
     window.set_engine_executable("unsaved executable".into());
+    window.set_server_bind_address("0.0.0.0".into());
+    window.set_server_port(4321);
     window.invoke_filter_logs("All sources".into(), "Error".into());
 
     windows.refresh_dynamic();
 
     assert_eq!(window.get_model_directory(), "unsaved/directory");
     assert_eq!(window.get_engine_executable(), "unsaved executable");
+    assert_eq!(window.get_server_bind_address(), "0.0.0.0");
+    assert_eq!(window.get_server_port(), 4321);
     assert_eq!(
         observed_filter.lock().unwrap().minimum_level,
         Some(LogLevel::Error)

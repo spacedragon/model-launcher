@@ -1,4 +1,9 @@
-use std::{fmt, io, rc::Rc, sync::Arc};
+use std::{
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+    rc::Rc,
+    sync::Arc,
+};
 
 use model_launcher_core::{
     EngineCapabilities, LaunchSettings, LifecycleSnapshot, LogFilter, LogRecord, LogStore, ModelId,
@@ -109,6 +114,67 @@ pub struct UiActions {
     pub export_logs: Arc<dyn Fn() + Send + Sync>,
     pub generate_token: Arc<dyn Fn() + Send + Sync>,
     pub engine_settings: Arc<dyn Fn() -> EngineSettings + Send + Sync>,
+    pub server_settings: Arc<dyn Fn() -> UiServerSettings + Send + Sync>,
+    pub save_server_settings: Arc<dyn Fn(UiServerSettings) + Send + Sync>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UiServerSettings {
+    pub bind_address: String,
+    pub port: u16,
+    pub auth_enabled: bool,
+}
+
+pub fn parse_server_settings(
+    bind_address: &str,
+    port: i32,
+    auth_enabled: bool,
+) -> Result<UiServerSettings, String> {
+    let bind = bind_address
+        .parse::<IpAddr>()
+        .map_err(|_| "bind address must be an IPv4 or IPv6 address".to_owned())?;
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| "port must be between 1 and 65535".to_owned())?;
+    Ok(UiServerSettings {
+        bind_address: bind.to_string(),
+        port,
+        auth_enabled,
+    })
+}
+
+#[must_use]
+pub fn server_authentication_status(settings: &UiServerSettings) -> &'static str {
+    if settings.auth_enabled {
+        "Token authentication enabled"
+    } else {
+        "Authentication disabled"
+    }
+}
+
+#[must_use]
+pub fn server_base_url(settings: &UiServerSettings) -> String {
+    settings
+        .bind_address
+        .parse::<IpAddr>()
+        .map(|bind| format!("http://{}", SocketAddr::new(bind, settings.port)))
+        .unwrap_or_default()
+}
+
+#[must_use]
+pub fn server_lan_warning(settings: &UiServerSettings) -> &'static str {
+    let is_loopback = settings
+        .bind_address
+        .parse::<IpAddr>()
+        .is_ok_and(|bind| bind.is_loopback());
+    match (is_loopback, settings.auth_enabled) {
+        (true, _) => "",
+        (false, true) => "Warning: the server is exposed to the local network.",
+        (false, false) => {
+            "Warning: the server is exposed to the local network without authentication."
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -158,6 +224,7 @@ pub fn run_desktop(
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     hydrate_server(&window, &view_model.snapshot);
+    hydrate_server_settings(&window, (actions.server_settings)());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
     hydrate_capabilities(&window, &view_model.snapshot.capabilities);
     set_logs(&window, (actions.logs)(LogFilter::default()));
@@ -165,6 +232,7 @@ pub fn run_desktop(
     install_load_callback(&window, actions.clone());
     install_prepare_load(&window, actions.clone());
     install_model_search(&window, actions.clone());
+    install_server_settings_callback(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -351,6 +419,7 @@ impl WindowManager {
         )))));
         window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
         hydrate_server(window, &view_model.snapshot);
+        refresh_server_settings(window, (self.actions.server_settings)());
         let filter = *self
             .current_log_filter
             .read()
@@ -386,6 +455,7 @@ fn create_window(
     window.set_models(ModelRc::from(Rc::new(VecModel::from(rows))));
     window.set_base_url(format!("http://{address}").into());
     hydrate_server(&window, &view_model.snapshot);
+    hydrate_server_settings(&window, (actions.server_settings)());
     window.set_service_status(format!("{:?}", view_model.snapshot.lifecycle.state).into());
     hydrate_capabilities(&window, &view_model.snapshot.capabilities);
     set_logs(&window, (actions.logs)(LogFilter::default()));
@@ -393,6 +463,7 @@ fn create_window(
     install_load_callback(&window, actions.clone());
     install_prepare_load(&window, actions.clone());
     install_model_search(&window, actions.clone());
+    install_server_settings_callback(&window, actions.clone());
     window.on_eject_model({
         let actions = actions.clone();
         move |_| (actions.eject)()
@@ -707,6 +778,34 @@ fn hydrate_server(window: &MainWindow, snapshot: &AppSnapshot) {
             .unwrap_or_default()
             .into(),
     );
+}
+
+fn hydrate_server_settings(window: &MainWindow, settings: UiServerSettings) {
+    window.set_server_bind_address(settings.bind_address.clone().into());
+    window.set_server_port(i32::from(settings.port));
+    window.set_server_auth_enabled(settings.auth_enabled);
+    window.set_base_url(server_base_url(&settings).into());
+    window.set_authentication_status(server_authentication_status(&settings).into());
+    window.set_server_warning(server_lan_warning(&settings).into());
+}
+
+fn refresh_server_settings(window: &MainWindow, settings: UiServerSettings) {
+    let base_url = server_base_url(&settings);
+    if window.get_base_url().as_str() != base_url {
+        hydrate_server_settings(window, settings);
+        return;
+    }
+    window.set_authentication_status(server_authentication_status(&settings).into());
+    window.set_server_warning(server_lan_warning(&settings).into());
+}
+
+fn install_server_settings_callback(window: &MainWindow, actions: UiActions) {
+    window.on_save_server_settings(move |bind_address, port, auth_enabled| {
+        match parse_server_settings(&bind_address, port, auth_enabled) {
+            Ok(settings) => (actions.save_server_settings)(settings),
+            Err(error) => report_status(format!("Server settings failed: {error}")),
+        }
+    });
 }
 
 fn launch_settings(

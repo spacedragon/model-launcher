@@ -452,6 +452,19 @@ impl ServiceHandle {
     pub fn local_addr(&self) -> SocketAddr {
         *self.inner.address.read().expect("address lock poisoned")
     }
+    pub fn server_settings(&self) -> (SocketAddr, bool) {
+        let policy = self
+            .inner
+            .authentication_policy
+            .read()
+            .expect("authentication policy lock poisoned")
+            .clone();
+        let auth_enabled = matches!(
+            *policy.read().expect("authentication lock poisoned"),
+            Authentication::Tokens(_)
+        );
+        (self.local_addr(), auth_enabled)
+    }
     pub fn snapshot(&self) -> ServiceSnapshot {
         ServiceSnapshot {
             models: self
