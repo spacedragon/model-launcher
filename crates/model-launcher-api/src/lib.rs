@@ -199,7 +199,7 @@ pub(crate) struct AppState {
     client: reqwest::Client,
     limits: GatewayLimits,
     connections: Arc<Semaphore>,
-    authentication: Authentication,
+    authentication: Arc<std::sync::RwLock<Authentication>>,
     management: Arc<dyn ManagementModelResolver>,
     profiles: Arc<dyn ProfileUpdater>,
 }
@@ -263,10 +263,14 @@ impl Gateway {
                 client,
                 limits: config.limits,
                 connections: Arc::new(Semaphore::new(config.limits.max_in_flight_requests)),
-                authentication: config.authentication.clone(),
+                authentication: Arc::new(std::sync::RwLock::new(config.authentication.clone())),
             },
             config,
         })
+    }
+
+    pub fn authentication_policy(&self) -> Arc<std::sync::RwLock<Authentication>> {
+        self.state.authentication.clone()
     }
 
     pub fn router(&self) -> Router {
@@ -379,7 +383,12 @@ impl Drop for GatewayServer {
 }
 
 async fn authenticate(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    let allowed = match &state.authentication {
+    let authentication = state
+        .authentication
+        .read()
+        .expect("authentication policy lock")
+        .clone();
+    let allowed = match authentication {
         Authentication::Disabled => true,
         Authentication::Tokens(tokens) => {
             match bearer_token(request.headers().get(header::AUTHORIZATION)) {
