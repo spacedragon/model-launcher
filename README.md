@@ -42,7 +42,7 @@ Never expose an unauthenticated server on a LAN. Loopback is the supported MVP b
 
 ## HTTP API examples
 
-Set `BASE=http://127.0.0.1:1234`, `TOKEN` to the one-time token, `MODEL` to a key returned by the list call, and preserve `INSTANCE` from load. These examples use `curl`; PowerShell users should call `curl.exe` to avoid legacy aliases.
+Set `BASE=http://127.0.0.1:1234`, `TOKEN` to the one-time token, `MODEL` to a key returned by the list call, and preserve `INSTANCE` from load. These examples use `curl` and `jq` so untrusted model/instance strings are encoded as JSON rather than interpolated; PowerShell users should call `curl.exe` to avoid legacy aliases or build bodies with `ConvertTo-Json`.
 
 ```bash
 BASE=http://127.0.0.1:1234
@@ -55,11 +55,11 @@ curl -fsS "$BASE/api/v1/models" -H "Authorization: Bearer $TOKEN"
 # Load; save model_instance_id from the response as INSTANCE
 curl -fsS "$BASE/api/v1/models/load" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"context_length\":4096,\"echo_load_config\":true}"
+  -d "$(jq -n --arg model "$MODEL" '{model:$model,context_length:4096,echo_load_config:true}')"
 
 # Unload the exact owned instance
 curl -fsS "$BASE/api/v1/models/unload" -H "Authorization: Bearer $TOKEN" \
-  -H 'Content-Type: application/json' -d "{\"instance_id\":\"$INSTANCE\"}"
+  -H 'Content-Type: application/json' -d "$(jq -n --arg instance "$INSTANCE" '{instance_id:$instance}')"
 
 # OpenAI-compatible catalog
 curl -fsS "$BASE/v1/models" -H "Authorization: Bearer $TOKEN"
@@ -67,22 +67,22 @@ curl -fsS "$BASE/v1/models" -H "Authorization: Bearer $TOKEN"
 # Chat, non-streaming
 curl -fsS "$BASE/v1/chat/completions" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}]}"
+  -d "$(jq -n --arg model "$MODEL" '{model:$model,stream:false,messages:[{role:"user",content:"Say hello"}]}')"
 
 # Chat, byte-preserving SSE streaming (-N disables curl buffering)
 curl -N "$BASE/v1/chat/completions" -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: text/event-stream' -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Count to three\"}]}"
+  -d "$(jq -n --arg model "$MODEL" '{model:$model,stream:true,messages:[{role:"user",content:"Count to three"}]}')"
 
 # Text completion, non-streaming
 curl -fsS "$BASE/v1/completions" -H "Authorization: Bearer $TOKEN" \
   -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"stream\":false,\"prompt\":\"Once upon a time\"}"
+  -d "$(jq -n --arg model "$MODEL" '{model:$model,stream:false,prompt:"Once upon a time"}')"
 
 # Text completion, SSE streaming
 curl -N "$BASE/v1/completions" -H "Authorization: Bearer $TOKEN" \
   -H 'Accept: text/event-stream' -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL\",\"stream\":true,\"prompt\":\"Count to three\"}"
+  -d "$(jq -n --arg model "$MODEL" '{model:$model,stream:true,prompt:"Count to three"}')"
 ```
 
 An inference request can JIT-load its named model when idle. A different model requested during active generation receives `model_busy`; retry after the current lease ends or explicitly unload. Management endpoints are JSON-only and do not have streaming variants.
@@ -114,4 +114,4 @@ cargo build --workspace --release
 ruby tests/windows-wsl/validate.rb
 ```
 
-Real WSL acceptance is deliberately explicit because ordinary CI cannot supply a user's distribution, executable, model, token, or GPU. The dispatch workflow runs only the noninteractive automated smoke on a trusted self-hosted Windows/WSL runner. Configure its optional `MODEL_LAUNCHER_SMOKE_TOKEN` Actions secret (never a dispatch input); the matching Argon2 hash must already be in that runner user's Model Launcher config. Interactive tray/resource observations are local-only. See [tests/windows-wsl/README.md](tests/windows-wsl/README.md). No real-Windows result is inferred from a cross-compile or from tests on macOS/Linux.
+Real WSL acceptance is deliberately explicit because ordinary CI cannot supply a user's distribution, executable, model, token, or GPU. The dispatch workflow runs only the noninteractive automated smoke on an ephemeral, trusted self-hosted Windows/WSL runner through the protected `windows-wsl-acceptance` environment; configure a required reviewer and allow only `main`. Configure its optional `MODEL_LAUNCHER_SMOKE_TOKEN` Actions secret (never a dispatch input); the matching Argon2 hash and model root must already be in that runner user's Model Launcher config. The harness never copies that config into artifacts. Destroy/clean the runner and its user profile after evidence upload. Interactive tray/resource observations are local-only. See [tests/windows-wsl/README.md](tests/windows-wsl/README.md). No real-Windows result is inferred from a cross-compile or from tests on macOS/Linux.

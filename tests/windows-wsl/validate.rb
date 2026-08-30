@@ -17,11 +17,17 @@ smoke = read("tests/windows-wsl/smoke.ps1")
    NonInteractive TimeoutSeconds LlamaCommit ModelProvenance].each do |parameter|
   require_match(smoke, /\$#{parameter}\b/, "smoke.ps1 is missing parameter #{parameter}")
 end
-require_match(smoke, /Stop-Process\s+-Id\s+\$script:OwnedLauncherPid/,
+require_match(smoke, /Stop-Process\s+-Id\s+\$ownedPid/,
               "smoke.ps1 must clean up only its recorded launcher PID")
 abort("smoke.ps1 must never kill by process name") if smoke.match?(/(?:taskkill|Stop-Process\s+-Name|Get-Process\s+[^\n]*\|\s*Stop-Process)/i)
 require_match(smoke, /evidence\.json/, "smoke.ps1 must write JSON evidence")
 require_match(smoke, /evidence\.md/, "smoke.ps1 must write Markdown evidence")
+abort("smoke must not copy or serialize authentication hashes") if smoke.match?(/auth_token_hashes|Copy-Item.*config/i)
+require_match(smoke, /MODEL_LAUNCHER_SHUTDOWN_FILE/, "smoke needs graceful shutdown sentinel")
+require_match(smoke, /\/proc\/.*\/stat/, "smoke must capture Linux process start-time identity")
+require_match(smoke, /function Sanitize-Evidence/, "evidence strings need control/Markdown sanitization")
+require_match(smoke, /SkipModelHash/, "large-model hashing needs an explicit skip switch")
+require_match(smoke, /Get-FileHash.*modelShard/, "provided model hashes must still be recomputed")
 require_match(smoke, /function Read-PassFail/, "manual checks need a strict Read-PassFail helper")
 require_match(smoke, /\$script:HadFailure/, "smoke.ps1 must aggregate failures")
 require_match(smoke, /schema\s*=\s*2/, "evidence schema must be explicitly versioned")
@@ -54,6 +60,21 @@ require_match(workflow_text, /::add-mask::/, "workflow must mask the optional to
 require_match(workflow_text, /-NonInteractive/, "workflow smoke must be explicitly noninteractive")
 abort("workflow must not run interactive resource checks") if workflow_text.include?("-ManualResourceChecks")
 abort("workflow must not contain Read-Host") if workflow_text.match?(/Read-Host/i)
+abort("workflow artifact upload must not use a directory or glob") if workflow_text.match?(/path:\s*(?:artifacts\/windows-wsl\/?|.*[*])/)
+%w[artifacts/windows-wsl/evidence.json artifacts/windows-wsl/evidence.md].each do |path|
+  require_match(workflow_text, /#{Regexp.escape(path)}/, "workflow must upload only #{path}")
+end
+artifact_paths = windows.dig("jobs", "real-wsl", "steps").find { |step| step["name"] == "Upload automated evidence" }.dig("with", "path").lines.map(&:strip).reject(&:empty?)
+abort("artifact upload contains unexpected paths: #{artifact_paths.inspect}") unless artifact_paths == %w[artifacts/windows-wsl/evidence.json artifacts/windows-wsl/evidence.md]
+abort("all workflow actions must be pinned to full SHAs") if workflow_text.scan(/uses:\s*([^\s]+)/).flatten.any? { |use| !use.match?(/@[0-9a-f]{40}\z/) }
+abort("self-hosted acceptance needs a protected environment") unless windows.dig("jobs", "real-wsl", "environment") == "windows-wsl-acceptance"
+require_match(workflow_text, /github\.ref.*refs\/heads\/main/, "acceptance workflow must validate the main ref")
+
+ci_text = read(".github/workflows/ci.yml")
+abort("all CI actions must be pinned to full SHAs") if ci_text.scan(/uses:\s*([^\s]+)/).flatten.any? { |use| !use.match?(/@[0-9a-f]{40}\z/) }
+
+main = read("apps/model-launcher/src/main.rs")
+require_match(main, /MODEL_LAUNCHER_SHUTDOWN_FILE/, "application must support graceful smoke shutdown")
 
 rc = read("apps/model-launcher/resources/app.rc")
 {

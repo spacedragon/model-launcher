@@ -3,7 +3,7 @@ param(
     [string]$Distro = "Ubuntu", [string]$LlamaServer = "/usr/local/bin/llama-server",
     [Parameter(Mandatory)][string]$LlamaCommit, [Parameter(Mandatory)][string]$ModelRoot,
     [Parameter(Mandatory)][string]$ModelKey, [Parameter(Mandatory)][string]$ModelProvenance,
-    [string]$ModelSha256, [string]$SecondModelKey,
+    [string]$ModelSha256, [switch]$SkipModelHash, [string]$SecondModelKey,
     [string]$ExePath = "target/release/model-launcher.exe", [uri]$BaseUrl = "http://127.0.0.1:1234",
     [string]$Token = $env:MODEL_LAUNCHER_SMOKE_TOKEN, [switch]$SkipBuild,
     [switch]$ManualResourceChecks, [switch]$NonInteractive,
@@ -13,6 +13,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $script:OwnedLauncherPid = $null
+$script:ShutdownFile = $null
+$script:BackendPid = $null
+$script:BackendStartTime = $null
 $script:HadFailure = $false
 $script:Evidence = [ordered]@{ schema = 2; started_utc = [DateTime]::UtcNow.ToString("o"); metadata = [ordered]@{}; checks = @(); manual_checks = @() }
 $ArtifactDir = Join-Path (Resolve-Path ".") "artifacts/windows-wsl"
@@ -20,9 +23,14 @@ $EvidenceJson = Join-Path $ArtifactDir "evidence.json"
 $EvidenceMarkdown = Join-Path $ArtifactDir "evidence.md"
 
 function Add-Check([string]$Name, [ValidateSet("PASS", "FAIL", "NOT_RUN")][string]$Status, [string]$Detail) {
+    $Name = Sanitize-Evidence $Name; $Detail = Sanitize-Evidence $Detail
     if ($Status -eq "FAIL") { $script:HadFailure = $true }
     $script:Evidence.checks += [ordered]@{ name = $Name; status = $Status; detail = $Detail; utc = [DateTime]::UtcNow.ToString("o") }
     Write-Host "[$Status] $Name - $Detail"
+}
+function Sanitize-Evidence([AllowNull()][string]$Value) {
+    if ($null -eq $Value) { return "" }
+    (($Value -replace '[\x00-\x1f\x7f]', ' ') -replace '::', ': :' -replace '[|`]', '_').Trim()
 }
 function Read-PassFail([string]$Name, [string]$Instruction) {
     if ($NonInteractive) { throw "Manual check '$Name' cannot prompt in -NonInteractive mode" }
@@ -58,13 +66,44 @@ function Invoke-Api([string]$Method, [string]$Path, $Body = $null) {
     if ($null -ne $Body) { $requestParameters.ContentType = "application/json"; $requestParameters.Body = ($Body | ConvertTo-Json -Depth 8 -Compress) }
     Invoke-RestMethod @requestParameters
 }
-function Stop-OwnedLauncher {
+function New-ShutdownSentinel {
+    New-Item -ItemType Directory -Force $ArtifactDir | Out-Null
+    $script:ShutdownFile = Join-Path $ArtifactDir ("shutdown-{0}.sentinel" -f [Guid]::NewGuid().ToString("N"))
+    $env:MODEL_LAUNCHER_SHUTDOWN_FILE = $script:ShutdownFile
+}
+function Request-GracefulShutdown {
     if ($null -ne $script:OwnedLauncherPid) {
-        if (Get-Process -Id $script:OwnedLauncherPid -ErrorAction SilentlyContinue) {
-            Stop-Process -Id $script:OwnedLauncherPid
-            Wait-Process -Id $script:OwnedLauncherPid -Timeout 15 -ErrorAction SilentlyContinue
+        $ownedPid = $script:OwnedLauncherPid
+        if (Get-Process -Id $ownedPid -ErrorAction SilentlyContinue) {
+            try {
+                [IO.File]::WriteAllText($script:ShutdownFile, "shutdown", [Text.UTF8Encoding]::new($false))
+                Wait-Process -Id $ownedPid -Timeout 20 -ErrorAction Stop
+            }
+            catch {
+                Add-Check "graceful launcher shutdown" "FAIL" "sentinel request failed or timed out; forcing only owned launcher PID $ownedPid"
+                Stop-Process -Id $ownedPid
+                Wait-Process -Id $ownedPid -Timeout 10 -ErrorAction SilentlyContinue
+            }
+        }
+        try {
+            if ($null -ne $script:BackendPid) {
+                $stat = (& wsl.exe -d $Distro -- cat "/proc/$script:BackendPid/stat" 2>$null) -join ""
+                if ($LASTEXITCODE -eq 0 -and $stat) {
+                    $tail = $stat.Substring($stat.LastIndexOf(')') + 2) -split '\s+'
+                    if ($tail.Count -le 19) { Add-Check "backend identity exited" "FAIL" "malformed /proc identity response after shutdown" }
+                    elseif ($tail[19] -eq $script:BackendStartTime) { Add-Check "backend identity exited" "FAIL" "same Linux PID/starttime still exists after graceful shutdown" }
+                    else { Add-Check "backend identity exited" "PASS" "Linux PID was reused with a different starttime" }
+                } else { Add-Check "backend identity exited" "PASS" "recorded Linux PID no longer exists" }
+            }
+            $remainingChildren = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $ownedPid -and $_.Name -eq "wsl.exe" })
+            if ($remainingChildren.Count -eq 0) { Add-Check "Windows WSL children exited" "PASS" "no owned wsl.exe child remains" }
+            else { Add-Check "Windows WSL children exited" "FAIL" "$($remainingChildren.Count) owned wsl.exe child process(es) remain" }
+        } catch { Add-Check "shutdown identity verification" "FAIL" $_.Exception.Message }
+        if ($script:ShutdownFile -and (Test-Path -LiteralPath $script:ShutdownFile)) {
+            Remove-Item -LiteralPath $script:ShutdownFile -Force
         }
         $script:OwnedLauncherPid = $null
+        $script:BackendPid = $null; $script:BackendStartTime = $null
     }
 }
 
@@ -89,39 +128,30 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "llama-server --help probe failed" }
     $llamaHashLine = (& wsl.exe -d $Distro -- sha256sum -- $LlamaServer 2>&1) -join " "
     $llamaHash = if ($LASTEXITCODE -eq 0) { ($llamaHashLine -split '\s+')[0] } else { "unavailable: $llamaHashLine" }
-    $computedModelHash = if ($ModelSha256) { $ModelSha256 } else { (Get-FileHash -LiteralPath $modelShard.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+    if ($ModelSha256 -and $ModelSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "ModelSha256 must be exactly 64 hexadecimal characters" }
+    if ($SkipModelHash -and $ModelSha256) { throw "-SkipModelHash and -ModelSha256 are mutually exclusive" }
+    $computedModelHash = if ($SkipModelHash) { "NOT_COMPUTED" } else { (Get-FileHash -LiteralPath $modelShard.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+    if ($ModelSha256 -and $computedModelHash -ne $ModelSha256.ToLowerInvariant()) { throw "ModelSha256 does not match the selected first shard" }
     $appCommit = (& git rev-parse HEAD 2>&1) -join ""
     $script:Evidence.metadata = [ordered]@{
-        windows_version = "$($os.Caption) $($os.Version) build $($os.BuildNumber)"; powershell_version = $PSVersionTable.PSVersion.ToString()
-        wsl_version = $wslVersion; wsl_kernel = $wslKernel; wsl_distro_version = $wslDistroVersion; distro = $Distro
-        llama_version = $llamaVersion; llama_commit = $LlamaCommit; llama_help_sha256 = Get-TextSha256 $llamaHelp
-        llama_executable_path = $LlamaServer; llama_executable_sha256 = $llamaHash
-        model_first_shard = $modelShard.FullName; model_first_shard_bytes = $modelShard.Length; model_sha256 = $computedModelHash; model_provenance = $ModelProvenance
-        cpu = $cpu -join "; "; gpu = $gpu -join "; "; ram_bytes = [int64]$os.TotalVisibleMemorySize * 1024
-        app_version = "0.1.0"; app_commit = $appCommit; executable_path = $ExePath; executable_sha256 = $null; bind = $BaseUrl.AbsoluteUri
-        sanitized_command = "smoke.ps1 -Distro '$Distro' -LlamaServer '$LlamaServer' -LlamaCommit '$LlamaCommit' -ModelRoot '$ModelRoot' -ModelKey '$ModelKey' -ModelProvenance '$ModelProvenance' -ModelSha256 '$ModelSha256' -SecondModelKey '$SecondModelKey' -ExePath '$ExePath' -BaseUrl '$($BaseUrl.AbsoluteUri)' -Token [REDACTED] -SkipBuild:$($SkipBuild.IsPresent) -ManualResourceChecks:$($ManualResourceChecks.IsPresent) -NonInteractive:$($NonInteractive.IsPresent) -TimeoutSeconds $TimeoutSeconds"
-        config = [ordered]@{ data_root = "isolated artifact LOCALAPPDATA"; distro = $Distro; llama_server = $LlamaServer; model_root = $ModelRoot; bind = $BaseUrl.AbsoluteUri; authentication = "copied Argon2 hash; plaintext redacted" }
+        windows_version = Sanitize-Evidence "$($os.Caption) $($os.Version) build $($os.BuildNumber)"; powershell_version = Sanitize-Evidence ($PSVersionTable.PSVersion.ToString())
+        wsl_version = Sanitize-Evidence $wslVersion; wsl_kernel = Sanitize-Evidence $wslKernel; wsl_distro_version = Sanitize-Evidence $wslDistroVersion; distro = Sanitize-Evidence $Distro
+        llama_version = Sanitize-Evidence $llamaVersion; llama_commit = Sanitize-Evidence $LlamaCommit; llama_help_sha256 = Get-TextSha256 $llamaHelp
+        llama_executable_path = Sanitize-Evidence $LlamaServer; llama_executable_sha256 = Sanitize-Evidence $llamaHash
+        model_first_shard = Sanitize-Evidence $modelShard.FullName; model_first_shard_bytes = $modelShard.Length; model_sha256 = $computedModelHash; model_provenance = Sanitize-Evidence $ModelProvenance
+        cpu = Sanitize-Evidence ($cpu -join "; "); gpu = Sanitize-Evidence ($gpu -join "; "); ram_bytes = [int64]$os.TotalVisibleMemorySize * 1024
+        app_version = "0.1.0"; app_commit = Sanitize-Evidence $appCommit; executable_path = Sanitize-Evidence $ExePath; executable_sha256 = $null; bind = Sanitize-Evidence $BaseUrl.AbsoluteUri
+        sanitized_command = Sanitize-Evidence "smoke.ps1 -Distro '$Distro' -LlamaServer '$LlamaServer' -LlamaCommit '$LlamaCommit' -ModelRoot '$ModelRoot' -ModelKey '$ModelKey' -ModelProvenance '$ModelProvenance' -ModelSha256 '$ModelSha256' -SkipModelHash:$($SkipModelHash.IsPresent) -Token [REDACTED]"
+        config = [ordered]@{ data_root = "existing user config (never copied to artifacts)"; distro = Sanitize-Evidence $Distro; llama_server = Sanitize-Evidence $LlamaServer; model_root = Sanitize-Evidence $ModelRoot; bind = $BaseUrl.AbsoluteUri; authentication = "existing Argon2 hash; plaintext redacted" }
     }
     Add-Check "preflight and metadata" "PASS" "Windows, WSL, llama-server, model, and hardware evidence captured"
     if (-not $SkipBuild) { cargo build -p model-launcher --release; if ($LASTEXITCODE -ne 0) { throw "release build failed" } }
     $resolvedExe = (Resolve-Path -LiteralPath $ExePath).Path
-    $script:Evidence.metadata.executable_path = $resolvedExe
+    $script:Evidence.metadata.executable_path = Sanitize-Evidence $resolvedExe
     $script:Evidence.metadata.executable_sha256 = (Get-FileHash -LiteralPath $resolvedExe -Algorithm SHA256).Hash.ToLowerInvariant()
 
-    $UserConfig = Join-Path $env:LOCALAPPDATA "ModelLauncher/config/config.json"
-    $HarnessLocalAppData = Join-Path $ArtifactDir "local-app-data"; $env:LOCALAPPDATA = $HarnessLocalAppData
-    $configDir = Join-Path $HarnessLocalAppData "ModelLauncher/config"; New-Item -ItemType Directory -Force $configDir | Out-Null
-    if (Test-Path -LiteralPath $UserConfig) { $settings = Get-Content -Raw -LiteralPath $UserConfig | ConvertFrom-Json }
-    else {
-        if ($NonInteractive) { throw "Noninteractive smoke needs an existing user config containing the supplied token hash" }
-        $settings = [pscustomobject][ordered]@{ version = 1; config = [pscustomobject][ordered]@{
-            models = @(); auth_token_hashes = @(); engine_distribution = $Distro; engine_executable = $LlamaServer; catalog_directory = $modelShard.DirectoryName
-            default_launch_settings = [ordered]@{ context_length = $null; gpu_layers = $null; cpu_threads = $null; batch_size = $null; parallel_slots = $null; flash_attention = $null; kv_cache_type = $null }
-        } }
-    }
-    $settings.config.engine_distribution = $Distro; $settings.config.engine_executable = $LlamaServer; $settings.config.catalog_directory = (Resolve-Path -LiteralPath $ModelRoot).Path
-    [IO.File]::WriteAllText((Join-Path $configDir "config.json"), ($settings | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
     $env:MODEL_LAUNCHER_WSL_DISTRO = $Distro; $env:MODEL_LAUNCHER_LLAMA_SERVER = $LlamaServer
+    New-ShutdownSentinel
     $launcher = Start-Process -FilePath $resolvedExe -PassThru; $script:OwnedLauncherPid = $launcher.Id
     Add-Check "owned launch" "PASS" "PID $($launcher.Id) recorded for PID-only cleanup"
     if (-not $Token) {
@@ -136,6 +166,18 @@ try {
     Add-Check "configure/probe/discover" "PASS" "Discovered $($catalog.models.Count) models including $ModelKey"
     $loaded = Invoke-Api POST "/api/v1/models/load" @{ model = $ModelKey; echo_load_config = $true }
     if ($loaded.status -ne "loaded") { throw "load did not return loaded" }; Add-Check "load" "PASS" "instance $($loaded.model_instance_id)"
+    $wslModelPath = ((& wsl.exe -d $Distro -- wslpath -a -u -- $modelShard.FullName 2>&1) -join "").Trim()
+    $candidates = @()
+    foreach ($line in (& wsl.exe -d $Distro -- ps -eo pid=,args= 2>&1)) {
+        if ($line -match '^\s*(\d+)\s+(.+)$' -and $Matches[2].Contains($LlamaServer) -and $Matches[2].Contains($wslModelPath)) { $candidates += [int]$Matches[1] }
+    }
+    if ($candidates.Count -ne 1) { throw "Could not identify exactly one backend by executable path and model argument" }
+    $script:BackendPid = $candidates[0]
+    $backendStat = ((& wsl.exe -d $Distro -- cat "/proc/$script:BackendPid/stat" 2>&1) -join "")
+    $backendTail = $backendStat.Substring($backendStat.LastIndexOf(')') + 2) -split '\s+'
+    $script:BackendStartTime = $backendTail[19]
+    $script:Evidence.metadata.backend_identity = "pid=$script:BackendPid starttime=$script:BackendStartTime"
+    Add-Check "backend identity" "PASS" "unique executable/model match with /proc starttime recorded"
     $models = Invoke-Api GET "/v1/models"
     if ($ModelKey -notin @($models.data | ForEach-Object { $_.id })) { throw "OpenAI model list omitted ModelKey" }
     $chat = Invoke-Api POST "/v1/chat/completions" @{ model = $ModelKey; stream = $false; messages = @(@{ role = "user"; content = "Reply with OK" }) }
@@ -150,6 +192,7 @@ try {
     if ($SecondModelKey) { Add-Check "model_busy" "NOT_RUN" "Timing-sensitive busy check is operator-local" }
 
     if ($ManualResourceChecks) {
+        if ($SkipModelHash) { Add-Check "model hash completeness" "FAIL" "full resource acceptance requires a computed model hash" }
         $before = Get-Process -Id $script:OwnedLauncherPid
         $activeBackendBefore = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $script:OwnedLauncherPid -and $_.Name -eq "wsl.exe" } | Select-Object -ExpandProperty ProcessId)
         Read-PassFail "window_cycles_50" "Open/close the tray window exactly 50 times without quitting."
@@ -174,13 +217,14 @@ try {
         Read-PassFail "log_catalog_bounds" "With overflow fixtures verify logs <= 2000 records/2 MiB and catalog <= 1024 models with bounded diagnostics."
     } else { Add-Check "resource lifecycle" "NOT_RUN" "Run -ManualResourceChecks only in local interactive PowerShell" }
 
-    Stop-OwnedLauncher
+    Request-GracefulShutdown
+    New-ShutdownSentinel
     $restarted = Start-Process -FilePath $resolvedExe -PassThru; $script:OwnedLauncherPid = $restarted.Id; Start-Sleep -Seconds 3
     Invoke-Api GET "/api/v1/models" | Out-Null
     $ownedWslChildren = @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq $script:OwnedLauncherPid -and $_.Name -eq "wsl.exe" })
     if ($ownedWslChildren.Count -ne 0) { throw "restart unexpectedly spawned a WSL backend" }
     Add-Check "restart no-autoload" "PASS" "catalog returned and launcher owns no wsl.exe child"
 } catch { Add-Check "harness" "FAIL" $_.Exception.Message }
-finally { Stop-OwnedLauncher; Save-Evidence }
+finally { Request-GracefulShutdown; Save-Evidence }
 
 if ($script:HadFailure) { exit 1 }

@@ -17,14 +17,11 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.89"
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust 1.89
+        run: rustup toolchain install 1.89 --profile minimal --component rustfmt,clippy
+      - name: Select Rust 1.89
+        run: rustup default 1.89
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy

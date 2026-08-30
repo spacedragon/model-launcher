@@ -17,13 +17,21 @@ permissions:
 
 jobs:
   real-wsl:
+    if: github.ref == 'refs/heads/main'
     runs-on: [self-hosted, Windows, WSL]
+    environment: windows-wsl-acceptance
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with: {toolchain: "1.89"}
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Validate protected ref
+        shell: pwsh
+        run: if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'Acceptance runs only from main' }
+      - name: Install Rust 1.89
+        shell: pwsh
+        run: rustup toolchain install 1.89 --profile minimal
+      - name: Select Rust 1.89
+        shell: pwsh
+        run: rustup default 1.89
       - name: Run noninteractive real-WSL smoke
         shell: pwsh
         env:
@@ -53,9 +61,11 @@ jobs:
             -NonInteractive
       - name: Upload automated evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-wsl-evidence
-          path: artifacts/windows-wsl/
+          path: |
+            artifacts/windows-wsl/evidence.json
+            artifacts/windows-wsl/evidence.md
           if-no-files-found: warn
           retention-days: 14

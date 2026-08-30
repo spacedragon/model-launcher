@@ -231,6 +231,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    if let Some(shutdown_file) = std::env::var_os("MODEL_LAUNCHER_SHUTDOWN_FILE")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+    {
+        runtime_handle.spawn({
+            let handle = handle.clone();
+            async move {
+                let mut poll = tokio::time::interval(Duration::from_millis(200));
+                loop {
+                    poll.tick().await;
+                    if shutdown_file.is_file() {
+                        let _ = handle.shutdown().await;
+                        let _ = slint::quit_event_loop();
+                        break;
+                    }
+                }
+            }
+        });
+    }
     run_desktop(
         AppSnapshot {
             models: snapshot.models,
