@@ -16,8 +16,8 @@ use model_launcher_api::{
     ProfileUpdater,
 };
 use model_launcher_core::{
-    AppError, CatalogService, CatalogWatcher, ConfigStore, EngineCapabilities, InferenceEngine,
-    LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter, LogRecord, LogStore,
+    AppError, CatalogService, CatalogWatcher, ConfigDiagnostic, ConfigStore, EngineCapabilities,
+    InferenceEngine, LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter, LogRecord, LogStore,
     LogStoreLimits, ModelRecord, ReconcileOptions, ReconcileResult, reconcile_catalog, scan,
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -63,6 +63,8 @@ pub struct ServiceSnapshot {
     pub lifecycle: LifecycleSnapshot,
     pub engine_valid: bool,
     pub engine_diagnostic: Option<String>,
+    pub config_diagnostic: Option<ConfigDiagnostic>,
+    pub catalog_diagnostic: Option<String>,
 }
 
 struct EngineHealth {
@@ -225,13 +227,31 @@ impl Service {
         watcher_barrier: Option<Arc<WatcherBarrier>>,
     ) -> Result<Self, ServiceError> {
         let store = ConfigStore::new(&options.config_dir);
-        let persisted = store.load()?;
+        let loaded = store.load_with_diagnostic()?;
+        let config_diagnostic = loaded.diagnostic.clone();
+        let persisted = loaded.config;
+        let configured_catalog = persisted.catalog_directory.is_some();
         let catalog_root = persisted
             .catalog_directory
             .clone()
             .unwrap_or_else(|| options.catalog_dir.clone());
+        let mut catalog_diagnostic = None;
+        if !configured_catalog && !catalog_root.is_dir()
+            && let Err(error) = std::fs::create_dir_all(&catalog_root)
+        {
+            catalog_diagnostic = Some(format!("model directory is unavailable: {error}"));
+        }
+        if !catalog_root.is_dir() {
+            catalog_diagnostic.get_or_insert_with(|| "model directory is unavailable".into());
+        }
         let catalog = CatalogService::new(&catalog_root, store.clone());
-        let initial = catalog.reconcile_now()?;
+        let initial = if catalog_root.is_dir() {
+            catalog.reconcile_now()?
+        } else {
+            let mut config = persisted;
+            config.models.clear();
+            ReconcileResult { config, diagnostics: Vec::new() }
+        };
         if let (Some(manager), Some(distribution), Some(executable)) = (
             settings.as_ref(),
             initial.config.engine_distribution.clone(),
@@ -249,9 +269,9 @@ impl Service {
             Authentication::Disabled => None,
         };
         let (changes, _) = watch::channel(0_u64);
-        let watcher = options
+        let watcher = (catalog_root.is_dir() && options
             .watch_catalog
-            .then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
+            ).then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
             .transpose()
             .map_err(|error| ServiceError::Watcher(error.to_string()))?;
         let (initial_capabilities, initial_diagnostic) = match engine.probe_capabilities().await {
@@ -352,6 +372,8 @@ impl Service {
             settings,
             engine,
             health,
+            config_diagnostic,
+            catalog_diagnostic: RwLock::new(catalog_diagnostic),
             models,
             catalog_root: RwLock::new(catalog_root),
             watch_catalog: options.watch_catalog,
@@ -421,6 +443,13 @@ impl ServiceHandle {
                 .diagnostic
                 .read()
                 .expect("engine diagnostic lock poisoned")
+                .clone(),
+            config_diagnostic: self.inner.config_diagnostic.clone(),
+            catalog_diagnostic: self
+                .inner
+                .catalog_diagnostic
+                .read()
+                .expect("catalog diagnostic lock poisoned")
                 .clone(),
         }
     }
@@ -586,6 +615,11 @@ impl ServiceHandle {
             .write()
             .expect("catalog root lock poisoned") = root.clone();
         self.inner.install_watcher(prepared_watcher, root).await;
+        *self
+            .inner
+            .catalog_diagnostic
+            .write()
+            .expect("catalog diagnostic lock poisoned") = None;
         manager.apply(settings.engine_distribution, settings.engine_executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
         self.inner.health.valid.store(true, Ordering::Release);
@@ -740,6 +774,8 @@ struct Inner {
     settings: Option<Arc<dyn EngineSettingsManager>>,
     engine: Arc<dyn InferenceEngine>,
     health: Arc<EngineHealth>,
+    config_diagnostic: Option<ConfigDiagnostic>,
+    catalog_diagnostic: RwLock<Option<String>>,
     models: Arc<RwLock<LauncherConfig>>,
     catalog_root: RwLock<PathBuf>,
     watch_catalog: bool,

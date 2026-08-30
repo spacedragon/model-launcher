@@ -4,7 +4,7 @@ use model_launcher::{
 };
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{
-    ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
+    ConfigDiagnosticKind, ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
     LaunchSettings, LifecycleState, LogFilter, LogLevel, LogRecord, LogSource, LogStore,
     LogStoreLimits, ModelRecord,
 };
@@ -590,6 +590,52 @@ fn options(root: &std::path::Path, _upstream: String) -> ServiceOptions {
         watch_catalog: false,
         shutdown_timeout: Duration::from_secs(2),
     }
+}
+
+#[tokio::test]
+async fn fresh_missing_default_catalog_is_created_before_watcher_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut service_options = options(temp.path(), String::new());
+    service_options.watch_catalog = true;
+
+    let service = Service::start(
+        service_options,
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .expect("fresh service starts");
+
+    assert!(temp.path().join("models").is_dir());
+    service.handle().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_config_starts_with_typed_visible_diagnostic() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(temp.path().join("config/config.json"), b"private corrupt bytes").unwrap();
+
+    let service = Service::start(
+        options(temp.path(), String::new()),
+        Arc::new(Engine {
+            starts: Arc::new(AtomicUsize::new(0)),
+            stops: Arc::new(AtomicUsize::new(0)),
+        }),
+    )
+    .await
+    .expect("quarantined config must not prevent startup");
+
+    let diagnostic = service
+        .handle()
+        .snapshot()
+        .config_diagnostic
+        .expect("visible diagnostic");
+    assert_eq!(diagnostic.kind, ConfigDiagnosticKind::Corrupt);
+    assert!(!diagnostic.to_string().contains("private corrupt bytes"));
+    service.handle().shutdown().await.unwrap();
 }
 
 #[tokio::test]
