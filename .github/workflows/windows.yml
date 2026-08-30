@@ -1,0 +1,65 @@
+name: Real Windows WSL acceptance
+
+"on":
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: Installed WSL distribution
+        required: true
+        default: Ubuntu
+      llama_server:
+        description: Absolute llama-server path inside WSL
+        required: true
+      model_root:
+        description: Windows directory containing the test GGUF
+        required: true
+      model_key:
+        description: Catalog key for the primary GGUF
+        required: true
+      token:
+        description: One-time launcher bearer token (secret input is preferable)
+        required: true
+      second_model_key:
+        description: Optional second model key for model_busy acceptance
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  real-wsl:
+    runs-on: [self-hosted, Windows, WSL]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run real WSL and resource acceptance
+        shell: pwsh
+        env:
+          MODEL_LAUNCHER_SMOKE_TOKEN: ${{ inputs.token }}
+          SMOKE_DISTRO: ${{ inputs.distro }}
+          SMOKE_LLAMA_SERVER: ${{ inputs.llama_server }}
+          SMOKE_MODEL_ROOT: ${{ inputs.model_root }}
+          SMOKE_MODEL_KEY: ${{ inputs.model_key }}
+          SMOKE_SECOND_MODEL_KEY: ${{ inputs.second_model_key }}
+        run: |
+          ./tests/windows-wsl/smoke.ps1 `
+            -Distro $env:SMOKE_DISTRO `
+            -LlamaServer $env:SMOKE_LLAMA_SERVER `
+            -ModelRoot $env:SMOKE_MODEL_ROOT `
+            -ModelKey $env:SMOKE_MODEL_KEY `
+            -SecondModelKey $env:SMOKE_SECOND_MODEL_KEY `
+            -Token $env:MODEL_LAUNCHER_SMOKE_TOKEN `
+            -ManualResourceChecks
+          -ManualResourceChecks
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-wsl-evidence
+          path: artifacts/windows-wsl/
+          if-no-files-found: warn
+          retention-days: 14

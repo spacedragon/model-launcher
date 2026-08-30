@@ -1,0 +1,42 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Rust 1.89
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit, contract, and headless tests
+        run: cargo test --workspace --all-targets
+      - name: Windows packaging contract
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build -p model-launcher --release
+          if (-not (Test-Path target/release/model-launcher.exe)) { throw "release executable missing" }
+      - name: Packaging harness contract
+        if: runner.os != 'Windows'
+        run: ruby tests/windows-wsl/validate.rb

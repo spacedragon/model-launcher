@@ -406,15 +406,15 @@ git commit -m "feat: add quiet native desktop and tray UI"
 - Create: `README.md`
 - Modify: `.gitignore`
 
-- [ ] **Step 1: Add CI and smoke-test checks**
+- [x] **Step 1: Add CI and smoke-test checks**
 
 CI runs format, clippy, unit, contract, and headless tests on Windows, macOS, and Linux; the real WSL/model smoke test remains explicit because it requires a local model and executable.
 
-- [ ] **Step 2: Add Windows metadata and documentation**
+- [x] **Step 2: Add Windows metadata and documentation**
 
 Embed application name/version/icon, document prerequisites and setup, explain LAN/token safety, provide curl examples for every supported endpoint, and document the ignored WSL smoke test inputs.
 
-- [ ] **Step 3: Run the full automated verification**
+- [x] **Step 3: Run the full automated verification**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets && cargo build --workspace --release`
 
@@ -423,6 +423,8 @@ Expected: all commands pass.
 - [ ] **Step 4: Run resource and lifecycle checks**
 
 On Windows, run the smoke harness with a small GGUF and user-supplied llama-server. Open/close the window 50 times, confirm the window weak handle is released and working-set growth stays within the documented tolerance, verify idle CPU is negligible, fill logs/catalog beyond their configured limits and confirm they stay bounded, kill llama-server to observe capped backoff, and eject during backoff.
+
+**NOT RUN (2026-08-30):** the current host is macOS and has no real Windows desktop, WSL distribution, user llama-server, GGUF acceptance model, or Windows resource-inspection tooling. Run `tests/windows-wsl/smoke.ps1 -ManualResourceChecks` on the documented user-supplied Windows hardware and attach its evidence before checking this step.
 
 - [ ] **Step 5: Commit**
 
