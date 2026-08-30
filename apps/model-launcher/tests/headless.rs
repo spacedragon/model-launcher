@@ -4,9 +4,9 @@ use model_launcher::{
 };
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{
-    ConfigDiagnosticKind, ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec, InferenceEngine,
-    LaunchSettings, LifecycleState, LogFilter, LogLevel, LogRecord, LogSource, LogStore,
-    LogStoreLimits, ModelRecord,
+    ConfigDiagnosticKind, ConfigStore, EngineCapabilities, EngineFuture, EngineProcess, EngineSpec,
+    InferenceEngine, LaunchSettings, LifecycleState, LogFilter, LogLevel, LogRecord, LogSource,
+    LogStore, LogStoreLimits, ModelRecord,
 };
 use std::{
     sync::{
@@ -150,12 +150,20 @@ async fn engine_settings_saves_are_serialized_across_async_validation() {
     let handle = service.handle();
     let first = tokio::spawn({
         let handle = handle.clone();
-        async move { handle.save_engine_settings("First".into(), "/first".into()).await }
+        async move {
+            handle
+                .save_engine_settings("First".into(), "/first".into())
+                .await
+        }
     });
     settings.first_entered.notified().await;
     let second = tokio::spawn({
         let handle = handle.clone();
-        async move { handle.save_engine_settings("Second".into(), "/second".into()).await }
+        async move {
+            handle
+                .save_engine_settings("Second".into(), "/second".into())
+                .await
+        }
     });
     tokio::task::yield_now().await;
     assert_eq!(settings.max_active.load(Ordering::SeqCst), 1);
@@ -654,7 +662,11 @@ async fn fresh_missing_default_catalog_is_created_before_watcher_start() {
 async fn corrupt_config_starts_with_typed_visible_diagnostic() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("config")).unwrap();
-    std::fs::write(temp.path().join("config/config.json"), b"private corrupt bytes").unwrap();
+    std::fs::write(
+        temp.path().join("config/config.json"),
+        b"private corrupt bytes",
+    )
+    .unwrap();
 
     let service = Service::start(
         options(temp.path(), String::new()),

@@ -10,8 +10,8 @@ use fake_llama_server::FakeServer;
 use futures_util::StreamExt as _;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
-    Accept, ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest,
-    LifecycleUpstreamResolver, TokenStore,
+    Accept, ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits,
+    LifecycleUpstreamResolver, LoadRequest, TokenStore,
 };
 
 struct ScriptedAcceptor {

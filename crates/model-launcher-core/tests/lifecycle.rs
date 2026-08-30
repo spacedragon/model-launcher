@@ -2,10 +2,10 @@ use std::error::Error as _;
 use std::{
     collections::VecDeque,
     io,
+    net::SocketAddr,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
-    net::SocketAddr,
     time::Duration,
 };
 

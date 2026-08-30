@@ -57,7 +57,9 @@ impl LifecycleUpstreamResolver {
         {
             return None;
         }
-        snapshot.endpoint.map(|endpoint| format!("http://{endpoint}"))
+        snapshot
+            .endpoint
+            .map(|endpoint| format!("http://{endpoint}"))
     }
 
     #[must_use]

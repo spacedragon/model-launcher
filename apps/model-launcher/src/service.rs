@@ -17,8 +17,9 @@ use model_launcher_api::{
 };
 use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigDiagnostic, ConfigStore, EngineCapabilities,
-    InferenceEngine, LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter, LogRecord, LogStore,
-    LogStoreLimits, ModelRecord, ReconcileOptions, ReconcileResult, reconcile_catalog, scan,
+    InferenceEngine, LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter,
+    LogRecord, LogStore, LogStoreLimits, ModelRecord, ReconcileOptions, ReconcileResult,
+    reconcile_catalog, scan,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -236,7 +237,8 @@ impl Service {
             .clone()
             .unwrap_or_else(|| options.catalog_dir.clone());
         let mut catalog_diagnostic = None;
-        if !configured_catalog && !catalog_root.is_dir()
+        if !configured_catalog
+            && !catalog_root.is_dir()
             && let Err(error) = std::fs::create_dir_all(&catalog_root)
         {
             catalog_diagnostic = Some(format!("model directory is unavailable: {error}"));
@@ -250,7 +252,10 @@ impl Service {
         } else {
             let mut config = persisted;
             config.models.clear();
-            ReconcileResult { config, diagnostics: Vec::new() }
+            ReconcileResult {
+                config,
+                diagnostics: Vec::new(),
+            }
         };
         if let (Some(manager), Some(distribution), Some(executable)) = (
             settings.as_ref(),
@@ -269,9 +274,8 @@ impl Service {
             Authentication::Disabled => None,
         };
         let (changes, _) = watch::channel(0_u64);
-        let watcher = (catalog_root.is_dir() && options
-            .watch_catalog
-            ).then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
+        let watcher = (catalog_root.is_dir() && options.watch_catalog)
+            .then(|| CatalogWatcher::watch(&catalog_root, Duration::from_millis(250)))
             .transpose()
             .map_err(|error| ServiceError::Watcher(error.to_string()))?;
         let (initial_capabilities, initial_diagnostic) = match engine.probe_capabilities().await {

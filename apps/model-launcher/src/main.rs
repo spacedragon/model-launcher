@@ -10,7 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let base = platform_data_dir();
-    let persisted = ConfigStore::new(base.join("config")).load_with_diagnostic()?.config;
+    let persisted = ConfigStore::new(base.join("config"))
+        .load_with_diagnostic()?
+        .config;
     let token_store = Arc::new(TokenStore::default());
     let authentication = if persisted.auth_enabled {
         Authentication::Tokens(token_store)
@@ -117,7 +119,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     recent_models: handle.recent_models(),
                     lifecycle: snapshot.lifecycle,
                     capabilities: handle.capabilities(),
-                    authentication_status: if auth_enabled { "Token authentication enabled" } else { "Authentication disabled" }.into(),
+                    authentication_status: if auth_enabled {
+                        "Token authentication enabled"
+                    } else {
+                        "Authentication disabled"
+                    }
+                    .into(),
                     server_warning: snapshot_lan_warning.clone(),
                     engine_valid: snapshot.engine_valid,
                     engine_diagnostic: snapshot.engine_diagnostic,
@@ -267,7 +274,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             recent_models: handle.recent_models(),
             lifecycle: snapshot.lifecycle,
             capabilities: handle.capabilities(),
-            authentication_status: if auth_enabled { "Token authentication enabled" } else { "Authentication disabled" }.into(),
+            authentication_status: if auth_enabled {
+                "Token authentication enabled"
+            } else {
+                "Authentication disabled"
+            }
+            .into(),
             server_warning: lan_warning,
             engine_valid: snapshot.engine_valid,
             engine_diagnostic: snapshot.engine_diagnostic,
