@@ -383,6 +383,53 @@ async fn engine_settings_saves_are_serialized_across_async_validation() {
 }
 
 #[tokio::test]
+async fn engine_settings_save_aborts_after_validation_when_shutdown_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let settings = Arc::new(BlockingSettings {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+        first_entered: tokio::sync::Notify::new(),
+        release_first: tokio::sync::Notify::new(),
+    });
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), String::new()),
+        idle_engine(),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let save = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .save_engine_settings("Late".into(), "/late".into())
+                .await
+        }
+    });
+    settings.first_entered.notified().await;
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    tokio::task::yield_now().await;
+    settings.release_first.notify_one();
+
+    assert!(matches!(
+        save.await.unwrap(),
+        Err(ServiceError::ShuttingDown)
+    ));
+    shutdown.await.unwrap().unwrap();
+    assert_eq!(handle.engine_settings(), (None, None));
+    let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    assert_eq!(saved.engine_distribution, None);
+    assert_eq!(saved.engine_executable, None);
+}
+
+#[tokio::test]
 async fn engine_settings_validate_persist_then_apply_exact_inputs() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();
@@ -668,6 +715,31 @@ async fn service_persists_live_tokens_and_exposes_redacted_logs() {
     assert!(restarted_tokens.verify(&plaintext).await);
     restarted.handle().shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn concurrent_token_persistence_failures_restore_the_live_token_set() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let tokens = Arc::new(TokenStore::default());
+    let mut opts = options(temp.path(), String::new());
+    opts.gateway.authentication = Authentication::Tokens(tokens.clone());
+    let service = Service::start(opts, idle_engine()).await.unwrap();
+    let handle = service.handle();
+    std::fs::remove_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(temp.path().join("config"), b"not a directory").unwrap();
+
+    let (first, second) = tokio::join!(handle.generate_token(), handle.generate_token());
+    assert!(first.is_err());
+    assert!(second.is_err());
+    assert!(tokens.phc_hashes().is_empty());
+
+    std::fs::remove_file(temp.path().join("config")).unwrap();
+    std::fs::create_dir(temp.path().join("config")).unwrap();
+    let created = handle.generate_token().await.unwrap();
+    assert!(tokens.verify(&created.plaintext).await);
+    assert_eq!(tokens.phc_hashes().len(), 1);
+    handle.shutdown().await.unwrap();
+}
 impl InferenceEngine for Engine {
     fn spec(&self) -> EngineFuture<'_, EngineSpec> {
         Box::pin(async {
@@ -865,6 +937,43 @@ async fn fresh_missing_default_catalog_is_created_before_watcher_start() {
 
     assert!(temp.path().join("models").is_dir());
     service.handle().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn file_at_default_catalog_root_starts_with_diagnostic_and_can_recover() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("models"), b"not a directory").unwrap();
+    let settings = Arc::new(RecordingSettings(Arc::new(std::sync::Mutex::new(
+        Vec::new(),
+    ))));
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), String::new()),
+        idle_engine(),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        settings,
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    assert!(handle.snapshot().catalog_diagnostic.is_some());
+    assert!(handle.snapshot().models.is_empty());
+
+    let replacement = temp.path().join("recovered-models");
+    std::fs::create_dir(&replacement).unwrap();
+    std::fs::write(replacement.join("recovered.gguf"), b"GGUFrecovered").unwrap();
+    handle
+        .save_launcher_settings(LauncherSettings {
+            catalog_directory: replacement.clone(),
+            engine_distribution: "Ubuntu".into(),
+            engine_executable: "/opt/llama-server".into(),
+            default_launch_settings: LaunchSettings::default(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(handle.launcher_settings().catalog_directory, replacement);
+    assert_eq!(handle.snapshot().models.len(), 1);
+    assert_eq!(handle.snapshot().catalog_diagnostic, None);
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
