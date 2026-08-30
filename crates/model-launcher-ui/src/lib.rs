@@ -474,10 +474,10 @@ fn display_rows(view_model: &ViewModel, query: &str) -> Vec<ModelDisplay> {
         .into_iter()
         .map(|row| {
             let action = view_model.action(row.id);
-            let (label, enabled) = match action {
-                ModelAction::Load => ("Load", true),
-                ModelAction::Eject => ("Eject", true),
-                ModelAction::Disabled(_) => ("Load", false),
+            let (label, enabled, reason) = match action {
+                ModelAction::Load => ("Load", true, String::new()),
+                ModelAction::Eject => ("Eject", true, String::new()),
+                ModelAction::Disabled(reason) => ("Load", false, reason),
             };
             ModelDisplay {
                 id: row.id.as_uuid().to_string().into(),
@@ -488,6 +488,7 @@ fn display_rows(view_model: &ViewModel, query: &str) -> Vec<ModelDisplay> {
                 status: row.status.clone().into(),
                 action: label.into(),
                 action_enabled: enabled,
+                action_reason: reason.into(),
             }
         })
         .collect()

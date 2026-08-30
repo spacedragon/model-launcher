@@ -1,7 +1,7 @@
 import { Button } from "std-widgets.slint";
 import { StatusPill } from "status-pill.slint";
 
-export struct ModelDisplay { id: string, name: string, key: string, size: string, path: string, status: string, action: string, action-enabled: bool }
+export struct ModelDisplay { id: string, name: string, key: string, size: string, path: string, status: string, action: string, action-enabled: bool, action-reason: string }
 
 export component ModelRow inherits Rectangle {
     in property <ModelDisplay> model;
@@ -16,11 +16,11 @@ export component ModelRow inherits Rectangle {
         VerticalLayout {
             alignment: center;
             Text { text: root.model.name; color: #1F2937; font-family: "Segoe UI"; font-size: 14px; font-weight: 600; overflow: elide; }
-            Text { text: root.show-path ? root.model.path : root.model.key; color: #667085; font-family: "Segoe UI"; font-size: 11px; overflow: elide; }
+            Text { text: root.model.action-reason != "" ? root.model.action-reason : (root.show-path ? root.model.path : root.model.key); color: root.model.action-reason != "" ? #B54708 : #667085; font-family: "Segoe UI"; font-size: 11px; overflow: elide; }
         }
         Text { visible: root.show-size; width: 74px; text: root.model.size; color: #667085; font-family: "Segoe UI"; font-size: 12px; vertical-alignment: center; }
         StatusPill { width: 82px; label: root.model.status; active: root.model.action == "Eject"; }
-        Button { width: 74px; text: root.model.action; enabled: root.model.action-enabled; accessible-label: root.model.action + " " + root.model.name; clicked => { root.action(root.model.id); } }
+        Button { width: 74px; text: root.model.action; enabled: root.model.action-enabled; accessible-label: root.model.action + " " + root.model.name + (root.model.action-reason != "" ? ": " + root.model.action-reason : ""); clicked => { root.action(root.model.id); } }
     }
     Rectangle { y: parent.height - 1px; height: 1px; background: #E5E7EB; }
 }
