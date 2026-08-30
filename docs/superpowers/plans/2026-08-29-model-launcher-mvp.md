@@ -324,27 +324,27 @@ git commit -m "feat: expose compatible model and inference APIs"
 - Create: `apps/model-launcher/src/{main,service}.rs`
 - Test: `apps/model-launcher/tests/headless.rs`
 
-- [ ] **Step 1: Write a failing end-to-end headless test**
+- [x] **Step 1: Write a failing end-to-end headless test**
 
 Compose temp configuration, catalog fixture, fake engine, lifecycle, and gateway. Verify scan→load→stream→eject, restart without auto-load, and shutdown ordering.
 
-- [ ] **Step 2: Verify failure**
+- [x] **Step 2: Verify failure**
 
 Run: `cargo test -p model-launcher --test headless`
 
 Expected: binary/service crate is absent.
 
-- [ ] **Step 3: Implement composition and shutdown**
+- [x] **Step 3: Implement composition and shutdown**
 
 Build a service handle independent of UI. Shutdown stops accepting HTTP, cancels backoff, ejects the engine, persists config, and joins background tasks with timeouts.
 
-- [ ] **Step 4: Verify the vertical slice**
+- [x] **Step 4: Verify the vertical slice**
 
 Run: `cargo test -p model-launcher --test headless && cargo test --workspace`
 
 Expected: the complete non-visual MVP flow passes.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add Cargo.toml apps/model-launcher
@@ -387,7 +387,7 @@ Run: `cargo test -p model-launcher-ui && cargo build -p model-launcher`
 
 Expected: view-model tests pass and the desktop binary builds on the development host; platform-specific code is cfg-gated.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml crates/model-launcher-ui apps/model-launcher
@@ -426,7 +426,7 @@ On Windows, run the smoke harness with a small GGUF and user-supplied llama-serv
 
 **NOT RUN (2026-08-30):** the current host is macOS and has no real Windows desktop, WSL distribution, user llama-server, GGUF acceptance model, or Windows resource-inspection tooling. Run `tests/windows-wsl/smoke.ps1 -ManualResourceChecks` on the documented user-supplied Windows hardware and attach its evidence before checking this step.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add .github .gitignore README.md apps/model-launcher tests/windows-wsl
@@ -439,11 +439,11 @@ git commit -m "build: package and verify the Windows WSL MVP"
 - Modify only files required by defects found during verification
 - Create: `docs/superpowers/verification/2026-08-29-model-launcher-mvp.md`
 
-- [ ] **Step 1: Trace every MVP requirement to evidence**
+- [x] **Step 1: Trace every MVP requirement to evidence**
 
 Create a requirement matrix linking each design requirement to tests, commands, or a documented Windows manual check. Mark any unavailable real-WSL evidence explicitly rather than claiming it passed.
 
-- [ ] **Step 2: Run final automated checks from a clean build**
+- [x] **Step 2: Run final automated checks from a clean build**
 
 Run: `cargo clean && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace --all-targets && cargo build -p model-launcher --release`
 
