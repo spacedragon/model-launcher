@@ -17,7 +17,7 @@ use model_launcher_api::{
 use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigStore, EngineCapabilities, InferenceEngine,
     LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter, LogRecord, LogStore,
-    LogStoreLimits, ModelRecord, ReconcileResult,
+    LogStoreLimits, ModelRecord, ReconcileOptions, ReconcileResult, reconcile_catalog, scan,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -548,6 +548,10 @@ impl ServiceHandle {
         &self,
         settings: LauncherSettings,
     ) -> Result<EngineCapabilities, ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         if !settings.catalog_directory.is_dir() {
             return Err(ServiceError::Authentication(
                 "model directory must be an existing directory".into(),
@@ -561,21 +565,28 @@ impl ServiceHandle {
             .await
             .map_err(ServiceError::Authentication)?;
         let root = settings.catalog_directory.clone();
+        let scanned = scan(&root);
+        if !scanned.complete {
+            return Err(ServiceError::Authentication(
+                "model directory could not be scanned completely".into(),
+            ));
+        }
+        let prepared_watcher = self.inner.prepare_watcher(&root)?;
         let latest = self.inner.store.update(|config| {
             config.catalog_directory = Some(root.clone());
             config.engine_distribution = Some(settings.engine_distribution.clone());
             config.engine_executable = Some(settings.engine_executable.clone());
             config.default_launch_settings = settings.default_launch_settings.clone();
+            *config = reconcile_catalog(config, scanned, ReconcileOptions::default()).config;
             Ok(())
         })?;
-        let result = CatalogService::new(&root, self.inner.store.clone()).reconcile_now()?;
-        *self.inner.models.write().expect("model lock poisoned") = result.config;
+        *self.inner.models.write().expect("model lock poisoned") = latest;
         *self
             .inner
             .catalog_root
             .write()
-            .expect("catalog root lock poisoned") = root;
-        self.inner.restart_watcher().await?;
+            .expect("catalog root lock poisoned") = root.clone();
+        self.inner.install_watcher(prepared_watcher, root).await;
         manager.apply(settings.engine_distribution, settings.engine_executable);
         *self.inner.capabilities.write().expect("capabilities lock") = caps.clone();
         self.inner.health.valid.store(true, Ordering::Release);
@@ -585,7 +596,6 @@ impl ServiceHandle {
             .diagnostic
             .write()
             .expect("engine diagnostic lock poisoned") = None;
-        let _ = latest;
         self.inner.changed();
         Ok(caps)
     }
@@ -751,17 +761,20 @@ impl Inner {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
-    async fn restart_watcher(&self) -> Result<(), ServiceError> {
+    fn prepare_watcher(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<Option<CatalogWatcher>, ServiceError> {
         if !self.watch_catalog {
-            return Ok(());
+            return Ok(None);
         }
-        let root = self
-            .catalog_root
-            .read()
-            .expect("catalog root lock poisoned")
-            .clone();
-        let mut watcher = CatalogWatcher::watch(&root, Duration::from_millis(250))
-            .map_err(|error| ServiceError::Watcher(error.to_string()))?;
+        CatalogWatcher::watch(root, Duration::from_millis(250))
+            .map(Some)
+            .map_err(|error| ServiceError::Watcher(error.to_string()))
+    }
+
+    async fn install_watcher(&self, watcher: Option<CatalogWatcher>, root: PathBuf) {
+        let Some(mut watcher) = watcher else { return };
         let (stop, mut stopped) = watch::channel(false);
         let catalog = CatalogService::new(root, self.store.clone());
         let models = self.models.clone();
@@ -792,7 +805,6 @@ impl Inner {
             old_task.abort();
             let _ = old_task.await;
         }
-        Ok(())
     }
 
     fn record_recent(&self, id: model_launcher_core::ModelId) {

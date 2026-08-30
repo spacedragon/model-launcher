@@ -51,6 +51,83 @@ impl EngineSettingsManager for RecordingSettings {
     }
 }
 
+struct BlockingSettings {
+    calls: AtomicUsize,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+    first_entered: tokio::sync::Notify,
+    release_first: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl EngineSettingsManager for BlockingSettings {
+    async fn validate(&self, _: &str, _: &str) -> Result<EngineCapabilities, String> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        if call == 0 {
+            self.first_entered.notify_one();
+            self.release_first.notified().await;
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        Ok(EngineCapabilities::default())
+    }
+
+    fn apply(&self, _: String, _: String) {}
+}
+
+#[tokio::test]
+async fn launcher_settings_saves_are_serialized_across_async_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("models");
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    for root in [&initial, &first_root, &second_root] {
+        std::fs::create_dir(root).unwrap();
+    }
+    let settings = Arc::new(BlockingSettings {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+        first_entered: tokio::sync::Notify::new(),
+        release_first: tokio::sync::Notify::new(),
+    });
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let save = |catalog_directory: std::path::PathBuf, distribution: &str| LauncherSettings {
+        catalog_directory,
+        engine_distribution: distribution.into(),
+        engine_executable: "/opt/llama-server".into(),
+        default_launch_settings: LaunchSettings::default(),
+    };
+    let first = tokio::spawn({
+        let handle = handle.clone();
+        let settings = save(first_root, "First");
+        async move { handle.save_launcher_settings(settings).await }
+    });
+    settings.first_entered.notified().await;
+    let second = tokio::spawn({
+        let handle = handle.clone();
+        let settings = save(second_root.clone(), "Second");
+        async move { handle.save_launcher_settings(settings).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(settings.max_active.load(Ordering::SeqCst), 1);
+    settings.release_first.notify_one();
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(handle.launcher_settings().catalog_directory, second_root);
+    assert_eq!(handle.engine_settings().0.as_deref(), Some("Second"));
+    handle.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn engine_settings_validate_persist_then_apply_exact_inputs() {
     let temp = tempfile::tempdir().unwrap();
