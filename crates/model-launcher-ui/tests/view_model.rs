@@ -12,10 +12,40 @@ use model_launcher_core::{
     ModelKey, ModelRecord, ModelState,
 };
 use model_launcher_ui::{
-    AppSnapshot, CloseNotice, CloseNoticeStore, EngineSettings, LogCommands, MetadataVisibility,
-    ModelAction, RecentModels, SaveSettings, TokenReveal, TrayCommand, TrayController, ViewModel,
-    load_dialog_fields_for, load_dialog_values_for, load_request_for,
+    AppSnapshot, Clipboard, ClipboardExpiry, CloseNotice, CloseNoticeStore, EngineSettings,
+    LogCommands, MetadataVisibility, ModelAction, RecentModels, SaveSettings, TokenReveal,
+    TrayCommand, TrayController, ViewModel, load_dialog_fields_for, load_dialog_values_for,
+    load_request_for,
 };
+
+#[derive(Default)]
+struct FakeClipboard(String);
+
+impl Clipboard for FakeClipboard {
+    fn get(&mut self) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+
+    fn set(&mut self, value: String) -> Result<(), String> {
+        self.0 = value;
+        Ok(())
+    }
+}
+
+#[test]
+fn token_clipboard_expiry_clears_only_the_unchanged_token() {
+    let mut clipboard = FakeClipboard::default();
+    clipboard.set("secret-token".into()).unwrap();
+    let expiry = ClipboardExpiry::new("secret-token");
+    assert!(expiry.clear_if_unchanged(&mut clipboard));
+    assert_eq!(clipboard.0, "");
+
+    clipboard.set("secret-token".into()).unwrap();
+    let expiry = ClipboardExpiry::new("secret-token");
+    clipboard.set("later user copy".into()).unwrap();
+    assert!(!expiry.clear_if_unchanged(&mut clipboard));
+    assert_eq!(clipboard.0, "later user copy");
+}
 
 fn model(name: &str, size: u64) -> ModelRecord {
     ModelRecord {

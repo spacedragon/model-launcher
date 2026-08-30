@@ -4,6 +4,71 @@ use model_launcher_core::{
     EngineCapabilities, LaunchSettings, LifecycleSnapshot, LogFilter, LogRecord, LogStore, ModelId,
     ModelRecord, SettingId,
 };
+use sha2::{Digest as _, Sha256};
+
+pub trait Clipboard {
+    fn get(&mut self) -> Result<String, String>;
+    fn set(&mut self, value: String) -> Result<(), String>;
+}
+
+pub struct ClipboardExpiry([u8; 32]);
+
+impl ClipboardExpiry {
+    #[must_use]
+    pub fn new(token: &str) -> Self {
+        Self(Sha256::digest(token.as_bytes()).into())
+    }
+
+    pub fn clear_if_unchanged(&self, clipboard: &mut impl Clipboard) -> bool {
+        let Ok(current) = clipboard.get() else {
+            return false;
+        };
+        if Sha256::digest(current.as_bytes()).as_slice() != self.0 {
+            return false;
+        }
+        clipboard.set(String::new()).is_ok()
+    }
+}
+
+struct SystemClipboard(copypasta::ClipboardContext);
+
+impl SystemClipboard {
+    fn open() -> Result<Self, String> {
+        copypasta::ClipboardContext::new()
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Clipboard for SystemClipboard {
+    fn get(&mut self) -> Result<String, String> {
+        use copypasta::ClipboardProvider as _;
+        self.0.get_contents().map_err(|error| error.to_string())
+    }
+
+    fn set(&mut self, value: String) -> Result<(), String> {
+        use copypasta::ClipboardProvider as _;
+        self.0
+            .set_contents(value)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn copy_token_and_schedule_expiry(token: &str) {
+    let Ok(mut clipboard) = SystemClipboard::open() else {
+        return;
+    };
+    if clipboard.set(token.to_owned()).is_err() {
+        return;
+    }
+    let expiry = ClipboardExpiry::new(token);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        if let Ok(mut clipboard) = SystemClipboard::open() {
+            expiry.clear_if_unchanged(&mut clipboard);
+        }
+    });
+}
 
 pub mod tray;
 pub use tray::{TrayCommand, TrayController};
@@ -127,6 +192,14 @@ pub fn run_desktop(
         if let Ok(mut clipboard) = ClipboardContext::new() {
             let _ = clipboard.set_contents(text.into());
         }
+    });
+    let weak = window.as_weak();
+    window.on_copy_token(move |text| {
+        copy_token_and_schedule_expiry(&text);
+        if let Some(window) = weak.upgrade() {
+            window.set_generated_token("".into());
+        }
+        clear_token_reveal();
     });
     install_log_filter(
         &window,
@@ -361,6 +434,14 @@ fn create_window(
         if let Ok(mut clipboard) = ClipboardContext::new() {
             let _ = clipboard.set_contents(text.into());
         }
+    });
+    let weak = window.as_weak();
+    window.on_copy_token(move |text| {
+        copy_token_and_schedule_expiry(&text);
+        if let Some(window) = weak.upgrade() {
+            window.set_generated_token("".into());
+        }
+        clear_token_reveal();
     });
     install_log_filter(&window, actions.clone(), current_log_filter);
     Ok(window)

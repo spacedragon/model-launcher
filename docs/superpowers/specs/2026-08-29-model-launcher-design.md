@@ -206,6 +206,8 @@ Tray state updates reactively from core snapshots. Quit stops accepting HTTP tra
 
 Versioned JSON configuration is stored in the Windows user application-data directory. Writes use a temporary file and atomic replacement. A previous valid file is retained for recovery. Corrupt or unsupported configuration is quarantined with a visible diagnostic instead of overwritten.
 
+Generated authentication tokens are removed from the live UI state immediately after copying. The system clipboard is cleared after 60 seconds only if it still contains that token; the expiry task retains only a SHA-256 digest, so a later user copy is preserved. Rust-owned token buffers are zeroed on a best-effort basis, but Slint `SharedString` and platform clipboard implementations do not guarantee zeroization, so this is not a claim that every in-memory copy is erased.
+
 Structured logs include timestamp, source, level, lifecycle generation, model UUID, and message. The in-memory log store is bounded. Export excludes secrets and can include the cached version/help probe for diagnosis.
 
 The application restores configuration and catalog state on restart but never automatically loads the previously running model.
