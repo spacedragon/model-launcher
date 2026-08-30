@@ -73,6 +73,11 @@ require_match(workflow_text, /github\.ref.*refs\/heads\/main/, "acceptance workf
 ci_text = read(".github/workflows/ci.yml")
 abort("all CI actions must be pinned to full SHAs") if ci_text.scan(/uses:\s*([^\s]+)/).flatten.any? { |use| !use.match?(/@[0-9a-f]{40}\z/) }
 
+attributes_path = File.join(ROOT, ".gitattributes")
+abort("CI needs .gitattributes to keep Rust sources LF on Windows") unless File.file?(attributes_path)
+attributes = File.read(attributes_path, encoding: "UTF-8")
+require_match(attributes, /^\*\.rs\s+text\s+eol=lf$/, "Rust sources must stay LF on Windows checkouts")
+
 main = read("apps/model-launcher/src/main.rs")
 require_match(main, /MODEL_LAUNCHER_SHUTDOWN_FILE/, "application must support graceful smoke shutdown")
 
