@@ -12,7 +12,8 @@ use std::{
 use futures_util::FutureExt as _;
 use model_launcher_api::{
     ApiModel, Authentication, CreatedToken, Gateway, GatewayConfig, GatewayConfigError,
-    GatewayServer, ManagementModel, ManagementModelResolver, ProfileUpdater, UpstreamResolver,
+    GatewayServer, LifecycleUpstreamResolver, ManagementModel, ManagementModelResolver,
+    ProfileUpdater,
 };
 use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigStore, EngineCapabilities, InferenceEngine,
@@ -26,7 +27,6 @@ pub struct ServiceOptions {
     pub config_dir: PathBuf,
     pub catalog_dir: PathBuf,
     pub gateway: GatewayConfig,
-    pub upstream: String,
     pub watch_catalog: bool,
     pub shutdown_timeout: Duration,
 }
@@ -278,8 +278,7 @@ impl Service {
             &models.read().expect("model lock poisoned"),
             &capabilities.read().expect("capabilities lock"),
         );
-        let upstream = options.upstream.clone();
-        let upstream: UpstreamResolver = Arc::new(move |_| Some(upstream.clone()));
+        let upstream = LifecycleUpstreamResolver::new(lifecycle_handle.clone()).into_resolver();
         let gateway = match Gateway::new_with_management(
             options.gateway,
             api_models.into(),

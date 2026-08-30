@@ -819,6 +819,7 @@ impl InferenceEngine for LlamaCppWslEngine {
                 .map_err(app_error)?;
             let owned_pid = establish_pid(&mut *child).await.map_err(app_error)?;
             Ok(Box::new(WslEngineProcess {
+                endpoint: SocketAddr::from(([127, 0, 0, 1], port)),
                 distribution,
                 pid: owned_pid.pid,
                 owned_pid,
@@ -838,6 +839,7 @@ impl InferenceEngine for LlamaCppWslEngine {
 }
 
 struct WslEngineProcess {
+    endpoint: SocketAddr,
     distribution: String,
     pid: u32,
     owned_pid: OwnedPid,
@@ -854,6 +856,10 @@ struct RetryContext {
     allocator: Arc<dyn PortAllocator>,
 }
 impl EngineProcess for WslEngineProcess {
+    fn endpoint(&self) -> Option<SocketAddr> {
+        Some(self.endpoint)
+    }
+
     fn wait_ready(&mut self, timeout: Duration) -> EngineFuture<'_, ()> {
         Box::pin(async move {
             let deadline = Instant::now() + timeout;
@@ -1022,6 +1028,7 @@ impl WslEngineProcess {
             .ok_or_else(|| app_error(WslError::Command("retry context unavailable".into())))?;
         let reservation = retry.allocator.reserve().map_err(app_error)?;
         let port = reservation.addr().port();
+        self.endpoint = SocketAddr::from(([127, 0, 0, 1], port));
         let mut args = retry.args.clone();
         if let Some(value) = args.windows(2).position(|pair| pair[0] == "--port") {
             args[value + 1] = port.to_string();
@@ -1454,6 +1461,7 @@ mod tests {
         let observer = Arc::new(CleanupObserver::default());
         let allocator = Arc::new(FakeAllocator(Mutex::new(VecDeque::from([2002]))));
         let mut process = WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 11,
             owned_pid: OwnedPid {
@@ -1517,6 +1525,7 @@ mod tests {
         });
         let allocator = Arc::new(FakeAllocator(Mutex::new(VecDeque::from([2002, 2003]))));
         let mut process = WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 11,
             owned_pid: OwnedPid {
@@ -1558,6 +1567,7 @@ mod tests {
         });
         let observer = Arc::new(CleanupObserver::default());
         let process = WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 77,
             owned_pid: OwnedPid {
@@ -1607,6 +1617,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             drop(WslEngineProcess {
+                endpoint: "127.0.0.1:1".parse().unwrap(),
                 distribution: "Ubuntu".into(),
                 pid: 78,
                 owned_pid: OwnedPid {
@@ -1647,6 +1658,7 @@ mod tests {
         let observer = Arc::new(CleanupObserver::default());
         let started = std::time::Instant::now();
         drop(WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 79,
             owned_pid: OwnedPid {
@@ -1694,6 +1706,7 @@ mod tests {
             signals: Mutex::new(Vec::new()),
         });
         drop(WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 80,
             owned_pid: OwnedPid {
@@ -1748,6 +1761,7 @@ mod tests {
         });
         let observer = Arc::new(CleanupObserver::default());
         drop(WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 78,
             owned_pid: OwnedPid {
@@ -1804,6 +1818,7 @@ mod tests {
             signals: Mutex::new(Vec::new()),
         });
         let mut process = WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 88,
             owned_pid: OwnedPid {
@@ -1873,6 +1888,7 @@ mod tests {
         waits: VecDeque<Result<i32, WslError>>,
     ) -> WslEngineProcess {
         WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
             distribution: "Ubuntu".into(),
             pid: 55,
             owned_pid: OwnedPid {

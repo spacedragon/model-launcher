@@ -25,7 +25,8 @@ use axum::{
     routing::{get, post},
 };
 use model_launcher_core::{
-    AppError, BatchSize, ContextLength, EngineCapabilities, LifecycleHandle, ModelRecord,
+    AppError, BatchSize, ContextLength, EngineCapabilities, LifecycleHandle, LifecycleState,
+    ModelRecord,
 };
 use serde::Serialize;
 use tokio::{
@@ -36,6 +37,34 @@ use tokio::{
 use tower::ServiceExt as _;
 
 pub type UpstreamResolver = Arc<dyn Fn(&ModelRecord) -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
+pub struct LifecycleUpstreamResolver {
+    lifecycle: LifecycleHandle,
+}
+
+impl LifecycleUpstreamResolver {
+    #[must_use]
+    pub fn new(lifecycle: LifecycleHandle) -> Self {
+        Self { lifecycle }
+    }
+
+    #[must_use]
+    pub fn resolve(&self, model: &ModelRecord) -> Option<String> {
+        let snapshot = self.lifecycle.snapshot();
+        if snapshot.state != LifecycleState::Running
+            || snapshot.process.as_ref().map(|process| process.model_id) != Some(model.id)
+        {
+            return None;
+        }
+        snapshot.endpoint.map(|endpoint| format!("http://{endpoint}"))
+    }
+
+    #[must_use]
+    pub fn into_resolver(self) -> UpstreamResolver {
+        Arc::new(move |model| self.resolve(model))
+    }
+}
 
 #[derive(Clone)]
 pub struct ManagementModel {

@@ -1,4 +1,4 @@
-use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use std::{collections::HashSet, io, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -34,6 +34,7 @@ pub struct LifecycleSnapshot {
     pub generation: u64,
     pub in_flight: usize,
     pub process: Option<ProcessContext>,
+    pub endpoint: Option<SocketAddr>,
     pub diagnostic: Option<String>,
 }
 
@@ -45,6 +46,7 @@ impl Default for LifecycleSnapshot {
             generation: 0,
             in_flight: 0,
             process: None,
+            endpoint: None,
             diagnostic: None,
         }
     }
@@ -401,6 +403,9 @@ impl Actor {
     }
 
     fn set_state(&mut self, state: LifecycleState) {
+        if state != LifecycleState::Running {
+            self.snapshot.endpoint = None;
+        }
         self.snapshot.state = state;
         self.publish();
     }
@@ -489,6 +494,7 @@ impl Actor {
                         return !shutdown_after_cancel;
                     }
                     StartOutcome::Ready(process) => {
+                        self.snapshot.endpoint = process.endpoint();
                         self.snapshot.process = Some(ProcessContext { model_id: model.id, generation });
                         self.set_state(LifecycleState::Running);
                         for reply in loads.drain(..) {

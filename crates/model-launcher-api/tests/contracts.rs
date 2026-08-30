@@ -11,7 +11,7 @@ use futures_util::StreamExt as _;
 use http_body_util::BodyExt as _;
 use model_launcher_api::{
     Accept, ApiModel, Authentication, Gateway, GatewayConfig, GatewayLimits, LoadRequest,
-    TokenStore,
+    LifecycleUpstreamResolver, TokenStore,
 };
 
 struct ScriptedAcceptor {
@@ -87,6 +87,9 @@ impl InferenceEngine for ReadyEngine {
 }
 struct ReadyProcess;
 impl EngineProcess for ReadyProcess {
+    fn endpoint(&self) -> Option<SocketAddr> {
+        Some("127.0.0.1:45678".parse().unwrap())
+    }
     fn wait_ready(&mut self, _: Duration) -> EngineFuture<'_, ()> {
         Box::pin(async { Ok(()) })
     }
@@ -277,6 +280,26 @@ async fn start(
 async fn stop(lifecycle: Lifecycle, server: model_launcher_api::GatewayServer) {
     server.stop().await.unwrap();
     lifecycle.handle().shutdown().await.unwrap();
+    lifecycle.wait_for_termination().await;
+}
+
+#[tokio::test]
+async fn lifecycle_upstream_resolver_tracks_only_the_running_process_endpoint() {
+    let lifecycle = Lifecycle::spawn(Arc::new(ReadyEngine));
+    let handle = lifecycle.handle();
+    let target = api_model().record;
+    let resolver = LifecycleUpstreamResolver::new(handle.clone());
+    assert_eq!(resolver.resolve(&target), None);
+
+    handle.load(target.clone()).await.unwrap();
+    assert_eq!(
+        resolver.resolve(&target).as_deref(),
+        Some("http://127.0.0.1:45678")
+    );
+
+    handle.eject().await.unwrap();
+    assert_eq!(resolver.resolve(&target), None);
+    handle.shutdown().await.unwrap();
     lifecycle.wait_for_termination().await;
 }
 

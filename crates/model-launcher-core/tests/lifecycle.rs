@@ -5,6 +5,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, Mutex},
+    net::SocketAddr,
     time::Duration,
 };
 
@@ -205,6 +206,10 @@ impl InferenceEngine for ScriptedEngine {
 }
 
 impl EngineProcess for FakeProcess {
+    fn endpoint(&self) -> Option<SocketAddr> {
+        Some("127.0.0.1:43123".parse().unwrap())
+    }
+
     fn wait_ready(&mut self, _timeout: Duration) -> EngineFuture<'_, ()> {
         Box::pin(async move {
             self.engine.inner.lock().unwrap().ready_entered += 1;
@@ -305,6 +310,39 @@ async fn load_transitions_stopped_starting_running_and_waits_for_readiness() {
     assert!(load.await.unwrap().is_ok());
     assert_eq!(snapshots.borrow().state, LifecycleState::Running);
     assert_eq!(snapshots.borrow().desired_model, Some(target.id));
+    assert_eq!(
+        snapshots.borrow().endpoint,
+        Some("127.0.0.1:43123".parse().unwrap())
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_is_owned_only_while_process_is_running() {
+    let engine = Arc::new(ScriptedEngine::new());
+    let control = engine.script();
+    let graceful_gate = control.block_graceful();
+    let lifecycle = Lifecycle::spawn(engine);
+    let handle = lifecycle.handle();
+    let load = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.load(model("endpoint")).await }
+    });
+    control.ready();
+    load.await.unwrap().unwrap();
+    assert_eq!(
+        handle.snapshot().endpoint,
+        Some("127.0.0.1:43123".parse().unwrap())
+    );
+
+    let eject = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.eject().await }
+    });
+    wait_for_state(&handle, LifecycleState::Stopping).await;
+    assert_eq!(handle.snapshot().endpoint, None);
+    graceful_gate.notify_one();
+    eject.await.unwrap().unwrap();
+    assert_eq!(handle.snapshot().endpoint, None);
 }
 
 #[tokio::test(start_paused = true)]

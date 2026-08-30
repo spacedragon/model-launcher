@@ -19,8 +19,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             authentication: Authentication::Tokens(token_store),
             limits: GatewayLimits::default(),
         },
-        upstream: std::env::var("MODEL_LAUNCHER_UPSTREAM")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
         watch_catalog: true,
         shutdown_timeout: Duration::from_secs(10),
     };

@@ -1,4 +1,4 @@
-use std::{future::Future, pin::Pin, time::Duration};
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,11 @@ pub trait InferenceEngine: Send + Sync {
 }
 
 pub trait EngineProcess: Send {
+    /// Returns the loopback endpoint owned by this process, once spawned.
+    fn endpoint(&self) -> Option<SocketAddr> {
+        None
+    }
+
     fn wait_ready(&mut self, timeout: Duration) -> EngineFuture<'_, ()>;
 
     fn check_health(&mut self) -> EngineFuture<'_, ()>;
