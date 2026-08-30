@@ -400,8 +400,21 @@ fn scan_impl(
         );
     }
     let ambiguous_keys = ambiguous
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
+    let ambiguous_shard_groups = ambiguous
         .into_iter()
-        .map(|(key, _)| key)
+        .flat_map(|(_, paths)| paths)
+        .filter_map(|path| {
+            let parent = path.parent()?.to_path_buf();
+            let captures = shard.captures(path.file_name()?.to_str()?)?;
+            Some((
+                parent,
+                captures[1].to_ascii_lowercase(),
+                captures[3].to_string(),
+            ))
+        })
         .collect::<HashSet<_>>();
     let mut consumed = HashSet::new();
     let mut budgets = ScanBudgets {
@@ -419,6 +432,18 @@ fn scan_impl(
         if normalized_key
             .as_ref()
             .is_some_and(|key| ambiguous_keys.contains(key))
+            || path
+                .parent()
+                .zip(path.file_name().and_then(|name| name.to_str()))
+                .and_then(|(parent, name)| {
+                    let captures = shard.captures(name)?;
+                    Some((
+                        parent.to_path_buf(),
+                        captures[1].to_ascii_lowercase(),
+                        captures[3].to_string(),
+                    ))
+                })
+                .is_some_and(|key| ambiguous_shard_groups.contains(&key))
         {
             consumed.insert(path.clone());
             continue;
