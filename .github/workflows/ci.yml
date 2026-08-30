@@ -18,6 +18,11 @@ jobs:
         os: [windows-latest, macos-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y libfontconfig1-dev
       - name: Install Rust 1.89
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt,clippy
       - name: Select Rust 1.89

@@ -48,6 +48,10 @@ matrix = ci.dig("jobs", "test", "strategy", "matrix", "os")
 expected = %w[windows-latest macos-latest ubuntu-latest]
 abort("CI OS matrix mismatch: #{matrix.inspect}") unless matrix == expected
 abort("CI test job needs a timeout") unless ci.dig("jobs", "test", "timeout-minutes").is_a?(Integer)
+linux_dependencies = ci.dig("jobs", "test", "steps").find { |step| step["name"] == "Install Linux dependencies" }
+abort("CI must install Linux native dependencies") unless linux_dependencies
+abort("Linux dependency step must run only on Linux") unless linux_dependencies["if"] == "runner.os == 'Linux'"
+require_match(linux_dependencies.fetch("run"), /libfontconfig1-dev/, "Linux CI needs fontconfig development files")
 
 windows = YAML.safe_load(read(".github/workflows/windows.yml"), aliases: false)
 triggers = windows.fetch("on")
