@@ -18,6 +18,7 @@ export component MainWindow inherits Window {
     in-out property <string> server-bind-address: "127.0.0.1";
     in-out property <int> server-port: 1234;
     in-out property <bool> server-auth-enabled;
+    in property <bool> server-auth-active;
     in property <string> engine-diagnostic;
     in property <[string]> logs;
     in property <string> log-copy-text;
@@ -101,7 +102,7 @@ export component MainWindow inherits Window {
                 Text { text: root.authentication-status; color: #1F2937; font-family: "Segoe UI"; }
                 Text { visible: root.server-warning != ""; text: root.server-warning; color: #B54708; font-family: "Segoe UI"; wrap: word-wrap; }
                 Text { text: "Authentication tokens are shown once and cannot be recovered."; color: #667085; font-family: "Segoe UI"; }
-                Button { text: "Generate token"; enabled: root.server-auth-enabled; clicked => { root.generate-token(); } }
+                Button { text: "Generate token"; enabled: root.server-auth-active; clicked => { root.generate-token(); } }
                 HorizontalLayout { visible: root.generated-token != ""; LineEdit { text: root.generated-token; read-only: true; accessible-label: "New authentication token"; } Button { text: "Copy token"; clicked => { root.copy-token(root.generated-token); } } Button { text: "Dismiss"; clicked => { root.dismiss-token(); } } }
                 } }
             }

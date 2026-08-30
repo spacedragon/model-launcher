@@ -50,6 +50,8 @@ pub enum ServiceError {
     Shutdown(ShutdownFailure),
     #[error("authentication token: {0}")]
     Authentication(String),
+    #[error("invalid server settings: {0}")]
+    InvalidServerSettings(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,7 +255,9 @@ impl Service {
             catalog.reconcile_now()?
         } else {
             let mut config = persisted;
-            config.models.clear();
+            for model in &mut config.models {
+                model.state = model_launcher_core::ModelState::Missing;
+            }
             ReconcileResult {
                 config,
                 diagnostics: Vec::new(),
@@ -606,6 +610,11 @@ impl ServiceHandle {
         if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
             return Err(ServiceError::ShuttingDown);
         }
+        if port == 0 {
+            return Err(ServiceError::InvalidServerSettings(
+                "port must be between 1 and 65535".into(),
+            ));
+        }
         let requested = SocketAddr::new(bind, port);
         let current = self.local_addr();
         let authentication = if auth_enabled {
@@ -632,24 +641,29 @@ impl ServiceHandle {
             return Ok(());
         }
 
-        let models = api_models(
-            &self.inner.models.read().expect("model lock poisoned"),
-            &self.inner.capabilities.read().expect("capabilities lock"),
-        );
-        let replacement = Gateway::new_with_management(
-            GatewayConfig {
-                bind: requested,
-                authentication,
-                limits: self.inner.gateway_limits,
-            },
-            models.into(),
-            self.inner.lifecycle.clone(),
-            self.inner.upstream.clone(),
-            self.inner.resolver.clone(),
-            self.inner.profiles.clone(),
-        )?;
+        let replacement = self.inner.gateway(requested, authentication)?;
         let replacement_policy = replacement.authentication_policy();
-        let replacement = replacement.start().await?;
+        let requires_handoff = requested.port() == current.port()
+            && requested.ip() != current.ip()
+            && (requested.ip().is_unspecified() || current.ip().is_unspecified());
+        let rollback_authentication = self.inner.authentication();
+        if requires_handoff {
+            let old = self.inner.resources.lock().await.gateway.take();
+            if let Some(old) = old {
+                let _ = old.stop().await;
+            }
+        }
+        let replacement = match replacement.start().await {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                if requires_handoff {
+                    self.inner
+                        .restore_gateway(current, rollback_authentication)
+                        .await?;
+                }
+                return Err(error.into());
+            }
+        };
         let latest = match self.inner.store.update(|config| {
             config.bind_address = bind.to_string();
             config.port = replacement.local_addr().port();
@@ -659,6 +673,11 @@ impl ServiceHandle {
             Ok(latest) => latest,
             Err(error) => {
                 let _ = replacement.stop().await;
+                if requires_handoff {
+                    self.inner
+                        .restore_gateway(current, rollback_authentication)
+                        .await?;
+                }
                 return Err(error.into());
             }
         };
@@ -742,6 +761,9 @@ impl ServiceHandle {
             .validate(&settings.engine_distribution, &settings.engine_executable)
             .await
             .map_err(ServiceError::Authentication)?;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
         let root = settings.catalog_directory.clone();
         let scanned = scan(&root);
         if !scanned.complete {
@@ -946,6 +968,54 @@ struct Inner {
 }
 
 impl Inner {
+    fn authentication(&self) -> Authentication {
+        let policy = self
+            .authentication_policy
+            .read()
+            .expect("authentication policy lock poisoned")
+            .clone();
+        policy.read().expect("authentication lock poisoned").clone()
+    }
+
+    fn gateway(
+        &self,
+        bind: SocketAddr,
+        authentication: Authentication,
+    ) -> Result<Gateway, GatewayConfigError> {
+        let models = api_models(
+            &self.models.read().expect("model lock poisoned"),
+            &self.capabilities.read().expect("capabilities lock"),
+        );
+        Gateway::new_with_management(
+            GatewayConfig {
+                bind,
+                authentication,
+                limits: self.gateway_limits,
+            },
+            models.into(),
+            self.lifecycle.clone(),
+            self.upstream.clone(),
+            self.resolver.clone(),
+            self.profiles.clone(),
+        )
+    }
+
+    async fn restore_gateway(
+        &self,
+        bind: SocketAddr,
+        authentication: Authentication,
+    ) -> Result<(), ServiceError> {
+        let restored = self.gateway(bind, authentication)?;
+        let restored_policy = restored.authentication_policy();
+        let restored = restored.start().await?;
+        *self
+            .authentication_policy
+            .write()
+            .expect("authentication policy lock poisoned") = restored_policy;
+        self.resources.lock().await.gateway = Some(restored);
+        Ok(())
+    }
+
     fn changed(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -1009,6 +1079,7 @@ impl Inner {
     }
     async fn perform_shutdown(&self) -> Result<(), ShutdownFailure> {
         let (gateway, lifecycle, watch_stop, watcher_task) = {
+            let _mutation = self.mutation.lock().await;
             let mut resources = self.resources.lock().await;
             (
                 resources.gateway.take(),

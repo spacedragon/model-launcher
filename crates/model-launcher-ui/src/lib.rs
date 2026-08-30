@@ -155,11 +155,16 @@ pub fn server_authentication_status(settings: &UiServerSettings) -> &'static str
 
 #[must_use]
 pub fn server_base_url(settings: &UiServerSettings) -> String {
-    settings
-        .bind_address
-        .parse::<IpAddr>()
-        .map(|bind| format!("http://{}", SocketAddr::new(bind, settings.port)))
-        .unwrap_or_default()
+    settings.bind_address.parse::<IpAddr>().map_or_else(
+        |_| String::new(),
+        |bind| {
+            if bind.is_unspecified() {
+                format!("http://<LAN-address>:{}", settings.port)
+            } else {
+                format!("http://{}", SocketAddr::new(bind, settings.port))
+            }
+        },
+    )
 }
 
 #[must_use]
@@ -784,6 +789,7 @@ fn hydrate_server_settings(window: &MainWindow, settings: UiServerSettings) {
     window.set_server_bind_address(settings.bind_address.clone().into());
     window.set_server_port(i32::from(settings.port));
     window.set_server_auth_enabled(settings.auth_enabled);
+    window.set_server_auth_active(settings.auth_enabled);
     window.set_base_url(server_base_url(&settings).into());
     window.set_authentication_status(server_authentication_status(&settings).into());
     window.set_server_warning(server_lan_warning(&settings).into());
@@ -797,6 +803,7 @@ fn refresh_server_settings(window: &MainWindow, settings: UiServerSettings) {
     }
     window.set_authentication_status(server_authentication_status(&settings).into());
     window.set_server_warning(server_lan_warning(&settings).into());
+    window.set_server_auth_active(settings.auth_enabled);
 }
 
 fn install_server_settings_callback(window: &MainWindow, actions: UiActions) {

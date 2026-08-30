@@ -123,6 +123,91 @@ async fn occupied_server_rebind_keeps_old_listener_and_disk_settings() {
 }
 
 #[tokio::test]
+async fn loopback_to_wildcard_rebind_can_keep_the_same_port() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+
+    handle
+        .save_server_settings(IpAddr::from([0, 0, 0, 0]), old.port(), false)
+        .await
+        .unwrap();
+    assert_eq!(handle.local_addr(), ([0, 0, 0, 0], old.port()).into());
+    assert_eq!(
+        models_status(([127, 0, 0, 1], old.port()).into(), None).await,
+        reqwest::StatusCode::OK
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_in_progress_handoff_and_stops_replacement_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let mut opts = options(temp.path(), String::new());
+    opts.gateway.limits.shutdown_grace = Duration::from_millis(100);
+    let service = Service::start(opts, idle_engine()).await.unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    let mut idle = tokio::net::TcpStream::connect(old).await.unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    idle.write_all(
+        b"POST /v1/completions HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let save = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .save_server_settings(IpAddr::from([0, 0, 0, 0]), old.port(), false)
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+
+    save.await.unwrap().unwrap();
+    shutdown.await.unwrap().unwrap();
+    assert!(
+        reqwest::get(format!("http://127.0.0.1:{}/v1/models", old.port()))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn server_settings_reject_zero_port_without_changing_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(options(temp.path(), String::new()), idle_engine())
+        .await
+        .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    assert!(
+        handle
+            .save_server_settings(old.ip(), 0, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(handle.local_addr(), old);
+    assert_eq!(models_status(old, None).await, reqwest::StatusCode::OK);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn rebound_server_model_lists_follow_later_catalog_rescans() {
     let temp = tempfile::tempdir().unwrap();
     let models = temp.path().join("models");
@@ -189,6 +274,43 @@ async fn server_rebind_rolls_back_replacement_when_persistence_fails() {
             .is_err()
     );
     handle.shutdown().await.unwrap_err();
+}
+
+#[tokio::test]
+async fn handoff_rollback_keeps_auth_policy_attached_to_restored_listener() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(options(temp.path(), String::new()), idle_engine())
+        .await
+        .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    std::fs::remove_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(temp.path().join("config"), b"not a directory").unwrap();
+    assert!(
+        handle
+            .save_server_settings(IpAddr::from([0, 0, 0, 0]), old.port(), false)
+            .await
+            .is_err()
+    );
+    assert_eq!(models_status(old, None).await, reqwest::StatusCode::OK);
+
+    std::fs::remove_file(temp.path().join("config")).unwrap();
+    std::fs::create_dir(temp.path().join("config")).unwrap();
+    handle
+        .save_server_settings(old.ip(), old.port(), true)
+        .await
+        .unwrap();
+    let token = handle.generate_token().await.unwrap();
+    assert_eq!(
+        models_status(old, None).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        models_status(old, Some(&token.plaintext)).await,
+        reqwest::StatusCode::OK
+    );
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -427,6 +549,58 @@ async fn engine_settings_save_aborts_after_validation_when_shutdown_starts() {
     let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
     assert_eq!(saved.engine_distribution, None);
     assert_eq!(saved.engine_executable, None);
+}
+
+#[tokio::test]
+async fn launcher_settings_save_aborts_after_validation_when_shutdown_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    let initial = temp.path().join("models");
+    let replacement = temp.path().join("replacement");
+    std::fs::create_dir(&initial).unwrap();
+    std::fs::create_dir(&replacement).unwrap();
+    let settings = Arc::new(BlockingSettings {
+        calls: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+        first_entered: tokio::sync::Notify::new(),
+        release_first: tokio::sync::Notify::new(),
+    });
+    let service = Service::start_with_desktop_dependencies(
+        options(temp.path(), String::new()),
+        idle_engine(),
+        LogStore::new(LogStoreLimits::new(10, 1024, 4)).unwrap(),
+        settings.clone(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let save = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle
+                .save_launcher_settings(LauncherSettings {
+                    catalog_directory: replacement,
+                    engine_distribution: "Late".into(),
+                    engine_executable: "/late".into(),
+                    default_launch_settings: LaunchSettings::default(),
+                })
+                .await
+        }
+    });
+    settings.first_entered.notified().await;
+    let shutdown = tokio::spawn({
+        let handle = handle.clone();
+        async move { handle.shutdown().await }
+    });
+    tokio::task::yield_now().await;
+    settings.release_first.notify_one();
+
+    assert!(matches!(
+        save.await.unwrap(),
+        Err(ServiceError::ShuttingDown)
+    ));
+    shutdown.await.unwrap().unwrap();
+    assert_eq!(handle.launcher_settings().catalog_directory, initial);
 }
 
 #[tokio::test]
@@ -942,6 +1116,14 @@ async fn fresh_missing_default_catalog_is_created_before_watcher_start() {
 #[tokio::test]
 async fn file_at_default_catalog_root_starts_with_diagnostic_and_can_recover() {
     let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    std::fs::write(temp.path().join("models/preserved.gguf"), b"GGUFpreserved").unwrap();
+    let seeded = Service::start(options(temp.path(), String::new()), idle_engine())
+        .await
+        .unwrap();
+    let preserved = seeded.handle().snapshot().models[0].clone();
+    seeded.handle().shutdown().await.unwrap();
+    std::fs::remove_dir_all(temp.path().join("models")).unwrap();
     std::fs::write(temp.path().join("models"), b"not a directory").unwrap();
     let settings = Arc::new(RecordingSettings(Arc::new(std::sync::Mutex::new(
         Vec::new(),
@@ -956,7 +1138,10 @@ async fn file_at_default_catalog_root_starts_with_diagnostic_and_can_recover() {
     .unwrap();
     let handle = service.handle();
     assert!(handle.snapshot().catalog_diagnostic.is_some());
-    assert!(handle.snapshot().models.is_empty());
+    let unavailable = handle.snapshot();
+    assert_eq!(unavailable.models.len(), 1);
+    assert_eq!(unavailable.models[0].id, preserved.id);
+    assert_eq!(unavailable.models[0].key, preserved.key);
 
     let replacement = temp.path().join("recovered-models");
     std::fs::create_dir(&replacement).unwrap();
@@ -971,7 +1156,14 @@ async fn file_at_default_catalog_root_starts_with_diagnostic_and_can_recover() {
         .await
         .unwrap();
     assert_eq!(handle.launcher_settings().catalog_directory, replacement);
-    assert_eq!(handle.snapshot().models.len(), 1);
+    let recovered = handle.snapshot();
+    assert_eq!(recovered.models.len(), 2);
+    assert!(
+        recovered
+            .models
+            .iter()
+            .any(|model| model.id == preserved.id)
+    );
     assert_eq!(handle.snapshot().catalog_diagnostic, None);
     handle.shutdown().await.unwrap();
 }

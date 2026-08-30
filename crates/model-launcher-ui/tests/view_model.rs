@@ -35,6 +35,7 @@ fn server_settings_validate_inputs_and_derive_live_security_copy() {
         server_lan_warning(&lan),
         "Warning: the server is exposed to the local network without authentication."
     );
+    assert_eq!(server_base_url(&lan), "http://<LAN-address>:8080");
     assert!(parse_server_settings("localhost", 1234, true).is_err());
     assert!(parse_server_settings("127.0.0.1", 0, true).is_err());
     let ipv6 = parse_server_settings("::1", 1234, true).unwrap();

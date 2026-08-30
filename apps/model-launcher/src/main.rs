@@ -22,8 +22,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Authentication::Disabled
     };
-    let bind: std::net::SocketAddr =
-        format!("{}:{}", persisted.bind_address, persisted.port).parse()?;
+    if persisted.port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "configured server port must be between 1 and 65535",
+        )
+        .into());
+    }
+    let bind = std::net::SocketAddr::new(persisted.bind_address.parse()?, persisted.port);
     let options = ServiceOptions {
         config_dir: base.join("config"),
         catalog_dir: base.join("models"),
