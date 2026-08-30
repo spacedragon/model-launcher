@@ -114,4 +114,4 @@ cargo build --workspace --release
 ruby tests/windows-wsl/validate.rb
 ```
 
-Real WSL acceptance is deliberately manual/explicit because CI cannot supply a user's distribution, executable, model, token, GPU, interactive tray desktop, process observations, or stable idle/working-set measurements. See [tests/windows-wsl/README.md](tests/windows-wsl/README.md). No real-Windows result is inferred from a cross-compile or from tests on macOS/Linux.
+Real WSL acceptance is deliberately explicit because ordinary CI cannot supply a user's distribution, executable, model, token, or GPU. The dispatch workflow runs only the noninteractive automated smoke on a trusted self-hosted Windows/WSL runner. Configure its optional `MODEL_LAUNCHER_SMOKE_TOKEN` Actions secret (never a dispatch input); the matching Argon2 hash must already be in that runner user's Model Launcher config. Interactive tray/resource observations are local-only. See [tests/windows-wsl/README.md](tests/windows-wsl/README.md). No real-Windows result is inferred from a cross-compile or from tests on macOS/Linux.
