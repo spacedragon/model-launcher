@@ -621,7 +621,7 @@ impl EngineProcess for CrashProcess {
     }
 }
 
-fn options(root: &std::path::Path, _upstream: String) -> ServiceOptions {
+fn options(root: &std::path::Path, upstream: String) -> ServiceOptions {
     ServiceOptions {
         config_dir: root.join("config"),
         catalog_dir: root.join("models"),
@@ -635,6 +635,7 @@ fn options(root: &std::path::Path, _upstream: String) -> ServiceOptions {
         },
         watch_catalog: false,
         shutdown_timeout: Duration::from_secs(2),
+        upstream_override: (!upstream.is_empty()).then_some(upstream),
     }
 }
 

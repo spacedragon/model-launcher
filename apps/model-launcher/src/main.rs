@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         watch_catalog: true,
         shutdown_timeout: Duration::from_secs(10),
+        upstream_override: None,
     };
     let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
     let runner = Arc::new(TokioCommandRunner::with_log_store(logs.clone(), None, None));

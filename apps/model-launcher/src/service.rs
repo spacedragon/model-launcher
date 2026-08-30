@@ -30,6 +30,8 @@ pub struct ServiceOptions {
     pub gateway: GatewayConfig,
     pub watch_catalog: bool,
     pub shutdown_timeout: Duration,
+    #[doc(hidden)]
+    pub upstream_override: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -302,7 +304,13 @@ impl Service {
             &models.read().expect("model lock poisoned"),
             &capabilities.read().expect("capabilities lock"),
         );
-        let upstream = LifecycleUpstreamResolver::new(lifecycle_handle.clone()).into_resolver();
+        let lifecycle_upstream = LifecycleUpstreamResolver::new(lifecycle_handle.clone());
+        let upstream_override = options.upstream_override.clone();
+        let upstream = Arc::new(move |model: &ModelRecord| {
+            lifecycle_upstream
+                .resolve(model)
+                .or_else(|| upstream_override.clone())
+        });
         let gateway = match Gateway::new_with_management(
             options.gateway,
             api_models.into(),
