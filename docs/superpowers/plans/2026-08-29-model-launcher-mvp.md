@@ -449,11 +449,11 @@ Run: `cargo clean && cargo fmt --all --check && cargo clippy --workspace --all-t
 
 Expected: all commands pass from clean state.
 
-- [ ] **Step 3: Review the implementation**
+- [x] **Step 3: Review the implementation**
 
 Use `superpowers:requesting-code-review` against the design and this plan. Fix all blocking findings and rerun targeted plus full verification.
 
-- [ ] **Step 4: Commit verification evidence**
+- [x] **Step 4: Commit verification evidence**
 
 ```bash
 git add docs/superpowers/verification

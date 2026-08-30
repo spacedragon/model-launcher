@@ -1,6 +1,6 @@
 # Model Launcher MVP verification evidence
 
-Verified 2026-08-30 on commit `c5613efd29f1faf5d64d1a5ce4bd5ac185216ce0` before this evidence commit.
+Verified 2026-08-30 on commit `8717042bd04e5ab2533345357d203635fd607d39` before this evidence commit.
 
 ## Status vocabulary
 
@@ -20,7 +20,7 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 | `cargo clean` | Compile PASS, exit 0 | 0.04 s on the evidentiary rerun | Cargo metadata identified the sole target directory as repository-local `target`; the initial removal completed and left `target` absent, then the exact evidentiary rerun reported `Removed 0 files`. No source/user path was targeted. |
 | `cargo fmt --all --check` | Compile PASS, exit 0 | 0.24 s | No diff. |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Compile PASS, exit 0 | 62.34 s | Clean rebuild; warnings denied. |
-| `cargo test --workspace --all-targets` | Automated PASS, exit 0 | 15.32 s; 216 passed, 0 failed, 0 ignored | Rerun outside the restricted socket sandbox. An earlier restricted run exited nonzero because all 17 headless tests were denied loopback/socket operations (`Operation not permitted`); it was environmental and is not counted as a pass. Windows-gated native-window tests compiled but ran 0 tests on macOS. |
+| `cargo test --workspace --all-targets` | Automated PASS, exit 0 | All test binaries passed; 0 failed | Final rerun outside the restricted socket sandbox included 34/34 headless, 32/32 API contracts, 1/1 proxy unit, and 17/17 UI view-model tests. An earlier restricted run was denied loopback/socket operations (`Operation not permitted`); it was environmental and is not counted as a pass. Windows-gated native-window tests compiled but ran 0 tests on macOS. |
 | `cargo build -p model-launcher --release` | Compile PASS, exit 0 | 122.03 s | Release profile completed. |
 | `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` | Compile PASS, exit 0 | 66.81 s | Cross-target compilation only; no Windows execution. |
 | `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` | BLOCKED, exit 101 | 1.11 s | Target not installed. The installed MSVC check above is the relevant Windows cross-target evidence. |
@@ -68,6 +68,8 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 | Requirement | Implementation | Test evidence | Status |
 |---|---|---|---|
 | Default loopback public gateway; configurable LAN binding independently of auth with warning | `crates/model-launcher-api/src/lib.rs`; `apps/model-launcher/src/service.rs` | `lan_without_auth_is_allowed_with_typed_warning`; `server_handle_keeps_stable_address_and_graceful_stop_releases_listener` | Automated PASS |
+| Live bind/port/auth changes replace the gateway safely, reject port zero, and preserve the old listener/settings on failure | `apps/model-launcher/src/service.rs`; `crates/model-launcher-ui/src/lib.rs`; `ui/app.slint` | `loopback_to_wildcard_rebind_can_keep_the_same_port`; `server_settings_reject_zero_port_without_changing_listener`; `handoff_rollback_keeps_auth_policy_attached_to_restored_listener`; `shutdown_waits_for_in_progress_handoff_and_stops_replacement_listener` | Automated PASS |
+| Gateway catalog/model routing follows rescans and persisted missing identities survive invalid-root startup/recovery | `apps/model-launcher/src/service.rs` | `file_at_default_catalog_root_starts_with_diagnostic_and_can_recover`; headless dynamic gateway model-list and routing coverage | Automated PASS |
 | `GET /v1/models` lists discovered unloaded/loaded models | `crates/model-launcher-api/src/{lib,models}.rs` | `lists_match_pinned_semantics`; headless vertical slice | Automated PASS |
 | Chat/completions proxy preserves payload bytes, safe response headers, and byte-correct SSE | `crates/model-launcher-api/src/proxy.rs` | `proxy_preserves_raw_bytes_and_safe_headers`; `controllable_fake_upstream_preserves_split_non_utf8_sse_bytes`; `bounded_request_spool_preserves_incoming_bytes`; `upstream_redirect_is_returned_without_following_or_forwarding_again` | Automated PASS |
 | LM Studio list/load/unload pinned fields, nullable semantics, supported overrides, unknown-field rejection | `crates/model-launcher-api/src/{management,models}.rs`; JSON fixtures under `tests/fixtures` | `management_load_echo_unload_and_errors_match_contracts`; `load_contract_rejects_unknown_fields_and_distinguishes_omitted_and_null`; `nullable_lm_metadata_is_present_as_null_not_omitted`; `supported_management_overrides_are_typed_and_applied_before_load` | Automated PASS |
@@ -81,7 +83,8 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 |---|---|---|---|
 | Quiet Native top title/navigation layout and full-width responsive Models page | `crates/model-launcher-ui/ui/{app.slint,components/*.slint}` | `modal_layout_stays_inside_compact_and_narrow_viewports`; `snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata`; `model_search_matches_name_key_and_path_case_insensitively` | Automated PASS for view model/compile; visual Windows inspection NOT RUN |
 | Load modal exposes editable key and supported settings, defaults from global profile, retains unsupported saved values visibly/read-only | UI Slint + adapter; core capability/profile | `load_dialog_adapter_hydrates_every_saved_profile_value`; `load_dialog_adapter_keeps_unsupported_saved_fields_visible_and_read_only`; `newly_discovered_models_inherit_global_launch_defaults` | Automated PASS |
-| Server/log/settings actions, filtered bounded redacted logs, save performs validation/probe | UI adapter + service + core log/config | `log_commands_use_bounded_filtered_redacted_snapshots`; `filters_use_typed_source_and_minimum_level`; `engine_settings_validate_persist_then_apply_exact_inputs`; `launcher_settings_saves_are_serialized_across_async_validation` | Automated PASS |
+| Server/log/settings actions, filtered bounded redacted logs, save performs validation/probe | UI adapter + service + core log/config | `log_commands_use_bounded_filtered_redacted_snapshots`; `filters_use_typed_source_and_minimum_level`; `engine_settings_validate_persist_then_apply_exact_inputs`; `launcher_settings_saves_are_serialized_across_async_validation`; `launcher_settings_save_aborts_after_validation_when_shutdown_starts` | Automated PASS |
+| Server form preserves unsaved drafts during refresh while live auth/token state stays current | `crates/model-launcher-ui/src/lib.rs`; `crates/model-launcher-ui/ui/app.slint` | UI view-model suite 17/17, including server-setting hydration and refresh behavior | Automated PASS |
 | Tray status/open/eject/recent/quit; reactive stable recent IDs; ordered shutdown | `crates/model-launcher-ui/src/tray.rs`; `apps/model-launcher/src/{main,service}.rs` | `tray_maps_commands_without_opening_a_real_window_and_drops_windows`; `tray_recent_request_resolves_stable_id_after_catalog_reordering`; `recent_models_are_successful_mru_entries_with_stable_ids`; headless shutdown tests | Automated PASS; real tray NOT RUN |
 | Close destroys/recreates window, one-time continued-in-tray notice, snapshots hydrate fresh state | `crates/model-launcher-ui/src/lib.rs` | `close_notice_and_plaintext_token_are_each_consumed_once`; `close_notice_consumption_is_persisted`; Windows test `real_main_window_weak_reference_dies_for_fifty_recreate_cycles` compiled but did not run | Automated PASS for state logic; native lifecycle NOT RUN |
 | Versioned JSON config; atomic replace/backup; migrations; quarantine corrupt/unsupported; failures do not claim persistence | `crates/model-launcher-core/src/config.rs` | config tests `configuration_round_trips`, `save_atomically_replaces_the_main_file`, `replacement_retains_the_last_valid_backup`, `migrates_a_version_zero_fixture`, `corrupt_file_is_quarantined_without_being_overwritten`, `unsupported_version_is_quarantined`, `replacement_failure_preserves_main_and_cleans_temporary_file` | Automated PASS |
@@ -108,10 +111,10 @@ Host: macOS 26.5.2 (25F84), Apple Silicon; local time zone UTC+08. Toolchain: `r
 | Acceptance / delivery requirement | Evidence | Status |
 |---|---|---|
 | Automated unit: help/capabilities, paths, shards/identity, lifecycle/cancellation/backoff | Named tests above; fresh workspace suite | Automated PASS |
-| API contracts: list/load/unload, forwarding, errors, auth, raw SSE | `contracts.rs` 31/31 plus proxy unit 1/1 | Automated PASS |
-| Fake-engine/headless lifecycle integration including readiness/crash/timeout/replacement/shared JIT | lifecycle 30/30 and headless 17/17 | Automated PASS |
+| API contracts: list/load/unload, forwarding, errors, auth, raw SSE | `contracts.rs` 32/32 plus proxy unit 1/1 | Automated PASS |
+| Fake-engine/headless lifecycle integration including readiness/crash/timeout/replacement/shared JIT | lifecycle 30/30 and headless 34/34 | Automated PASS |
 | Persistence: atomic writes, migration, corruption, missing/moved | config 20/20 and catalog 37/37 | Automated PASS |
-| Slint view-model responsiveness and action availability | view-model 16/16 | Automated PASS |
+| Slint view-model responsiveness and action availability | view-model 17/17 | Automated PASS |
 | Windows package metadata and harness contract | release build, MSVC cross-check, Ruby validator; `apps/model-launcher/resources/*`, workflows, README | Compile PASS / Automated PASS |
 | Real Windows acceptance steps 1–10 (probe, discover/edit key, UI load + streamed chat, LM unload, JIT, busy, crash/backoff, eject-backoff, tray reopen, restart/no auto-load) | `tests/windows-wsl/smoke.ps1` and its README define executable evidence capture, but no Windows/WSL/model was available | NOT RUN |
 | Resource: destroyed window/component while tray/core remain | Windows weak-reference test and `-ManualResourceChecks` harness exist | NOT RUN |
@@ -139,4 +142,6 @@ On trusted user-supplied Windows hardware, from an interactive clean checkout, r
   -ManualResourceChecks
 ```
 
-Attach the generated ignored `artifacts/windows-wsl/evidence.json` and `evidence.md`, and check Task 9 Step 4 only if every automated and strict manual gate is `PASS`. Task 10 Step 3 also remains open for the independently assigned final code review.
+Attach the generated ignored `artifacts/windows-wsl/evidence.json` and `evidence.md`, and check Task 9 Step 4 only if every automated and strict manual gate is `PASS`.
+
+The independent blocker-only implementation review completed after the final fixes and reported no remaining Critical or Important findings. Its targeted checks covered handoff rollback authentication, shutdown during handoff, UI view-model behavior, formatting, Clippy, and diff cleanliness.
