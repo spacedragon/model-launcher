@@ -74,6 +74,9 @@ pub struct ManagementModel {
     pub capabilities: EngineCapabilities,
 }
 pub trait ManagementModelResolver: Send + Sync {
+    fn models(&self) -> Option<Vec<ApiModel>> {
+        None
+    }
     fn resolve(&self, key: &str) -> Option<ManagementModel>;
 }
 pub trait ProfileUpdater: Send + Sync {
@@ -205,9 +208,15 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    fn find_model(&self, key: &str) -> Result<&ApiModel, ApiError> {
-        self.models
-            .iter()
+    fn models(&self) -> Vec<ApiModel> {
+        self.management
+            .models()
+            .unwrap_or_else(|| self.models.to_vec())
+    }
+
+    fn find_model(&self, key: &str) -> Result<ApiModel, ApiError> {
+        self.models()
+            .into_iter()
             .find(|model| model.record.key.as_str() == key)
             .ok_or_else(|| ApiError::not_found("model_not_found", "model was not found"))
     }

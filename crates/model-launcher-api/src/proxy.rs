@@ -31,7 +31,7 @@ pub(crate) async fn proxy(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("model_required", "model is required"))?;
-    let model = state.find_model(model_key)?.record.clone();
+    let model = state.find_model(model_key)?.record;
     let lease = tokio::time::timeout(
         state.limits.startup_timeout,
         state.lifecycle.acquire(model.clone()),

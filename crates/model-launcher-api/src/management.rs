@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::{ApiError, AppState, LmModel, LoadConfig, LoadRequest, LoadResponse, UnloadRequest};
 
 pub(crate) async fn list(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({"models": state.models.iter().map(LmModel::from).collect::<Vec<_>>() }))
+    Json(json!({"models": state.models().iter().map(LmModel::from).collect::<Vec<_>>() }))
 }
 
 pub(crate) async fn load(
@@ -72,7 +72,8 @@ pub(crate) async fn unload(
 }
 
 pub(crate) async fn openai_models(State(state): State<AppState>) -> Json<Value> {
+    let models = state.models();
     Json(
-        json!({"object":"list","data":state.models.iter().map(|model| json!({"id":model.record.key,"object":"model","owned_by":model.publisher})).collect::<Vec<_>>() }),
+        json!({"object":"list","data":models.iter().map(|model| json!({"id":model.record.key,"object":"model","owned_by":model.publisher})).collect::<Vec<_>>() }),
     )
 }

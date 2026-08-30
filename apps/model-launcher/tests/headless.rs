@@ -9,12 +9,220 @@ use model_launcher_core::{
     LogStore, LogStoreLimits, ModelRecord,
 };
 use std::{
+    net::IpAddr,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+async fn models_status(address: std::net::SocketAddr, token: Option<&str>) -> reqwest::StatusCode {
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!("http://{address}/v1/models"));
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    request.send().await.unwrap().status()
+}
+
+#[tokio::test]
+async fn server_authentication_can_be_enabled_without_rebinding() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let address = handle.local_addr();
+    handle
+        .save_server_settings(address.ip(), address.port(), true)
+        .await
+        .unwrap();
+    let token = handle.generate_token().await.unwrap();
+    assert_eq!(handle.local_addr(), address);
+    assert_eq!(
+        models_status(address, None).await,
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        models_status(address, Some(&token.plaintext)).await,
+        reqwest::StatusCode::OK
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn server_rebind_moves_listener_and_persists_only_after_success() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    handle
+        .save_server_settings(IpAddr::from([127, 0, 0, 1]), new_port, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        models_status(handle.local_addr(), None).await,
+        reqwest::StatusCode::OK
+    );
+    assert!(
+        reqwest::Client::new()
+            .get(format!("http://{old}/v1/models"))
+            .send()
+            .await
+            .is_err()
+    );
+    let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    assert_eq!(saved.port, new_port);
+    handle.shutdown().await.unwrap();
+    assert!(
+        reqwest::get(format!("http://127.0.0.1:{new_port}/v1/models"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn occupied_server_rebind_keeps_old_listener_and_disk_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    assert!(
+        handle
+            .save_server_settings(old.ip(), occupied_port, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(handle.local_addr(), old);
+    assert_eq!(models_status(old, None).await, reqwest::StatusCode::OK);
+    let saved = ConfigStore::new(temp.path().join("config")).load().unwrap();
+    assert_ne!(saved.port, occupied_port);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rebound_server_model_lists_follow_later_catalog_rescans() {
+    let temp = tempfile::tempdir().unwrap();
+    let models = temp.path().join("models");
+    std::fs::create_dir(&models).unwrap();
+    std::fs::write(models.join("first.gguf"), b"GGUFfirst").unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    handle
+        .save_server_settings(handle.local_addr().ip(), new_port, false)
+        .await
+        .unwrap();
+
+    std::fs::write(models.join("second.gguf"), b"GGUFsecond").unwrap();
+    handle.rescan(models).await.unwrap();
+
+    let response: serde_json::Value =
+        reqwest::get(format!("http://{}/v1/models", handle.local_addr()))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(response["data"].as_array().unwrap().len(), 2);
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn server_rebind_rolls_back_replacement_when_persistence_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let service = Service::start(
+        options(temp.path(), "http://127.0.0.1:1".into()),
+        idle_engine(),
+    )
+    .await
+    .unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    std::fs::remove_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(temp.path().join("config"), b"not a directory").unwrap();
+
+    assert!(
+        handle
+            .save_server_settings(old.ip(), new_port, false)
+            .await
+            .is_err()
+    );
+    assert_eq!(handle.local_addr(), old);
+    assert_eq!(models_status(old, None).await, reqwest::StatusCode::OK);
+    assert!(
+        reqwest::get(format!("http://127.0.0.1:{new_port}/v1/models"))
+            .await
+            .is_err()
+    );
+    handle.shutdown().await.unwrap_err();
+}
+
+#[tokio::test]
+async fn old_listener_stop_failure_does_not_report_applied_rebind_as_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("models")).unwrap();
+    let mut opts = options(temp.path(), "http://127.0.0.1:1".into());
+    opts.gateway.limits.shutdown_grace = Duration::ZERO;
+    let service = Service::start(opts, idle_engine()).await.unwrap();
+    let handle = service.handle();
+    let old = handle.local_addr();
+    let mut idle = tokio::net::TcpStream::connect(old).await.unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    idle.write_all(
+        b"POST /v1/completions HTTP/1.1\r\nhost: localhost\r\ncontent-length: 10\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let reservation = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+
+    handle
+        .save_server_settings(old.ip(), new_port, false)
+        .await
+        .unwrap();
+    assert_eq!(handle.local_addr().port(), new_port);
+    assert_eq!(
+        models_status(handle.local_addr(), None).await,
+        reqwest::StatusCode::OK
+    );
+    let _ = handle.shutdown().await;
+}
 
 struct Engine {
     starts: Arc<AtomicUsize>,

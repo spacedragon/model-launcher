@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc, RwLock,
@@ -13,7 +13,7 @@ use futures_util::FutureExt as _;
 use model_launcher_api::{
     ApiModel, Authentication, CreatedToken, Gateway, GatewayConfig, GatewayConfigError,
     GatewayServer, LifecycleUpstreamResolver, ManagementModel, ManagementModelResolver,
-    ProfileUpdater,
+    ProfileUpdater, UpstreamResolver,
 };
 use model_launcher_core::{
     AppError, CatalogService, CatalogWatcher, ConfigDiagnostic, ConfigStore, EngineCapabilities,
@@ -271,9 +271,15 @@ impl Service {
                 tokens
                     .replace_phc_hashes(initial.config.auth_token_hashes.clone())
                     .map_err(|error| ServiceError::Authentication(error.to_string()))?;
-                Some(tokens.clone())
+                tokens.clone()
             }
-            Authentication::Disabled => None,
+            Authentication::Disabled => {
+                let tokens = Arc::new(model_launcher_api::TokenStore::default());
+                tokens
+                    .replace_phc_hashes(initial.config.auth_token_hashes.clone())
+                    .map_err(|error| ServiceError::Authentication(error.to_string()))?;
+                tokens
+            }
         };
         let (changes, _) = watch::channel(0_u64);
         let watcher = (catalog_root.is_dir() && options.watch_catalog)
@@ -311,17 +317,19 @@ impl Service {
                 .resolve(model)
                 .or_else(|| upstream_override.clone())
         });
+        let gateway_limits = options.gateway.limits;
+        let profiles: Arc<dyn ProfileUpdater> = Arc::new(PersistProfiles {
+            store: store.clone(),
+            models: models.clone(),
+            capabilities: capabilities.clone(),
+        });
         let gateway = match Gateway::new_with_management(
             options.gateway,
             api_models.into(),
             lifecycle_handle.clone(),
-            upstream,
+            upstream.clone(),
             resolver.clone(),
-            Arc::new(PersistProfiles {
-                store: store.clone(),
-                models: models.clone(),
-                capabilities: capabilities.clone(),
-            }),
+            profiles.clone(),
         ) {
             Ok(gateway) => gateway,
             Err(error) => {
@@ -330,6 +338,7 @@ impl Service {
                 return Err(error.into());
             }
         };
+        let authentication_policy = gateway.authentication_policy();
         let gateway = match gateway.start().await {
             Ok(server) => server,
             Err(error) => {
@@ -376,11 +385,16 @@ impl Service {
         let (events, _) = broadcast::channel(32);
         let (shutdown_result, _) = watch::channel(None);
         let inner = Arc::new(Inner {
-            address,
+            address: RwLock::new(address),
             lifecycle: lifecycle_handle,
             capabilities: resolver.capabilities.clone(),
             logs,
             tokens,
+            authentication_policy: RwLock::new(authentication_policy),
+            gateway_limits,
+            upstream,
+            resolver,
+            profiles,
             settings,
             engine,
             health,
@@ -436,7 +450,7 @@ pub struct ServiceHandle {
 
 impl ServiceHandle {
     pub fn local_addr(&self) -> SocketAddr {
-        self.inner.address
+        *self.inner.address.read().expect("address lock poisoned")
     }
     pub fn snapshot(&self) -> ServiceSnapshot {
         ServiceSnapshot {
@@ -528,11 +542,23 @@ impl ServiceHandle {
         if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
             return Err(ServiceError::ShuttingDown);
         }
-        let tokens = self
+        let authentication_policy = self
             .inner
-            .tokens
-            .as_ref()
-            .ok_or_else(|| ServiceError::Authentication("authentication is disabled".into()))?;
+            .authentication_policy
+            .read()
+            .expect("authentication policy lock poisoned")
+            .clone();
+        if matches!(
+            *authentication_policy
+                .read()
+                .expect("authentication lock poisoned"),
+            Authentication::Disabled
+        ) {
+            return Err(ServiceError::Authentication(
+                "authentication is disabled".into(),
+            ));
+        }
+        let tokens = &self.inner.tokens;
         let prior = tokens.phc_hashes();
         let created = tokens
             .create()
@@ -555,6 +581,94 @@ impl ServiceHandle {
             .auth_token_hashes = latest.auth_token_hashes;
         self.inner.changed();
         Ok(created)
+    }
+
+    pub async fn save_server_settings(
+        &self,
+        bind: IpAddr,
+        port: u16,
+        auth_enabled: bool,
+    ) -> Result<(), ServiceError> {
+        let _mutation = self.inner.mutation.lock().await;
+        if !matches!(*self.inner.shutdown.lock().await, ShutdownState::Running) {
+            return Err(ServiceError::ShuttingDown);
+        }
+        let requested = SocketAddr::new(bind, port);
+        let current = self.local_addr();
+        let authentication = if auth_enabled {
+            Authentication::Tokens(self.inner.tokens.clone())
+        } else {
+            Authentication::Disabled
+        };
+        if requested == current {
+            let latest = self.inner.store.update(|config| {
+                config.bind_address = bind.to_string();
+                config.port = port;
+                config.auth_enabled = auth_enabled;
+                Ok(())
+            })?;
+            *self.inner.models.write().expect("model lock poisoned") = latest;
+            *self
+                .inner
+                .authentication_policy
+                .read()
+                .expect("authentication policy lock poisoned")
+                .write()
+                .expect("authentication lock poisoned") = authentication;
+            self.inner.changed();
+            return Ok(());
+        }
+
+        let models = api_models(
+            &self.inner.models.read().expect("model lock poisoned"),
+            &self.inner.capabilities.read().expect("capabilities lock"),
+        );
+        let replacement = Gateway::new_with_management(
+            GatewayConfig {
+                bind: requested,
+                authentication,
+                limits: self.inner.gateway_limits,
+            },
+            models.into(),
+            self.inner.lifecycle.clone(),
+            self.inner.upstream.clone(),
+            self.inner.resolver.clone(),
+            self.inner.profiles.clone(),
+        )?;
+        let replacement_policy = replacement.authentication_policy();
+        let replacement = replacement.start().await?;
+        let latest = match self.inner.store.update(|config| {
+            config.bind_address = bind.to_string();
+            config.port = replacement.local_addr().port();
+            config.auth_enabled = auth_enabled;
+            Ok(())
+        }) {
+            Ok(latest) => latest,
+            Err(error) => {
+                let _ = replacement.stop().await;
+                return Err(error.into());
+            }
+        };
+        let old = {
+            let mut resources = self.inner.resources.lock().await;
+            resources.gateway.replace(replacement)
+        };
+        *self.inner.address.write().expect("address lock poisoned") =
+            SocketAddr::new(bind, latest.port);
+        *self
+            .inner
+            .authentication_policy
+            .write()
+            .expect("authentication policy lock poisoned") = replacement_policy;
+        *self.inner.models.write().expect("model lock poisoned") = latest;
+        self.inner.changed();
+        if let Some(old) = old {
+            // The replacement is already live and durably committed. `stop` aborts an old
+            // listener after its grace period, so a timeout must not make the applied save look
+            // rolled back to the caller.
+            let _ = old.stop().await;
+        }
+        Ok(())
     }
     pub async fn save_engine_settings(
         &self,
@@ -789,11 +903,16 @@ impl ServiceHandle {
 }
 
 struct Inner {
-    address: SocketAddr,
+    address: RwLock<SocketAddr>,
     lifecycle: LifecycleHandle,
     capabilities: Arc<RwLock<EngineCapabilities>>,
     logs: LogStore,
-    tokens: Option<Arc<model_launcher_api::TokenStore>>,
+    tokens: Arc<model_launcher_api::TokenStore>,
+    authentication_policy: RwLock<Arc<RwLock<Authentication>>>,
+    gateway_limits: model_launcher_api::GatewayLimits,
+    upstream: UpstreamResolver,
+    resolver: Arc<ServiceModels>,
+    profiles: Arc<dyn ProfileUpdater>,
     settings: Option<Arc<dyn EngineSettingsManager>>,
     engine: Arc<dyn InferenceEngine>,
     health: Arc<EngineHealth>,
@@ -960,6 +1079,13 @@ struct ServiceModels {
     capabilities: Arc<RwLock<EngineCapabilities>>,
 }
 impl ManagementModelResolver for ServiceModels {
+    fn models(&self) -> Option<Vec<ApiModel>> {
+        Some(api_models(
+            &self.models.read().expect("model lock poisoned"),
+            &self.capabilities.read().expect("capabilities lock"),
+        ))
+    }
+
     fn resolve(&self, key: &str) -> Option<ManagementModel> {
         let capabilities = self.capabilities.read().ok()?.clone();
         self.models
