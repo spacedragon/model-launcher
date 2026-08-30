@@ -12,6 +12,7 @@ export component MainWindow inherits Window {
     in-out property <string> search-query;
     in property <string> service-status: "Stopped";
     in property <string> operation-status;
+    in property <string> configuration-diagnostic;
     in property <string> base-url: "http://127.0.0.1:1234";
     in property <string> authentication-status;
     in property <string> server-warning;
@@ -68,6 +69,12 @@ export component MainWindow inherits Window {
             }
         }
         Rectangle { height: 2px; background: root.service-status == "Running" ? #2563EB : #E5E7EB; }
+        Rectangle {
+            visible: root.configuration-diagnostic != "";
+            height: 38px;
+            background: #FFFAEB;
+            Text { x: 14px; width: parent.width - 28px; text: root.configuration-diagnostic; color: #B54708; font-family: "Segoe UI"; font-size: 11px; vertical-alignment: center; wrap: word-wrap; }
+        }
         Rectangle {
             height: 48px; background: #FFFFFF;
             HorizontalLayout { padding-left: 12px; spacing: 4px;

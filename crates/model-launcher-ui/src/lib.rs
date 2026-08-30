@@ -6,14 +6,26 @@ use std::{
 };
 
 use model_launcher_core::{
-    EngineCapabilities, LaunchSettings, LifecycleSnapshot, LogFilter, LogRecord, LogStore, ModelId,
-    ModelRecord, SettingId,
+    ConfigDiagnostic, ConfigDiagnosticKind, EngineCapabilities, LaunchSettings, LifecycleSnapshot,
+    LogFilter, LogRecord, LogStore, ModelId, ModelRecord, SettingId,
 };
 use sha2::{Digest as _, Sha256};
 
 pub trait Clipboard {
     fn get(&mut self) -> Result<String, String>;
     fn set(&mut self, value: String) -> Result<(), String>;
+}
+
+#[must_use]
+pub fn configuration_diagnostic_status(diagnostic: Option<&ConfigDiagnostic>) -> Option<String> {
+    diagnostic.map(|diagnostic| match diagnostic.kind {
+        ConfigDiagnosticKind::Corrupt => {
+            "Configuration was corrupt and has been quarantined.".to_owned()
+        }
+        ConfigDiagnosticKind::UnsupportedVersion { version } => {
+            format!("Configuration version {version} is unsupported and has been quarantined.")
+        }
+    })
 }
 
 pub struct ClipboardExpiry([u8; 32]);
@@ -783,6 +795,13 @@ fn hydrate_server(window: &MainWindow, snapshot: &AppSnapshot) {
             .unwrap_or_default()
             .into(),
     );
+    window.set_configuration_diagnostic(
+        snapshot
+            .configuration_diagnostic
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
 }
 
 fn hydrate_server_settings(window: &MainWindow, settings: UiServerSettings) {
@@ -1064,6 +1083,7 @@ pub struct AppSnapshot {
     pub server_warning: String,
     pub engine_valid: bool,
     pub engine_diagnostic: Option<String>,
+    pub configuration_diagnostic: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1126,6 +1146,11 @@ impl ViewModel {
     #[must_use]
     pub fn rows(&self) -> &[ModelRow] {
         &self.rows
+    }
+
+    #[must_use]
+    pub fn configuration_diagnostic_status(&self) -> Option<&str> {
+        self.snapshot.configuration_diagnostic.as_deref()
     }
 
     #[must_use]

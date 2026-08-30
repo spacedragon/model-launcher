@@ -1199,6 +1199,78 @@ async fn corrupt_config_starts_with_typed_visible_diagnostic() {
 }
 
 #[tokio::test]
+async fn preloaded_invalid_config_keeps_original_diagnostic_visible_to_service_and_ui() {
+    for (contents, expected_kind, expected_status) in [
+        (
+            b"private corrupt bytes".as_slice(),
+            ConfigDiagnosticKind::Corrupt,
+            "Configuration was corrupt and has been quarantined.",
+        ),
+        (
+            br#"{"version":99,"config":{}}"#.as_slice(),
+            ConfigDiagnosticKind::UnsupportedVersion { version: 99 },
+            "Configuration version 99 is unsupported and has been quarantined.",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.json"), contents).unwrap();
+
+        // Mirror production startup: the executable needs persisted server settings before
+        // constructing ServiceOptions, then hands that exact load to the service.
+        let loaded = Service::load_configuration(&config_dir).expect("preload configuration");
+        let persisted = loaded.config().clone();
+        let mut service_options = options(temp.path(), String::new());
+        service_options.gateway.bind =
+            std::net::SocketAddr::new(persisted.bind_address.parse().unwrap(), 0);
+        let service = Service::start_with_configuration(service_options, idle_engine(), loaded)
+            .await
+            .expect("quarantined config must not prevent startup");
+
+        let diagnostic = service
+            .handle()
+            .snapshot()
+            .config_diagnostic
+            .expect("original diagnostic must survive startup");
+        assert_eq!(diagnostic.kind, expected_kind);
+        assert_eq!(
+            model_launcher_ui::configuration_diagnostic_status(Some(&diagnostic)).as_deref(),
+            Some(expected_status)
+        );
+        assert_eq!(
+            std::fs::read_dir(&config_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("quarantine"))
+                .count(),
+            1,
+            "the service must not quarantine the same configuration a second time"
+        );
+        service.handle().shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn preloaded_configuration_cannot_be_started_with_an_unrelated_store() {
+    let loaded_root = tempfile::tempdir().unwrap();
+    let service_root = tempfile::tempdir().unwrap();
+    let loaded = Service::load_configuration(loaded_root.path().join("config")).unwrap();
+
+    let result = Service::start_with_configuration(
+        options(service_root.path(), String::new()),
+        idle_engine(),
+        loaded,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        Err(ServiceError::ConfigurationSourceMismatch)
+    ));
+}
+
+#[tokio::test]
 async fn scan_http_stream_eject_restart_and_idempotent_shutdown() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir(temp.path().join("models")).unwrap();

@@ -18,6 +18,7 @@ fn real_main_window_weak_reference_dies_for_fifty_recreate_cycles() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
     let actions = UiActions {
         load: Arc::new(|_| {}),
@@ -60,6 +61,7 @@ fn dynamic_refresh_preserves_unsaved_settings_and_current_log_filter() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
     let observed_filter = Arc::new(std::sync::Mutex::new(LogFilter::default()));
     let actions = UiActions {

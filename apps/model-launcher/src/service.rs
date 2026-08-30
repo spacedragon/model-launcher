@@ -16,10 +16,10 @@ use model_launcher_api::{
     ProfileUpdater, UpstreamResolver,
 };
 use model_launcher_core::{
-    AppError, CatalogService, CatalogWatcher, ConfigDiagnostic, ConfigStore, EngineCapabilities,
-    InferenceEngine, LauncherConfig, Lifecycle, LifecycleHandle, LifecycleSnapshot, LogFilter,
-    LogRecord, LogStore, LogStoreLimits, ModelRecord, ReconcileOptions, ReconcileResult,
-    reconcile_catalog, scan,
+    AppError, CatalogService, CatalogWatcher, ConfigDiagnostic, ConfigLoadOutcome, ConfigStore,
+    EngineCapabilities, InferenceEngine, LauncherConfig, Lifecycle, LifecycleHandle,
+    LifecycleSnapshot, LogFilter, LogRecord, LogStore, LogStoreLimits, ModelRecord,
+    ReconcileOptions, ReconcileResult, reconcile_catalog, scan,
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -32,6 +32,21 @@ pub struct ServiceOptions {
     pub shutdown_timeout: Duration,
     #[doc(hidden)]
     pub upstream_override: Option<String>,
+}
+
+/// A configuration loaded once for use both while constructing service options and starting the
+/// service. Its private source store prevents pairing an outcome with an unrelated config path.
+pub struct LoadedConfiguration {
+    config_dir: PathBuf,
+    store: ConfigStore,
+    outcome: ConfigLoadOutcome,
+}
+
+impl LoadedConfiguration {
+    #[must_use]
+    pub const fn config(&self) -> &LauncherConfig {
+        &self.outcome.config
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +67,8 @@ pub enum ServiceError {
     Authentication(String),
     #[error("invalid server settings: {0}")]
     InvalidServerSettings(String),
+    #[error("loaded configuration source does not match service config directory")]
+    ConfigurationSourceMismatch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,12 +195,34 @@ impl WatcherBarrier {
     }
 }
 impl Service {
+    pub fn load_configuration(
+        config_dir: impl Into<PathBuf>,
+    ) -> Result<LoadedConfiguration, ServiceError> {
+        let config_dir = config_dir.into();
+        let store = ConfigStore::new(&config_dir);
+        let outcome = store.load_with_diagnostic()?;
+        Ok(LoadedConfiguration {
+            config_dir,
+            store,
+            outcome,
+        })
+    }
+
     pub async fn start(
         options: ServiceOptions,
         engine: Arc<dyn InferenceEngine>,
     ) -> Result<Self, ServiceError> {
         let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
-        Self::start_inner(options, engine, logs, None, None, None).await
+        Self::start_inner(options, engine, logs, None, None, None, None).await
+    }
+
+    pub async fn start_with_configuration(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        loaded: LoadedConfiguration,
+    ) -> Result<Self, ServiceError> {
+        let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
+        Self::start_inner(options, engine, logs, None, None, None, Some(loaded)).await
     }
 
     pub async fn start_with_log_store(
@@ -191,7 +230,7 @@ impl Service {
         engine: Arc<dyn InferenceEngine>,
         logs: LogStore,
     ) -> Result<Self, ServiceError> {
-        Self::start_inner(options, engine, logs, None, None, None).await
+        Self::start_inner(options, engine, logs, None, None, None, None).await
     }
 
     pub async fn start_with_desktop_dependencies(
@@ -200,7 +239,26 @@ impl Service {
         logs: LogStore,
         settings: Arc<dyn EngineSettingsManager>,
     ) -> Result<Self, ServiceError> {
-        Self::start_inner(options, engine, logs, Some(settings), None, None).await
+        Self::start_inner(options, engine, logs, Some(settings), None, None, None).await
+    }
+
+    pub async fn start_with_desktop_dependencies_and_configuration(
+        options: ServiceOptions,
+        engine: Arc<dyn InferenceEngine>,
+        logs: LogStore,
+        settings: Arc<dyn EngineSettingsManager>,
+        loaded: LoadedConfiguration,
+    ) -> Result<Self, ServiceError> {
+        Self::start_inner(
+            options,
+            engine,
+            logs,
+            Some(settings),
+            None,
+            None,
+            Some(loaded),
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -210,7 +268,7 @@ impl Service {
         injected_background: Option<tokio::task::JoinHandle<()>>,
     ) -> Result<Self, ServiceError> {
         let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
-        Self::start_inner(options, engine, logs, None, injected_background, None).await
+        Self::start_inner(options, engine, logs, None, injected_background, None, None).await
     }
 
     #[doc(hidden)]
@@ -220,7 +278,7 @@ impl Service {
         barrier: Arc<WatcherBarrier>,
     ) -> Result<Self, ServiceError> {
         let logs = LogStore::new(LogStoreLimits::new(2_000, 2 * 1024 * 1024, 256))?;
-        Self::start_inner(options, engine, logs, None, None, Some(barrier)).await
+        Self::start_inner(options, engine, logs, None, None, Some(barrier), None).await
     }
 
     async fn start_inner(
@@ -230,9 +288,18 @@ impl Service {
         settings: Option<Arc<dyn EngineSettingsManager>>,
         injected_background: Option<tokio::task::JoinHandle<()>>,
         watcher_barrier: Option<Arc<WatcherBarrier>>,
+        loaded: Option<LoadedConfiguration>,
     ) -> Result<Self, ServiceError> {
-        let store = ConfigStore::new(&options.config_dir);
-        let loaded = store.load_with_diagnostic()?;
+        let (store, loaded) = if let Some(loaded) = loaded {
+            if loaded.config_dir != options.config_dir {
+                return Err(ServiceError::ConfigurationSourceMismatch);
+            }
+            (loaded.store, loaded.outcome)
+        } else {
+            let store = ConfigStore::new(&options.config_dir);
+            let outcome = store.load_with_diagnostic()?;
+            (store, outcome)
+        };
         let config_diagnostic = loaded.diagnostic.clone();
         let persisted = loaded.config;
         let configured_catalog = persisted.catalog_directory.is_some();

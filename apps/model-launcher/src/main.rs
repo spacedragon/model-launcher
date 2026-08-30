@@ -1,9 +1,9 @@
 use model_launcher::{EngineSettingsManager, LauncherSettings, Service, ServiceOptions};
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
-use model_launcher_core::{ConfigStore, LogFilter, LogStore, LogStoreLimits};
+use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{
-    AppSnapshot, CloseNoticeStore, UiActions, UiServerSettings, run_desktop,
-    server_authentication_status, server_lan_warning,
+    AppSnapshot, CloseNoticeStore, UiActions, UiServerSettings, configuration_diagnostic_status,
+    run_desktop, server_authentication_status, server_lan_warning,
 };
 use model_launcher_wsl::{LlamaCppWslEngine, ProbeCache, TokioCommandRunner, WslProber};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -13,9 +13,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let base = platform_data_dir();
-    let persisted = ConfigStore::new(base.join("config"))
-        .load_with_diagnostic()?
-        .config;
+    let loaded = Service::load_configuration(base.join("config"))?;
+    let persisted = loaded.config().clone();
     let token_store = Arc::new(TokenStore::default());
     let authentication = if persisted.auth_enabled {
         Authentication::Tokens(token_store)
@@ -57,11 +56,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             WslProber::new(runner),
         ),
     });
-    let service = runtime.block_on(Service::start_with_desktop_dependencies(
+    let service = runtime.block_on(Service::start_with_desktop_dependencies_and_configuration(
         options.clone(),
         engine,
         logs,
         settings_manager,
+        loaded,
     ))?;
     let handle = service.handle();
     let snapshot = handle.snapshot();
@@ -131,6 +131,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     server_warning: server_lan_warning(&server).into(),
                     engine_valid: snapshot.engine_valid,
                     engine_diagnostic: snapshot.engine_diagnostic,
+                    configuration_diagnostic: configuration_diagnostic_status(
+                        snapshot.config_diagnostic.as_ref(),
+                    ),
                 }
             }
         }),
@@ -320,6 +323,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             server_warning: server_lan_warning(&server).into(),
             engine_valid: snapshot.engine_valid,
             engine_diagnostic: snapshot.engine_diagnostic,
+            configuration_diagnostic: configuration_diagnostic_status(
+                snapshot.config_diagnostic.as_ref(),
+            ),
         },
         handle.local_addr().to_string(),
         actions,

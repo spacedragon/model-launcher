@@ -107,6 +107,7 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
     let vm = ViewModel::from_snapshot(snapshot);
     assert_eq!(vm.rows()[0].name, "Alpha");
@@ -135,6 +136,28 @@ fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
 }
 
 #[test]
+fn configuration_recovery_diagnostic_is_available_as_ui_operation_status() {
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: Some(
+            "Configuration was corrupt and has been quarantined.".into(),
+        ),
+    });
+
+    assert_eq!(
+        vm.configuration_diagnostic_status(),
+        Some("Configuration was corrupt and has been quarantined.")
+    );
+}
+
+#[test]
 fn model_search_matches_name_key_and_path_case_insensitively() {
     let mut alpha = model("Alpha Chat", 1);
     alpha.key = ModelKey::parse("team/assistant").unwrap();
@@ -149,6 +172,7 @@ fn model_search_matches_name_key_and_path_case_insensitively() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     });
 
     assert_eq!(vm.filtered_rows("CHAT")[0].id, alpha.id);
@@ -176,6 +200,7 @@ fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     });
     assert_eq!(
         vm.action(other.id),
@@ -196,6 +221,7 @@ fn invalid_engine_disables_load_with_probe_diagnostic() {
         server_warning: String::new(),
         engine_valid: false,
         engine_diagnostic: Some("safe probe diagnostic".into()),
+        configuration_diagnostic: None,
     });
     assert_eq!(
         vm.action(alpha.id),
@@ -367,6 +393,7 @@ fn tray_recent_request_resolves_stable_id_after_catalog_reordering() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
 
     let request = load_request_for(&snapshot, alpha.id).unwrap();
@@ -395,6 +422,7 @@ fn load_dialog_adapter_hydrates_every_saved_profile_value() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
 
     let values = load_dialog_values_for(&snapshot, alpha.id).unwrap();
@@ -418,6 +446,7 @@ fn load_dialog_adapter_keeps_unsupported_saved_fields_visible_and_read_only() {
         server_warning: String::new(),
         engine_valid: true,
         engine_diagnostic: None,
+        configuration_diagnostic: None,
     };
 
     let gpu = load_dialog_fields_for(&snapshot, alpha.id)
