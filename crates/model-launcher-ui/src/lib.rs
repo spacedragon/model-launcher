@@ -75,6 +75,27 @@ pub use tray::{TrayCommand, TrayController};
 
 slint::include_modules!();
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModalLayout {
+    pub width: u32,
+    pub height: u32,
+    pub actions_reachable: bool,
+}
+
+#[must_use]
+pub fn modal_layout(
+    parent_width: u32,
+    parent_height: u32,
+    preferred_width: u32,
+    preferred_height: u32,
+) -> ModalLayout {
+    ModalLayout {
+        width: preferred_width.min(parent_width.saturating_sub(32)),
+        height: preferred_height.min(parent_height.saturating_sub(32)),
+        actions_reachable: parent_width >= 96 && parent_height >= 96,
+    }
+}
+
 #[derive(Clone)]
 pub struct UiActions {
     pub load: Arc<dyn Fn(UiLoadRequest) + Send + Sync>,

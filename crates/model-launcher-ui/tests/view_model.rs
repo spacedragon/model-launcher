@@ -15,8 +15,19 @@ use model_launcher_ui::{
     AppSnapshot, Clipboard, ClipboardExpiry, CloseNotice, CloseNoticeStore, EngineSettings,
     LogCommands, MetadataVisibility, ModelAction, RecentModels, SaveSettings, TokenReveal,
     TrayCommand, TrayController, ViewModel, load_dialog_fields_for, load_dialog_values_for,
-    load_request_for,
+    load_request_for, modal_layout,
 };
+
+#[test]
+fn modal_layout_stays_inside_compact_and_narrow_viewports() {
+    let compact = modal_layout(400, 420, 440, 500);
+    assert_eq!((compact.width, compact.height), (368, 388));
+    assert!(compact.actions_reachable);
+
+    let narrow = modal_layout(240, 260, 420, 170);
+    assert_eq!((narrow.width, narrow.height), (208, 170));
+    assert!(narrow.actions_reachable);
+}
 
 #[derive(Default)]
 struct FakeClipboard(String);
