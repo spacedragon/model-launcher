@@ -369,7 +369,14 @@ fn setup_tray(app: &mut tauri::App, actions: UiActions) -> tauri::Result<()> {
 pub fn configuration_diagnostic_status(
     diagnostic: Option<&model_launcher_core::ConfigDiagnostic>,
 ) -> Option<String> {
-    diagnostic.map(ToString::to_string)
+    diagnostic.map(|diagnostic| match diagnostic.kind {
+        model_launcher_core::ConfigDiagnosticKind::Corrupt => {
+            "Configuration was corrupt and has been quarantined.".to_owned()
+        }
+        model_launcher_core::ConfigDiagnosticKind::UnsupportedVersion { version } => {
+            format!("Configuration version {version} is unsupported and has been quarantined.")
+        }
+    })
 }
 
 pub fn parse_server_settings(

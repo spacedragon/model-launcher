@@ -2060,7 +2060,6 @@ name = "model-launcher"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "embed-resource",
  "fake-llama-server",
  "futures-util",
  "model-launcher-api",

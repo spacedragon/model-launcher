@@ -20,6 +20,3 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde_json.workspace = true
 tempfile = "3"
 fake-llama-server = { path = "../../tests/fake-llama-server" }
-
-[target.'cfg(windows)'.build-dependencies]
-embed-resource = "3"
