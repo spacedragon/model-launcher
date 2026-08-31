@@ -1,0 +1,71 @@
+name: Real Windows WSL acceptance
+
+"on":
+  workflow_dispatch:
+    inputs:
+      distro: {description: Installed WSL distribution, required: true, default: Ubuntu}
+      llama_server: {description: Absolute llama-server path inside WSL, required: true}
+      llama_commit: {description: llama.cpp commit/build identifier, required: true}
+      model_root: {description: Windows directory containing the test GGUF, required: true}
+      model_key: {description: Catalog key for the primary GGUF, required: true}
+      model_provenance: {description: Model source/revision/license, required: true}
+      model_sha256: {description: Optional precomputed first-shard SHA256, required: false}
+      second_model_key: {description: Optional second model key, required: false}
+
+permissions:
+  contents: read
+
+jobs:
+  real-wsl:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, WSL]
+    environment: windows-wsl-acceptance
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Validate protected ref
+        shell: pwsh
+        run: if ($env:GITHUB_REF -ne 'refs/heads/main') { throw 'Acceptance runs only from main' }
+      - name: Install Rust 1.89
+        shell: pwsh
+        run: rustup toolchain install 1.89 --profile minimal
+      - name: Select Rust 1.89
+        shell: pwsh
+        run: rustup default 1.89
+      - name: Run noninteractive real-WSL smoke
+        shell: pwsh
+        env:
+          MODEL_LAUNCHER_SMOKE_TOKEN: ${{ secrets.MODEL_LAUNCHER_SMOKE_TOKEN }}
+          SMOKE_DISTRO: ${{ inputs.distro }}
+          SMOKE_LLAMA_SERVER: ${{ inputs.llama_server }}
+          SMOKE_LLAMA_COMMIT: ${{ inputs.llama_commit }}
+          SMOKE_MODEL_ROOT: ${{ inputs.model_root }}
+          SMOKE_MODEL_KEY: ${{ inputs.model_key }}
+          SMOKE_MODEL_PROVENANCE: ${{ inputs.model_provenance }}
+          SMOKE_MODEL_SHA256: ${{ inputs.model_sha256 }}
+          SMOKE_SECOND_MODEL_KEY: ${{ inputs.second_model_key }}
+        run: |
+          if ($env:MODEL_LAUNCHER_SMOKE_TOKEN) {
+            Write-Output "::add-mask::$env:MODEL_LAUNCHER_SMOKE_TOKEN"
+          }
+          ./tests/windows-wsl/smoke.ps1 `
+            -Distro $env:SMOKE_DISTRO `
+            -LlamaServer $env:SMOKE_LLAMA_SERVER `
+            -LlamaCommit $env:SMOKE_LLAMA_COMMIT `
+            -ModelRoot $env:SMOKE_MODEL_ROOT `
+            -ModelKey $env:SMOKE_MODEL_KEY `
+            -ModelProvenance $env:SMOKE_MODEL_PROVENANCE `
+            -ModelSha256 $env:SMOKE_MODEL_SHA256 `
+            -SecondModelKey $env:SMOKE_SECOND_MODEL_KEY `
+            -Token $env:MODEL_LAUNCHER_SMOKE_TOKEN `
+            -NonInteractive
+      - name: Upload automated evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-wsl-evidence
+          path: |
+            artifacts/windows-wsl/evidence.json
+            artifacts/windows-wsl/evidence.md
+          if-no-files-found: warn
+          retention-days: 14

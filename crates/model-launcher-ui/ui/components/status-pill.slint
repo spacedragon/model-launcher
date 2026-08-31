@@ -1,0 +1,8 @@
+export component StatusPill inherits Rectangle {
+    in property <string> label: "Stopped";
+    in property <bool> active: false;
+    height: 24px;
+    border-radius: 4px;
+    background: active ? #E8F0FE : #F2F4F7;
+    Text { text: root.label; color: active ? #2563EB : #667085; font-family: "Segoe UI"; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+}

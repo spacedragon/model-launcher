@@ -1,0 +1,30 @@
+[package]
+name = "model-launcher-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+model-launcher-core = { path = "../model-launcher-core" }
+axum = "0.8"
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "http2"] }
+argon2 = "0.5"
+subtle = "2"
+rand = "0.8"
+bytes = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+thiserror.workspace = true
+async-trait.workspace = true
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto", "http1", "http2"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+fake-llama-server = { path = "../../tests/fake-llama-server" }

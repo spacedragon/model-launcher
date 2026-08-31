@@ -1,0 +1,467 @@
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+use model_launcher_core::{
+    CatalogIdentity, EngineCapabilities, LaunchProfile, LaunchSettings, LifecycleSnapshot,
+    LifecycleState, LogFilter, LogLevel, LogRecord, LogSource, LogStore, LogStoreLimits, ModelId,
+    ModelKey, ModelRecord, ModelState,
+};
+use model_launcher_ui::{
+    AppSnapshot, Clipboard, ClipboardExpiry, CloseNotice, CloseNoticeStore, EngineSettings,
+    LogCommands, MetadataVisibility, ModelAction, RecentModels, SaveSettings, TokenReveal,
+    TrayCommand, TrayController, ViewModel, load_dialog_fields_for, load_dialog_values_for,
+    load_request_for, modal_layout, parse_server_settings, server_authentication_status,
+    server_base_url, server_lan_warning,
+};
+
+#[test]
+fn server_settings_validate_inputs_and_derive_live_security_copy() {
+    let loopback = parse_server_settings("127.0.0.1", 1234, false).unwrap();
+    assert_eq!(loopback.bind_address, "127.0.0.1");
+    assert_eq!(loopback.port, 1234);
+    assert_eq!(
+        server_authentication_status(&loopback),
+        "Authentication disabled"
+    );
+    assert_eq!(server_lan_warning(&loopback), "");
+
+    let lan = parse_server_settings("0.0.0.0", 8080, false).unwrap();
+    assert_eq!(
+        server_lan_warning(&lan),
+        "Warning: the server is exposed to the local network without authentication."
+    );
+    assert_eq!(server_base_url(&lan), "http://<LAN-address>:8080");
+    assert!(parse_server_settings("localhost", 1234, true).is_err());
+    assert!(parse_server_settings("127.0.0.1", 0, true).is_err());
+    let ipv6 = parse_server_settings("::1", 1234, true).unwrap();
+    assert_eq!(server_base_url(&ipv6), "http://[::1]:1234");
+}
+
+#[test]
+fn modal_layout_stays_inside_compact_and_narrow_viewports() {
+    let compact = modal_layout(400, 420, 440, 500);
+    assert_eq!((compact.width, compact.height), (368, 388));
+    assert!(compact.actions_reachable);
+
+    let narrow = modal_layout(240, 260, 420, 170);
+    assert_eq!((narrow.width, narrow.height), (208, 170));
+    assert!(narrow.actions_reachable);
+}
+
+#[derive(Default)]
+struct FakeClipboard(String);
+
+impl Clipboard for FakeClipboard {
+    fn get(&mut self) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+
+    fn set(&mut self, value: String) -> Result<(), String> {
+        self.0 = value;
+        Ok(())
+    }
+}
+
+#[test]
+fn token_clipboard_expiry_clears_only_the_unchanged_token() {
+    let mut clipboard = FakeClipboard::default();
+    clipboard.set("secret-token".into()).unwrap();
+    let expiry = ClipboardExpiry::new("secret-token");
+    assert!(expiry.clear_if_unchanged(&mut clipboard));
+    assert_eq!(clipboard.0, "");
+
+    clipboard.set("secret-token".into()).unwrap();
+    let expiry = ClipboardExpiry::new("secret-token");
+    clipboard.set("later user copy".into()).unwrap();
+    assert!(!expiry.clear_if_unchanged(&mut clipboard));
+    assert_eq!(clipboard.0, "later user copy");
+}
+
+fn model(name: &str, size: u64) -> ModelRecord {
+    ModelRecord {
+        id: ModelId::new(),
+        key: ModelKey::parse(name.to_ascii_lowercase().replace(' ', "-")).unwrap(),
+        display_name: name.into(),
+        path: PathBuf::from(format!("/models/{name}.gguf")),
+        file_identity: CatalogIdentity::default(),
+        size_bytes: size,
+        state: ModelState::Available,
+        launch_profile: LaunchProfile::default(),
+    }
+}
+
+#[test]
+fn snapshot_maps_to_compact_rows_and_prioritizes_narrow_metadata() {
+    let alpha = model("Alpha", 2_147_483_648);
+    let snapshot = AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    };
+    let vm = ViewModel::from_snapshot(snapshot);
+    assert_eq!(vm.rows()[0].name, "Alpha");
+    assert_eq!(vm.rows()[0].size, "2.0 GB");
+    assert_eq!(
+        vm.metadata_visibility(900),
+        MetadataVisibility {
+            size: true,
+            path: true
+        }
+    );
+    assert_eq!(
+        vm.metadata_visibility(560),
+        MetadataVisibility {
+            size: true,
+            path: false
+        }
+    );
+    assert_eq!(
+        vm.metadata_visibility(420),
+        MetadataVisibility {
+            size: false,
+            path: false
+        }
+    );
+}
+
+#[test]
+fn configuration_recovery_diagnostic_is_available_as_ui_operation_status() {
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: Some(
+            "Configuration was corrupt and has been quarantined.".into(),
+        ),
+    });
+
+    assert_eq!(
+        vm.configuration_diagnostic_status(),
+        Some("Configuration was corrupt and has been quarantined.")
+    );
+}
+
+#[test]
+fn model_search_matches_name_key_and_path_case_insensitively() {
+    let mut alpha = model("Alpha Chat", 1);
+    alpha.key = ModelKey::parse("team/assistant").unwrap();
+    alpha.path = PathBuf::from("/models/Research/alpha.gguf");
+    let beta = model("Beta", 1);
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![alpha.clone(), beta],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    });
+
+    assert_eq!(vm.filtered_rows("CHAT")[0].id, alpha.id);
+    assert_eq!(vm.filtered_rows("assistant")[0].id, alpha.id);
+    assert_eq!(vm.filtered_rows("research")[0].id, alpha.id);
+    assert!(vm.filtered_rows("missing").is_empty());
+}
+
+#[test]
+fn busy_disables_other_load_with_explanation_but_keeps_eject_enabled() {
+    let active = model("Active", 1);
+    let other = model("Other", 1);
+    let lifecycle = LifecycleSnapshot {
+        state: LifecycleState::Running,
+        desired_model: Some(active.id),
+        in_flight: 2,
+        ..LifecycleSnapshot::default()
+    };
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![active.clone(), other.clone()],
+        recent_models: vec![],
+        lifecycle,
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    });
+    assert_eq!(
+        vm.action(other.id),
+        ModelAction::Disabled("Finish active requests or eject the current model first.".into())
+    );
+    assert_eq!(vm.action(active.id), ModelAction::Eject);
+}
+
+#[test]
+fn invalid_engine_disables_load_with_probe_diagnostic() {
+    let alpha = model("Alpha", 1);
+    let vm = ViewModel::from_snapshot(AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: false,
+        engine_diagnostic: Some("safe probe diagnostic".into()),
+        configuration_diagnostic: None,
+    });
+    assert_eq!(
+        vm.action(alpha.id),
+        ModelAction::Disabled("safe probe diagnostic".into())
+    );
+}
+
+#[test]
+fn capability_visibility_retains_and_reports_unsupported_values() {
+    let settings = LaunchSettings {
+        gpu_layers: Some(model_launcher_core::GpuLayers::new(20)),
+        ..Default::default()
+    };
+    let caps = EngineCapabilities {
+        context_length: true,
+        ..Default::default()
+    };
+    let fields = ViewModel::setting_fields(&settings, &caps);
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.id == "context_length" && field.visible)
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.id == "gpu_layers" && field.visible && field.retained_unsupported)
+    );
+    assert_eq!(settings.gpu_layers.unwrap().get(), 20);
+}
+
+#[test]
+fn close_notice_and_plaintext_token_are_each_consumed_once() {
+    let mut notice = CloseNotice::default();
+    assert!(notice.take().is_some());
+    assert!(notice.take().is_none());
+    let mut token = TokenReveal::new("secret-token");
+    assert_eq!(token.expose(), Some("secret-token"));
+    token.clear();
+    assert_eq!(token.expose(), None);
+    let mut token = TokenReveal::new("secret-token");
+    assert_eq!(token.take().as_deref(), Some("secret-token"));
+    assert!(token.take().is_none());
+    assert!(!format!("{token:?}").contains("secret-token"));
+}
+
+#[test]
+fn close_notice_consumption_is_persisted() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = CloseNoticeStore::new(directory.path().join("notice"));
+    let mut notice = store.load();
+    assert!(notice.take().is_some());
+    store.save(&notice).unwrap();
+    assert!(store.load().take().is_none());
+}
+
+#[test]
+fn save_engine_settings_validates_identity_then_reprobes() {
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let save = SaveSettings::new(
+        {
+            let order = order.clone();
+            move |_| {
+                order.lock().unwrap().push("validate");
+                Ok(())
+            }
+        },
+        {
+            let order = order.clone();
+            move || {
+                order.lock().unwrap().push("probe");
+                Ok(EngineCapabilities::default())
+            }
+        },
+    );
+    save.run(&EngineSettings::default()).unwrap();
+    assert_eq!(*order.lock().unwrap(), ["validate", "probe"]);
+}
+
+#[test]
+fn recent_models_are_most_recent_first_and_bounded() {
+    let mut recent = RecentModels::new(2);
+    let a = model("A", 1);
+    let b = model("B", 1);
+    let c = model("C", 1);
+    recent.record(a.id);
+    recent.record(b.id);
+    recent.record(a.id);
+    recent.record(c.id);
+    assert_eq!(recent.ids(), &[c.id, a.id]);
+}
+
+#[test]
+fn log_commands_use_bounded_filtered_redacted_snapshots() {
+    let store = LogStore::new(LogStoreLimits::new(2, 4096, 4)).unwrap();
+    for (level, message) in [
+        (LogLevel::Info, "old"),
+        (LogLevel::Warn, "Authorization: Bearer secret"),
+        (LogLevel::Error, "boom"),
+    ] {
+        store.append(LogRecord {
+            timestamp_ms: 1,
+            source: LogSource::Application,
+            level,
+            generation: None,
+            model_id: None,
+            message: message.into(),
+            truncated: false,
+        });
+    }
+    let logs = LogCommands::new(store);
+    assert_eq!(
+        logs.snapshot(LogFilter {
+            source: None,
+            minimum_level: Some(LogLevel::Warn)
+        })
+        .len(),
+        2
+    );
+    let copied = logs.copy_text(LogFilter {
+        source: None,
+        minimum_level: Some(LogLevel::Warn),
+    });
+    assert!(copied.contains("boom"));
+    assert!(!copied.contains("old"));
+    assert!(!copied.contains("secret"));
+    let mut bytes = Vec::new();
+    logs.export(&mut bytes).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(!text.contains("secret"));
+    assert!(!text.contains("old"));
+}
+
+#[test]
+fn tray_maps_commands_without_opening_a_real_window_and_drops_windows() {
+    let opened = Arc::new(AtomicUsize::new(0));
+    let mut tray = TrayController::new({
+        let opened = opened.clone();
+        move || {
+            opened.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    assert_eq!(tray.map_command("open"), Some(TrayCommand::Open));
+    let recent_id = ModelId::new();
+    assert_eq!(
+        tray.map_command(&format!("recent:{}", recent_id.as_uuid())),
+        Some(TrayCommand::LoadRecent(recent_id))
+    );
+    assert_eq!(opened.load(Ordering::SeqCst), 0);
+    for _ in 0..50 {
+        tray.open_for_test();
+        assert!(tray.has_window());
+        tray.close_for_test();
+        assert!(!tray.has_window());
+    }
+    assert_eq!(tray.live_window_count(), 0);
+}
+
+#[test]
+fn tray_recent_request_resolves_stable_id_after_catalog_reordering() {
+    let alpha = model("Alpha", 1);
+    let beta = model("Beta", 1);
+    let snapshot = AppSnapshot {
+        models: vec![beta, alpha.clone()],
+        recent_models: vec![alpha.clone()],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    };
+
+    let request = load_request_for(&snapshot, alpha.id).unwrap();
+    assert_eq!(request.id, alpha.id);
+    assert_eq!(request.key, alpha.key.to_string());
+}
+
+#[test]
+fn load_dialog_adapter_hydrates_every_saved_profile_value() {
+    let mut alpha = model("Alpha", 1);
+    alpha.launch_profile.settings = LaunchSettings {
+        context_length: Some(model_launcher_core::ContextLength::new(8192).unwrap()),
+        gpu_layers: Some(model_launcher_core::GpuLayers::new(31)),
+        cpu_threads: Some(model_launcher_core::CpuThreads::new(9).unwrap()),
+        batch_size: Some(model_launcher_core::BatchSize::new(777).unwrap()),
+        parallel_slots: Some(model_launcher_core::ParallelSlots::new(3).unwrap()),
+        flash_attention: Some(true),
+        kv_cache_type: Some(model_launcher_core::KvCacheType::Q8_0),
+    };
+    let snapshot = AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities::default(),
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    };
+
+    let values = load_dialog_values_for(&snapshot, alpha.id).unwrap();
+    assert_eq!(values.key, alpha.key.to_string());
+    assert_eq!(values.settings, alpha.launch_profile.settings);
+}
+
+#[test]
+fn load_dialog_adapter_keeps_unsupported_saved_fields_visible_and_read_only() {
+    let mut alpha = model("Alpha", 1);
+    alpha.launch_profile.settings.gpu_layers = Some(model_launcher_core::GpuLayers::new(23));
+    let snapshot = AppSnapshot {
+        models: vec![alpha.clone()],
+        recent_models: vec![],
+        lifecycle: LifecycleSnapshot::default(),
+        capabilities: EngineCapabilities {
+            context_length: true,
+            ..EngineCapabilities::default()
+        },
+        authentication_status: String::new(),
+        server_warning: String::new(),
+        engine_valid: true,
+        engine_diagnostic: None,
+        configuration_diagnostic: None,
+    };
+
+    let gpu = load_dialog_fields_for(&snapshot, alpha.id)
+        .unwrap()
+        .into_iter()
+        .find(|field| field.id == "gpu_layers")
+        .unwrap();
+    assert!(gpu.visible);
+    assert!(gpu.retained_unsupported);
+    assert_eq!(
+        alpha
+            .launch_profile
+            .settings
+            .render(&snapshot.capabilities)
+            .unsupported,
+        vec![model_launcher_core::SettingId::GpuLayers]
+    );
+}

@@ -1,0 +1,25 @@
+[package]
+name = "model-launcher-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+gguf-rs-lib.workspace = true
+notify.workspace = true
+
+[dev-dependencies]
+gguf-rs-lib.workspace = true
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem"] }

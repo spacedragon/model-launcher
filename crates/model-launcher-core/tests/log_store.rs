@@ -1,0 +1,439 @@
+use model_launcher_core::{
+    EngineLogFramer, LogFilter, LogLevel, LogRecord, LogSource, LogStore, LogStoreLimits,
+    MAX_ENGINE_LOG_LINE_BYTES, ModelId,
+};
+use uuid::Uuid;
+
+fn model_id() -> ModelId {
+    ModelId::from_uuid(Uuid::from_u128(7))
+}
+
+fn record(timestamp_ms: u64, message: &str) -> LogRecord {
+    LogRecord {
+        timestamp_ms,
+        source: LogSource::Application,
+        level: LogLevel::Info,
+        generation: Some(3),
+        model_id: Some(model_id()),
+        message: message.to_owned(),
+        truncated: false,
+    }
+}
+
+fn store(limits: LogStoreLimits) -> LogStore {
+    LogStore::new(limits).expect("valid log limits")
+}
+
+#[test]
+fn records_keep_all_structured_fields() {
+    let store = store(LogStoreLimits::new(4, 1_024, 4));
+
+    store.append(record(1_725_000_123_456, "ready"));
+
+    assert_eq!(store.snapshot(), vec![record(1_725_000_123_456, "ready")]);
+}
+
+#[test]
+fn retention_enforces_record_and_utf8_byte_limits() {
+    let by_count = store(LogStoreLimits::new(2, 1_024, 4));
+    by_count.append(record(1, "one"));
+    by_count.append(record(2, "two"));
+    by_count.append(record(3, "three"));
+    assert_eq!(
+        by_count
+            .snapshot()
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect::<Vec<_>>(),
+        ["two", "three"]
+    );
+
+    let by_bytes = store(LogStoreLimits::new(10, 5, 4));
+    by_bytes.append(record(1, "abc"));
+    by_bytes.append(record(2, "éé"));
+    assert_eq!(by_bytes.snapshot(), vec![record(2, "éé")]);
+}
+
+#[test]
+fn filters_use_typed_source_and_minimum_level() {
+    let store = store(LogStoreLimits::new(8, 1_024, 4));
+    store.append(record(1, "app info"));
+    store.append(LogRecord {
+        timestamp_ms: 2,
+        source: LogSource::EngineStderr,
+        level: LogLevel::Error,
+        generation: Some(4),
+        model_id: None,
+        message: "engine error".into(),
+        truncated: false,
+    });
+
+    let filtered = store.filtered_snapshot(LogFilter {
+        source: Some(LogSource::EngineStderr),
+        minimum_level: Some(LogLevel::Warn),
+    });
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].message, "engine error");
+}
+
+#[test]
+fn export_is_stable_json_lines_in_snapshot_order() {
+    let store = store(LogStoreLimits::new(4, 1_024, 4));
+    store.append(record(2, "second"));
+    store.append(record(1, "first"));
+
+    let mut output = Vec::new();
+    store.export_json_lines(&mut output).expect("export logs");
+
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        concat!(
+            "{\"timestamp_ms\":2,\"source\":\"application\",\"level\":\"info\",\"generation\":3,\"model_id\":\"00000000-0000-0000-0000-000000000007\",\"message\":\"second\",\"truncated\":false}\n",
+            "{\"timestamp_ms\":1,\"source\":\"application\",\"level\":\"info\",\"generation\":3,\"model_id\":\"00000000-0000-0000-0000-000000000007\",\"message\":\"first\",\"truncated\":false}\n"
+        )
+    );
+}
+
+#[test]
+fn authorization_and_bearer_secrets_are_redacted_before_storage_and_broadcast() {
+    let store = store(LogStoreLimits::new(8, 4_096, 4));
+    let mut subscriber = store.subscribe();
+    let secret = "super-secret-token";
+    store.append(record(
+        1,
+        &format!(
+            "Authorization : Bearer {secret}\r\naUtHoRiZaTiOn:\tBasic abc123 request Bearer loose-token"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    assert!(!combined.contains(secret));
+    assert!(!combined.contains("abc123"));
+    assert!(!combined.contains("loose-token"));
+    assert!(snapshot[0].message.contains("Authorization : [REDACTED]"));
+}
+
+#[test]
+fn folded_authorization_credentials_are_redacted_from_every_observation_surface() {
+    let store = store(LogStoreLimits::new(8, 4_096, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = [
+        "basic-folded",
+        "digest-folded",
+        "custom-folded",
+        "continued-secret",
+    ];
+    store.append(record(
+        1,
+        concat!(
+            "Authorization:\r\n Basic basic-folded\r\n",
+            "aUtHoRiZaTiOn:\n\tDigest digest-folded\n",
+            "AUTHORIZATION: Custom custom-folded\r\n",
+            "\tcontinued-secret\r\nsafe: visible"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(snapshot[0].message.contains("safe: visible"));
+}
+
+#[test]
+fn inline_authorization_fields_and_mixed_line_delimiters_are_redacted_everywhere() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = [
+        "inline-basic",
+        "inline-digest",
+        "bare-custom",
+        "folded-custom",
+    ];
+    store.append(record(
+        1,
+        concat!(
+            "request headers: Authorization: Basic inline-basic\r\n",
+            "safe NotAuthorization: keep-this\n",
+            "x aUtHoRiZaTiOn : Digest inline-digest\r",
+            "prefix AUTHORIZATION:\r\n\tfolded-custom\r",
+            "x authorization: Custom bare-custom\rnext: safe"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(
+        snapshot[0]
+            .message
+            .contains("request headers: Authorization:")
+    );
+    assert!(snapshot[0].message.contains("NotAuthorization: keep-this"));
+    assert!(snapshot[0].message.contains("next: safe"));
+}
+
+#[test]
+fn unicode_whitespace_before_authorization_colon_is_redacted_everywhere() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = ["nbsp-basic", "em-custom", "ideographic-custom"];
+    store.append(record(
+        1,
+        concat!(
+            "request Authorization\u{00a0}: Basic nbsp-basic\n",
+            "x authorization\u{2003}: Custom em-custom\r",
+            "AUTHORIZATION\u{3000}: Custom ideographic-custom\r\n",
+            "safe NotAuthorization\u{2003}: keep-this"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(
+        snapshot[0]
+            .message
+            .contains("NotAuthorization\u{2003}: keep-this")
+    );
+}
+
+#[test]
+fn unicode_whitespace_folded_continuations_are_redacted_until_an_empty_line() {
+    let store = store(LogStoreLimits::new(8, 8_192, 4));
+    let mut subscriber = store.subscribe();
+    let secrets = ["nbsp-folded", "em-folded", "ideographic-folded"];
+    store.append(record(
+        1,
+        concat!(
+            "Authorization:\r\n\u{00a0}Basic nbsp-folded\r\n",
+            "Authorization:\n\u{2003}Custom em-folded\n",
+            "Authorization:\r\u{3000}Custom ideographic-folded\r",
+            "\r\u{2003}safe-after-empty"
+        ),
+    ));
+
+    let broadcast = subscriber.try_recv().expect("broadcast record");
+    let snapshot = store.snapshot();
+    let mut export = Vec::new();
+    store.export_json_lines(&mut export).expect("export logs");
+    let combined = format!(
+        "{broadcast:?}{snapshot:?}{}",
+        String::from_utf8(export).unwrap()
+    );
+
+    for secret in secrets {
+        assert!(!combined.contains(secret), "leaked {secret}");
+    }
+    assert!(snapshot[0].message.contains("\u{2003}safe-after-empty"));
+}
+
+#[test]
+fn bounded_broadcast_reports_lagged_record_count() {
+    let store = store(LogStoreLimits::new(8, 1_024, 2));
+    let mut subscriber = store.subscribe();
+    for timestamp in 0..5 {
+        store.append(record(timestamp, "event"));
+    }
+
+    assert_eq!(subscriber.try_recv().unwrap_err().lagged(), Some(3));
+}
+
+#[test]
+fn engine_bytes_frame_crlf_split_chunks_lossy_utf8_and_eof_partial() {
+    let store = store(LogStoreLimits::new(16, 4_096, 4));
+    let mut stdout = EngineLogFramer::new(
+        store.clone(),
+        LogSource::EngineStdout,
+        LogLevel::Info,
+        Some(9),
+        Some(model_id()),
+        64,
+    )
+    .expect("valid framer limits");
+    stdout.push(10, b"hel");
+    stdout.push(11, b"lo\r\nworld\nlossy:\xff");
+    stdout.finish(12);
+
+    let records = store.snapshot();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.message.as_str())
+            .collect::<Vec<_>>(),
+        ["hello", "world", "lossy:\u{fffd}"]
+    );
+    assert!(
+        records
+            .iter()
+            .all(|record| record.source == LogSource::EngineStdout)
+    );
+    assert_eq!(records[0].timestamp_ms, 11);
+    assert_eq!(records[2].timestamp_ms, 12);
+}
+
+#[test]
+fn oversized_lines_are_truncated_and_framing_continues_with_bounded_pending_data() {
+    let store = store(LogStoreLimits::new(16, 4_096, 4));
+    let mut stderr = EngineLogFramer::new(
+        store.clone(),
+        LogSource::EngineStderr,
+        LogLevel::Error,
+        None,
+        None,
+        5,
+    )
+    .expect("valid framer limits");
+
+    stderr.push(1, b"abcdefghij");
+    assert!(stderr.pending_len() <= 5);
+    stderr.push(2, b"kl\nok\n");
+
+    let records = store.snapshot();
+    assert_eq!(records[0].message, "abcde");
+    assert!(records[0].truncated);
+    assert_eq!(records[1].message, "ok");
+    assert!(!records[1].truncated);
+}
+
+#[test]
+fn crlf_terminator_does_not_consume_the_line_content_limit_across_chunks() {
+    let store = store(LogStoreLimits::new(8, 1_024, 2));
+    let mut stdout = EngineLogFramer::new(
+        store.clone(),
+        LogSource::EngineStdout,
+        LogLevel::Info,
+        None,
+        None,
+        5,
+    )
+    .expect("valid framer limits");
+
+    stdout.push(1, b"abcde\r");
+    stdout.push(2, b"\n");
+
+    assert_eq!(store.snapshot()[0].message, "abcde");
+    assert!(!store.snapshot()[0].truncated);
+}
+
+#[test]
+fn bare_carriage_return_counts_as_content_and_overflows_only_past_the_limit() {
+    let store = store(LogStoreLimits::new(8, 1_024, 2));
+    let mut stdout = EngineLogFramer::new(
+        store.clone(),
+        LogSource::EngineStdout,
+        LogLevel::Info,
+        None,
+        None,
+        5,
+    )
+    .expect("valid framer limits");
+
+    stdout.push(1, b"abcd\r");
+    stdout.push(2, b"X\n");
+
+    assert_eq!(store.snapshot()[0].message, "abcd\r");
+    assert!(store.snapshot()[0].truncated);
+}
+
+#[test]
+fn zero_broadcast_capacity_is_rejected_with_a_stable_error() {
+    let error = LogStore::new(LogStoreLimits::new(8, 1_024, 0))
+        .err()
+        .expect("zero broadcast capacity must fail");
+
+    assert_eq!(error.code(), "invalid_log_limit");
+    assert_eq!(error.to_string(), "invalid log limit: broadcast_capacity");
+}
+
+#[test]
+fn zero_record_or_byte_retention_disables_storage_but_keeps_broadcasting() {
+    for limits in [
+        LogStoreLimits::new(0, 1_024, 2),
+        LogStoreLimits::new(8, 0, 2),
+    ] {
+        let store = store(limits);
+        let mut subscriber = store.subscribe();
+
+        store.append(record(1, "broadcast only"));
+
+        assert!(store.snapshot().is_empty());
+        assert_eq!(subscriber.try_recv().unwrap().message, "broadcast only");
+    }
+}
+
+#[test]
+fn engine_framer_rejects_zero_and_unbounded_line_limits_but_accepts_the_hard_limit() {
+    let make = |max_line_bytes| {
+        EngineLogFramer::new(
+            store(LogStoreLimits::new(8, 1_024, 2)),
+            LogSource::EngineStdout,
+            LogLevel::Info,
+            None,
+            None,
+            max_line_bytes,
+        )
+    };
+
+    for invalid in [0, MAX_ENGINE_LOG_LINE_BYTES + 1, usize::MAX] {
+        let error = make(invalid).err().expect("invalid line limit must fail");
+        assert_eq!(error.code(), "invalid_log_limit");
+        assert_eq!(error.to_string(), "invalid log limit: max_line_bytes");
+    }
+    assert!(make(MAX_ENGINE_LOG_LINE_BYTES).is_ok());
+}
+
+#[test]
+fn delivery_drop_accounting_covers_no_receivers_lag_and_multiple_receivers() {
+    let store = store(LogStoreLimits::new(16, 4_096, 2));
+    store.append(record(0, "no receivers"));
+    assert_eq!(store.total_delivery_drops(), 1);
+
+    let mut first = store.subscribe();
+    let mut second = store.subscribe();
+    for timestamp in 1..=5 {
+        store.append(record(timestamp, "event"));
+    }
+    assert_eq!(first.try_recv().unwrap_err().lagged(), Some(3));
+    assert_eq!(first.local_delivery_drops(), 3);
+    assert_eq!(store.total_delivery_drops(), 4);
+
+    assert_eq!(second.try_recv().unwrap_err().lagged(), Some(3));
+    assert_eq!(second.local_delivery_drops(), 3);
+    assert_eq!(store.total_delivery_drops(), 7);
+}
