@@ -1,7 +1,7 @@
 use crate::{
-    ExecutableIdentity, OwnedPid, PortAllocator, ProbeSnapshot, Signal, capture_version,
-    guarded_signal_argv, launch_argv, parse_identity, parse_ownership_handshake, probe_argv,
-    stat_argv, windows_to_wsl_path,
+    ExecutableIdentity, GUARDED_SIGNAL_SCRIPT, LAUNCH_SCRIPT, OwnedPid, PortAllocator,
+    ProbeSnapshot, Signal, capture_version, guarded_signal_argv, launch_argv, parse_identity,
+    parse_ownership_handshake, probe_argv, stat_argv, windows_to_wsl_path,
 };
 use async_trait::async_trait;
 use model_launcher_core::{
@@ -18,7 +18,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdout, Command},
 };
 
@@ -175,12 +175,32 @@ impl TokioCommandRunner {
 #[async_trait]
 impl CommandRunner for TokioCommandRunner {
     async fn output(&self, program: &str, argv: &[String]) -> Result<CommandOutput, WslError> {
-        let output = Command::new(program)
-            .args(argv)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|error| WslError::Command(error.to_string()))?;
+        let mut command = Command::new(program);
+        command.args(argv).kill_on_drop(true);
+        let output = if uses_stdin_script(argv, crate::SIGNAL_SENTINEL) {
+            let mut child = command
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| WslError::Command(error.to_string()))?;
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| WslError::Command("missing stdin pipe".into()))?
+                .write_all(format!("{GUARDED_SIGNAL_SCRIPT}\n").as_bytes())
+                .await
+                .map_err(|error| WslError::Command(error.to_string()))?;
+            child
+                .wait_with_output()
+                .await
+                .map_err(|error| WslError::Command(error.to_string()))?
+        } else {
+            command
+                .output()
+                .await
+                .map_err(|error| WslError::Command(error.to_string()))?
+        };
         Ok(CommandOutput {
             success: output.status.success(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -200,10 +220,20 @@ impl CommandRunner for TokioCommandRunner {
         let mut child = Command::new(program)
             .args(argv)
             .kill_on_drop(true)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|error| WslError::Command(error.to_string()))?;
+        if uses_stdin_script(argv, crate::LAUNCH_SENTINEL) {
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| WslError::Command("missing stdin pipe".into()))?
+                .write_all(format!("{LAUNCH_SCRIPT}\n").as_bytes())
+                .await
+                .map_err(|error| WslError::Command(error.to_string()))?;
+        }
         let stdout = child
             .stdout
             .take()
@@ -225,6 +255,11 @@ impl CommandRunner for TokioCommandRunner {
             inspector: Arc::new(self.clone()),
         }))
     }
+}
+
+fn uses_stdin_script(argv: &[String], sentinel: &str) -> bool {
+    argv.windows(2)
+        .any(|pair| pair[0] == "-s" && pair[1] == sentinel)
 }
 
 struct TokioWslChild {
@@ -321,7 +356,7 @@ impl WslChild for TokioWslChild {
                 let tail = self.stderr_tail.lock().expect("stderr tail lock").clone();
                 return Err(classify_pre_ready_exit(&status.to_string(), &tail));
             }
-            if tokio::net::TcpStream::connect(self.addr).await.is_ok() {
+            if http_health_ready(self.addr).await? {
                 return if self.endpoint_is_owned().await? {
                     Ok(())
                 } else {
@@ -335,9 +370,9 @@ impl WslChild for TokioWslChild {
         }
     }
     async fn check_health(&mut self) -> Result<(), WslError> {
-        tokio::net::TcpStream::connect(self.addr)
-            .await
-            .map_err(|e| WslError::Command(e.to_string()))?;
+        if !http_health_ready(self.addr).await? {
+            return Err(WslError::Command("health endpoint is not ready".into()));
+        }
         if self.endpoint_is_owned().await? {
             Ok(())
         } else {
@@ -378,6 +413,23 @@ impl WslChild for TokioWslChild {
         }
         Ok(())
     }
+}
+
+async fn http_health_ready(addr: SocketAddr) -> Result<bool, WslError> {
+    let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+        return Ok(false);
+    };
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .await
+        .map_err(|error| WslError::Command(error.to_string()))?;
+    let mut response = [0_u8; 32];
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+        .await
+        .map_err(|_| WslError::Command("health response timed out".into()))?
+        .map_err(|error| WslError::Command(error.to_string()))?;
+    Ok(response[..read].starts_with(b"HTTP/1.1 200")
+        || response[..read].starts_with(b"HTTP/1.0 200"))
 }
 
 impl TokioWslChild {
@@ -1490,8 +1542,8 @@ mod tests {
         assert!(
             signals
                 .iter()
-                .any(|argv| argv.get(7).is_some_and(|v| v == "TERM")
-                    && argv.get(8).is_some_and(|v| v == "11"))
+                .any(|argv| argv.get(6).is_some_and(|v| v == "TERM")
+                    && argv.get(7).is_some_and(|v| v == "11"))
         );
         assert_eq!(process.pid, 22);
         assert_eq!(
@@ -1554,7 +1606,7 @@ mod tests {
         let signals = runner.signals.lock().unwrap();
         let killed: Vec<_> = signals
             .iter()
-            .filter_map(|argv| argv.get(8).cloned())
+            .filter_map(|argv| argv.get(7).cloned())
             .collect();
         assert_eq!(killed, ["11", "22", "33"]);
     }
@@ -1593,7 +1645,7 @@ mod tests {
             1,
             "an exited owned child must never receive a PID-reuse-prone KILL"
         );
-        assert_eq!(&signals[0][7..], &["TERM", "77", "107"]);
+        assert_eq!(&signals[0][6..], &["TERM", "77", "107"]);
     }
     #[tokio::test]
     async fn completed_cleanup_remains_observable_to_a_late_waiter() {
@@ -1646,7 +1698,7 @@ mod tests {
                 .expect("cleanup must outlive the runtime active during Drop");
         });
         let signals = runner.signals.lock().unwrap();
-        assert_eq!(&signals[0][7..], &["TERM", "78", "108"]);
+        assert_eq!(&signals[0][6..], &["TERM", "78", "108"]);
         assert_eq!(observer.completed(), 1);
     }
     #[test]
@@ -1683,7 +1735,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         let signals = runner.signals.lock().unwrap();
-        assert_eq!(&signals[0][7..], &["TERM", "79", "109"]);
+        assert_eq!(&signals[0][6..], &["TERM", "79", "109"]);
         assert_eq!(observer.completed(), 1);
         assert_eq!(observer.failures(), 0);
     }
@@ -1779,7 +1831,7 @@ mod tests {
             .expect("bounded cleanup must complete");
         let signals = runner.signals.lock().unwrap();
         assert_eq!(signals.len(), 2);
-        assert_eq!(&signals[1][7..], &["KILL", "78", "108"]);
+        assert_eq!(&signals[1][6..], &["KILL", "78", "108"]);
     }
 
     struct DelayedEndpointChild {
@@ -1926,8 +1978,8 @@ mod tests {
                     .lock()
                     .unwrap()
                     .iter()
-                    .any(|argv| argv.get(7).is_some_and(|v| v == "KILL")
-                        && argv.get(8).is_some_and(|v| v == "55"))
+                    .any(|argv| argv.get(6).is_some_and(|v| v == "KILL")
+                        && argv.get(7).is_some_and(|v| v == "55"))
             );
         }
     }

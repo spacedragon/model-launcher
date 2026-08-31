@@ -87,8 +87,9 @@ function Request-GracefulShutdown {
         }
         try {
             if ($null -ne $script:BackendPid) {
-                $stat = (& wsl.exe -d $Distro -- cat "/proc/$script:BackendPid/stat" 2>$null) -join ""
-                if ($LASTEXITCODE -eq 0 -and $stat) {
+                & wsl.exe -d $Distro -- test -r "/proc/$script:BackendPid/stat"
+                if ($LASTEXITCODE -eq 0) {
+                    $stat = (& wsl.exe -d $Distro -- cat "/proc/$script:BackendPid/stat") -join ""
                     $tail = $stat.Substring($stat.LastIndexOf(')') + 2) -split '\s+'
                     if ($tail.Count -le 19) { Add-Check "backend identity exited" "FAIL" "malformed /proc identity response after shutdown" }
                     elseif ($tail[19] -eq $script:BackendStartTime) { Add-Check "backend identity exited" "FAIL" "same Linux PID/starttime still exists after graceful shutdown" }
@@ -117,17 +118,29 @@ try {
     $cpu = Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Name
     $gpu = Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name
     $wslVersion = (& wsl.exe --version 2>&1) -join " | "
-    $distroList = (& wsl.exe --list --quiet) -join "`n"
+    # Windows PowerShell can decode wsl.exe's UTF-16 output as strings containing NULs.
+    $distroList = ((& wsl.exe --list --quiet) -join "`n") -replace "`0", ""
     if ($distroList -notmatch [regex]::Escape($Distro)) { throw "WSL distribution is not installed: $Distro" }
     $wslKernel = (& wsl.exe -d $Distro -- uname -r 2>&1) -join " "
     $wslDistroVersion = (& wsl.exe -d $Distro -- cat /etc/os-release 2>&1) -join " | "
     & wsl.exe -d $Distro -- test -x $LlamaServer
     if ($LASTEXITCODE -ne 0) { throw "llama-server is missing or not executable: $LlamaServer" }
-    $llamaVersion = (& wsl.exe -d $Distro -- $LlamaServer --version 2>&1) -join " | "
-    $llamaHelp = (& wsl.exe -d $Distro -- $LlamaServer --help 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0) { throw "llama-server --help probe failed" }
-    $llamaHashLine = (& wsl.exe -d $Distro -- sha256sum -- $LlamaServer 2>&1) -join " "
-    $llamaHash = if ($LASTEXITCODE -eq 0) { ($llamaHashLine -split '\s+')[0] } else { "unavailable: $llamaHashLine" }
+    # Some GPU builds report device discovery on stderr even when probes succeed. Under Windows
+    # PowerShell and ErrorActionPreference=Stop that otherwise becomes a terminating error.
+    $savedErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $llamaVersion = (& wsl.exe -d $Distro -- $LlamaServer --version 2>&1) -join " | "
+        $llamaVersionExitCode = $LASTEXITCODE
+        $llamaHelp = (& wsl.exe -d $Distro -- $LlamaServer --help 2>&1) -join "`n"
+        $llamaHelpExitCode = $LASTEXITCODE
+        $llamaHashLine = (& wsl.exe -d $Distro -- sha256sum -- $LlamaServer 2>&1) -join " "
+        $llamaHashExitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $savedErrorActionPreference }
+    if ($llamaVersionExitCode -ne 0) { throw "llama-server --version probe failed" }
+    if ($llamaHelpExitCode -ne 0) { throw "llama-server --help probe failed" }
+    $llamaHash = if ($llamaHashExitCode -eq 0) { ($llamaHashLine -split '\s+')[0] } else { "unavailable: $llamaHashLine" }
     if ($ModelSha256 -and $ModelSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "ModelSha256 must be exactly 64 hexadecimal characters" }
     if ($SkipModelHash -and $ModelSha256) { throw "-SkipModelHash and -ModelSha256 are mutually exclusive" }
     $computedModelHash = if ($SkipModelHash) { "NOT_COMPUTED" } else { (Get-FileHash -LiteralPath $modelShard.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -166,7 +179,8 @@ try {
     Add-Check "configure/probe/discover" "PASS" "Discovered $($catalog.models.Count) models including $ModelKey"
     $loaded = Invoke-Api POST "/api/v1/models/load" @{ model = $ModelKey; echo_load_config = $true }
     if ($loaded.status -ne "loaded") { throw "load did not return loaded" }; Add-Check "load" "PASS" "instance $($loaded.model_instance_id)"
-    $wslModelPath = ((& wsl.exe -d $Distro -- wslpath -a -u -- $modelShard.FullName 2>&1) -join "").Trim()
+    $wslpathInput = $modelShard.FullName -replace '\\', '/'
+    $wslModelPath = ((& wsl.exe -d $Distro -- wslpath -a -u -- $wslpathInput 2>&1) -join "").Trim()
     $candidates = @()
     foreach ($line in (& wsl.exe -d $Distro -- ps -eo pid=,args= 2>&1)) {
         if ($line -match '^\s*(\d+)\s+(.+)$' -and $Matches[2].Contains($LlamaServer) -and $Matches[2].Contains($wslModelPath)) { $candidates += [int]$Matches[1] }
@@ -184,7 +198,7 @@ try {
     if (-not $chat.choices) { throw "non-streaming chat returned no choices" }; Add-Check "chat non-streaming" "PASS" "response contained choices"
     $headers = @{ Accept = "text/event-stream"; Authorization = "Bearer $Token" }
     $sseBody = @{ model = $ModelKey; stream = $true; messages = @(@{ role = "user"; content = "Reply with OK" }) } | ConvertTo-Json -Depth 6 -Compress
-    $sse = Invoke-WebRequest -Method Post -Uri ([uri]::new($BaseUrl, "/v1/chat/completions")) -Headers $headers -ContentType "application/json" -Body $sseBody -TimeoutSec $TimeoutSeconds
+    $sse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ([uri]::new($BaseUrl, "/v1/chat/completions")) -Headers $headers -ContentType "application/json" -Body $sseBody -TimeoutSec $TimeoutSeconds
     if ($sse.Content -notmatch "data:") { throw "streaming chat returned no SSE data" }; Add-Check "chat streaming" "PASS" "SSE data observed"
     Invoke-Api POST "/api/v1/models/unload" @{ instance_id = $loaded.model_instance_id } | Out-Null; Add-Check "unload" "PASS" "primary ejected"
     $jit = Invoke-Api POST "/v1/completions" @{ model = $ModelKey; stream = $false; prompt = "Reply with OK" }

@@ -154,7 +154,7 @@ impl LaunchSettings {
         );
         if self.flash_attention == Some(true) {
             if capabilities.flash_attention {
-                args.push("--flash-attn".into());
+                args.extend(["--flash-attn".into(), "on".into()]);
             } else {
                 unsupported.push(SettingId::FlashAttention);
             }
@@ -273,5 +273,19 @@ mod tests {
 
         assert!(rendered.args.is_empty());
         assert!(rendered.unsupported.is_empty());
+    }
+
+    #[test]
+    fn enabled_flash_attention_uses_the_typed_llama_cpp_value() {
+        let settings = LaunchSettings {
+            flash_attention: Some(true),
+            ..LaunchSettings::default()
+        };
+        let capabilities = EngineCapabilities {
+            flash_attention: true,
+            ..EngineCapabilities::default()
+        };
+
+        assert_eq!(settings.to_args(&capabilities), ["--flash-attn", "on"]);
     }
 }
