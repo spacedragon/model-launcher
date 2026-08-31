@@ -22,7 +22,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libfontconfig1-dev
+          sudo apt-get install --no-install-recommends -y \
+            libfontconfig1-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
       - name: Install Rust 1.89
         run: rustup toolchain install 1.89 --profile minimal --component rustfmt,clippy
       - name: Select Rust 1.89

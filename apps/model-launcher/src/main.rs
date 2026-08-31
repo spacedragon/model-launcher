@@ -144,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
                     let _ = handle.shutdown().await;
-                    let _ = slint::quit_event_loop();
+                    model_launcher_ui::quit_event_loop();
                 });
             }
         }),
@@ -300,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     poll.tick().await;
                     if shutdown_file.is_file() {
                         let _ = handle.shutdown().await;
-                        let _ = slint::quit_event_loop();
+                        model_launcher_ui::quit_event_loop();
                         break;
                     }
                 }
