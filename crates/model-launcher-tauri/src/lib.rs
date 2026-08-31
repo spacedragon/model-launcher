@@ -328,10 +328,10 @@ pub fn run_desktop(
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window.hide();
-                if let Some(state) = window.try_state::<DesktopState>() {
-                    if let Some(message) = (state.actions.close_notice)() {
-                        emit("close-notice", message);
-                    }
+                if let Some(state) = window.try_state::<DesktopState>()
+                    && let Some(message) = (state.actions.close_notice)()
+                {
+                    emit("close-notice", message);
                 }
             }
         })
