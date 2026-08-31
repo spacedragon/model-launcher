@@ -1,0 +1,462 @@
+use model_launcher_core::{
+    EngineCapabilities, LaunchSettings, LifecycleSnapshot, LogFilter, LogLevel, LogRecord,
+    LogSource, ModelId, ModelRecord, ModelState,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    net::IpAddr,
+    path::PathBuf,
+    sync::{Arc, OnceLock, RwLock},
+};
+use tauri::{Emitter, Manager, WebviewWindow};
+
+#[derive(Clone, Debug)]
+pub struct AppSnapshot {
+    pub models: Vec<ModelRecord>,
+    pub recent_models: Vec<ModelRecord>,
+    pub lifecycle: LifecycleSnapshot,
+    pub capabilities: EngineCapabilities,
+    pub authentication_status: String,
+    pub server_warning: String,
+    pub engine_valid: bool,
+    pub engine_diagnostic: Option<String>,
+    pub configuration_diagnostic: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct UiActions {
+    pub load: Arc<dyn Fn(UiLoadRequest) + Send + Sync>,
+    pub eject: Arc<dyn Fn() + Send + Sync>,
+    pub rescan: Arc<dyn Fn() + Send + Sync>,
+    pub snapshot: Arc<dyn Fn() -> AppSnapshot + Send + Sync>,
+    pub quit: Arc<dyn Fn() + Send + Sync>,
+    pub close_notice: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    pub save_settings: Arc<dyn Fn(EngineSettings) + Send + Sync>,
+    pub logs: Arc<dyn Fn(LogFilter) -> Vec<LogRecord> + Send + Sync>,
+    pub export_logs: Arc<dyn Fn() + Send + Sync>,
+    pub generate_token: Arc<dyn Fn() + Send + Sync>,
+    pub engine_settings: Arc<dyn Fn() -> EngineSettings + Send + Sync>,
+    pub server_settings: Arc<dyn Fn() -> UiServerSettings + Send + Sync>,
+    pub save_server_settings: Arc<dyn Fn(UiServerSettings) + Send + Sync>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UiLoadRequest {
+    pub id: ModelId,
+    pub key: String,
+    pub settings: LaunchSettings,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineSettings {
+    pub distribution: String,
+    pub executable: String,
+    pub model_directory: String,
+    pub defaults: LaunchSettings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiServerSettings {
+    pub bind_address: String,
+    pub port: u16,
+    pub auth_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Bootstrap {
+    models: Vec<ModelDto>,
+    recent_models: Vec<ModelDto>,
+    lifecycle: LifecycleDto,
+    capabilities: EngineCapabilities,
+    authentication_status: String,
+    server_warning: String,
+    engine_valid: bool,
+    engine_diagnostic: Option<String>,
+    configuration_diagnostic: Option<String>,
+    engine_settings: EngineSettings,
+    server_settings: UiServerSettings,
+    base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelDto {
+    id: ModelId,
+    key: String,
+    name: String,
+    path: String,
+    file_name: String,
+    size_bytes: u64,
+    size: String,
+    state: String,
+    running: bool,
+    settings: LaunchSettings,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LifecycleDto {
+    state: String,
+    desired_model: Option<ModelId>,
+    in_flight: usize,
+    diagnostic: Option<String>,
+}
+
+struct DesktopState {
+    address: String,
+    actions: UiActions,
+}
+
+fn bootstrap(state: &DesktopState) -> Bootstrap {
+    let snapshot = (state.actions.snapshot)();
+    let running = snapshot.lifecycle.desired_model;
+    let convert = |model: &ModelRecord| ModelDto {
+        id: model.id,
+        key: model.key.to_string(),
+        name: model.display_name.clone(),
+        path: model.path.display().to_string(),
+        file_name: model
+            .path
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        size_bytes: model.size_bytes,
+        size: format_bytes(model.size_bytes),
+        state: match &model.state {
+            ModelState::Available => "ready".into(),
+            ModelState::Missing => "missing".into(),
+            ModelState::Unlaunchable { .. } => "unlaunchable".into(),
+        },
+        running: running == Some(model.id),
+        settings: model.launch_profile.settings.clone(),
+    };
+    Bootstrap {
+        models: snapshot.models.iter().map(convert).collect(),
+        recent_models: snapshot.recent_models.iter().map(convert).collect(),
+        lifecycle: LifecycleDto {
+            state: format!("{:?}", snapshot.lifecycle.state).to_lowercase(),
+            desired_model: snapshot.lifecycle.desired_model,
+            in_flight: snapshot.lifecycle.in_flight,
+            diagnostic: snapshot.lifecycle.diagnostic,
+        },
+        capabilities: snapshot.capabilities,
+        authentication_status: snapshot.authentication_status,
+        server_warning: snapshot.server_warning,
+        engine_valid: snapshot.engine_valid,
+        engine_diagnostic: snapshot.engine_diagnostic,
+        configuration_diagnostic: snapshot.configuration_diagnostic,
+        engine_settings: (state.actions.engine_settings)(),
+        server_settings: (state.actions.server_settings)(),
+        base_url: format!("http://{}", state.address),
+    }
+}
+
+#[tauri::command]
+fn get_bootstrap(state: tauri::State<'_, DesktopState>) -> Bootstrap {
+    bootstrap(&state)
+}
+
+#[tauri::command]
+fn load_model(state: tauri::State<'_, DesktopState>, request: UiLoadRequest) {
+    (state.actions.load)(request);
+}
+
+#[tauri::command]
+fn eject_model(state: tauri::State<'_, DesktopState>) {
+    (state.actions.eject)();
+}
+
+#[tauri::command]
+fn rescan_models(state: tauri::State<'_, DesktopState>) {
+    (state.actions.rescan)();
+}
+
+#[tauri::command]
+fn save_engine_settings(state: tauri::State<'_, DesktopState>, settings: EngineSettings) {
+    (state.actions.save_settings)(settings);
+}
+
+#[tauri::command]
+fn save_server_settings(
+    state: tauri::State<'_, DesktopState>,
+    settings: UiServerSettings,
+) -> Result<(), String> {
+    parse_server_settings(
+        settings.bind_address.clone(),
+        i32::from(settings.port),
+        settings.auth_enabled,
+    )?;
+    (state.actions.save_server_settings)(settings);
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LogQuery {
+    source: Option<String>,
+    minimum_level: Option<String>,
+}
+
+#[tauri::command]
+fn get_logs(state: tauri::State<'_, DesktopState>, query: LogQuery) -> Vec<LogRecord> {
+    let source = match query.source.as_deref() {
+        Some("application") => Some(LogSource::Application),
+        Some("engine_stdout") => Some(LogSource::EngineStdout),
+        Some("engine_stderr") => Some(LogSource::EngineStderr),
+        _ => None,
+    };
+    let minimum_level = match query.minimum_level.as_deref() {
+        Some("trace") => Some(LogLevel::Trace),
+        Some("debug") => Some(LogLevel::Debug),
+        Some("info") => Some(LogLevel::Info),
+        Some("warn") => Some(LogLevel::Warn),
+        Some("error") => Some(LogLevel::Error),
+        _ => None,
+    };
+    (state.actions.logs)(LogFilter {
+        source,
+        minimum_level,
+    })
+}
+
+#[tauri::command]
+fn export_logs(state: tauri::State<'_, DesktopState>) {
+    (state.actions.export_logs)();
+}
+
+#[tauri::command]
+fn generate_token(state: tauri::State<'_, DesktopState>) {
+    (state.actions.generate_token)();
+}
+
+#[tauri::command]
+fn minimize(window: WebviewWindow) -> Result<(), String> {
+    window.minimize().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn toggle_maximize(window: WebviewWindow) -> Result<(), String> {
+    let maximized = window.is_maximized().map_err(|error| error.to_string())?;
+    if maximized {
+        window.unmaximize()
+    } else {
+        window.maximize()
+    }
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn close_window(window: WebviewWindow) -> Result<(), String> {
+    window.close().map_err(|error| error.to_string())
+}
+
+static APP: OnceLock<RwLock<Option<tauri::AppHandle>>> = OnceLock::new();
+
+fn app_slot() -> &'static RwLock<Option<tauri::AppHandle>> {
+    APP.get_or_init(|| RwLock::new(None))
+}
+
+fn emit(event: &str, payload: impl Serialize + Clone) {
+    if let Some(app) = app_slot()
+        .read()
+        .expect("app handle lock poisoned")
+        .as_ref()
+    {
+        let _ = app.emit(event, payload);
+    }
+}
+
+pub fn request_refresh() {
+    emit("state-changed", ());
+}
+
+pub fn report_status(message: impl Into<String>) {
+    emit("operation-status", message.into());
+}
+
+pub fn report_settings_saved() {
+    report_status("设置已保存");
+    request_refresh();
+}
+
+pub fn report_generated_token(token: String) {
+    emit("token-generated", token);
+}
+
+pub fn quit_event_loop() {
+    if let Some(app) = app_slot()
+        .read()
+        .expect("app handle lock poisoned")
+        .as_ref()
+    {
+        app.exit(0);
+    }
+}
+
+pub fn run_desktop(
+    _snapshot: AppSnapshot,
+    address: String,
+    actions: UiActions,
+) -> Result<(), tauri::Error> {
+    let state = DesktopState {
+        address,
+        actions: actions.clone(),
+    };
+    tauri::Builder::default()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            get_bootstrap,
+            load_model,
+            eject_model,
+            rescan_models,
+            save_engine_settings,
+            save_server_settings,
+            get_logs,
+            export_logs,
+            generate_token,
+            minimize,
+            toggle_maximize,
+            close_window
+        ])
+        .setup(move |app| {
+            *app_slot().write().expect("app handle lock poisoned") = Some(app.handle().clone());
+            setup_tray(app, actions.clone())?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                if let Some(state) = window.try_state::<DesktopState>() {
+                    if let Some(message) = (state.actions.close_notice)() {
+                        emit("close-notice", message);
+                    }
+                }
+            }
+        })
+        .run(tauri::generate_context!())?;
+    *app_slot().write().expect("app handle lock poisoned") = None;
+    Ok(())
+}
+
+fn setup_tray(app: &mut tauri::App, actions: UiActions) -> tauri::Result<()> {
+    use tauri::{
+        menu::{Menu, MenuItem},
+        tray::TrayIconBuilder,
+    };
+    let open = MenuItem::with_id(app, "open", "打开 Model Launcher", true, None::<&str>)?;
+    let eject = MenuItem::with_id(app, "eject", "卸载当前模型", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &eject, &quit])?;
+    TrayIconBuilder::new()
+        .menu(&menu)
+        .on_menu_event(move |app, event| match event.id.as_ref() {
+            "open" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "eject" => (actions.eject)(),
+            "quit" => (actions.quit)(),
+            _ => {}
+        })
+        .build(app)?;
+    Ok(())
+}
+
+pub fn configuration_diagnostic_status(
+    diagnostic: Option<&model_launcher_core::ConfigDiagnostic>,
+) -> Option<String> {
+    diagnostic.map(ToString::to_string)
+}
+
+pub fn parse_server_settings(
+    bind_address: String,
+    port: i32,
+    auth_enabled: bool,
+) -> Result<UiServerSettings, String> {
+    bind_address
+        .parse::<IpAddr>()
+        .map_err(|_| "监听地址必须是有效的 IPv4 或 IPv6 地址".to_string())?;
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| "端口必须介于 1 和 65535 之间".to_string())?;
+    Ok(UiServerSettings {
+        bind_address,
+        port,
+        auth_enabled,
+    })
+}
+
+pub fn server_authentication_status(settings: &UiServerSettings) -> &'static str {
+    if settings.auth_enabled {
+        "Bearer Token 已启用"
+    } else {
+        "认证未启用"
+    }
+}
+
+pub fn server_base_url(settings: &UiServerSettings) -> String {
+    format!("http://{}:{}", settings.bind_address, settings.port)
+}
+
+pub fn server_lan_warning(settings: &UiServerSettings) -> &'static str {
+    match settings.bind_address.parse::<IpAddr>() {
+        Ok(address) if !address.is_loopback() && !settings.auth_enabled => {
+            "当前监听地址可被其他设备访问，且未启用身份验证。"
+        }
+        _ => "",
+    }
+}
+
+pub struct CloseNoticeStore {
+    path: PathBuf,
+}
+
+impl CloseNoticeStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn load(&self) -> CloseNotice {
+        CloseNotice {
+            pending: !self.path.exists(),
+        }
+    }
+
+    pub fn save(&self, notice: &CloseNotice) -> std::io::Result<()> {
+        if !notice.pending {
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&self.path, b"shown")?;
+        }
+        Ok(())
+    }
+}
+
+pub struct CloseNotice {
+    pending: bool,
+}
+
+impl CloseNotice {
+    pub fn take(&mut self) -> Option<&'static str> {
+        self.pending.then(|| {
+            self.pending = false;
+            "Model Launcher 将继续在系统托盘中运行。"
+        })
+    }
+}
+
+fn format_bytes(value: u64) -> String {
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if value as f64 >= GB {
+        format!("{:.1} GB", value as f64 / GB)
+    } else {
+        format!("{:.0} MB", value as f64 / MB)
+    }
+}

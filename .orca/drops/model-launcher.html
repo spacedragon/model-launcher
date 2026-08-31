@@ -1,0 +1,1266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Launcher</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{
+  --canvas:#0D0E11; --surface:#14161A; --elevated:#1A1D22; --input:#101216; --hover:#20242B;
+  --b-subtle:#22262D; --b:#2C313A; --b-strong:#3A404A;
+  --t:#E8EAED; --t2:#9AA1AB; --t3:#6A717C; --on:#fff;
+  --acc:#4C8DFF; --acc-dim:#1E3358;
+  --run:#3FB950; --run-dim:#12331D;
+  --warn:#D29922; --warn-dim:#3A2D0B;
+  --dang:#F85149; --dang-dim:#3D1613;
+  --idle:#5A616B;
+  --r-sm:6px; --r-md:8px; --r-lg:10px;
+  --sans:"Inter",-apple-system,"Segoe UI",system-ui,"PingFang SC","Microsoft YaHei",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SF Mono","Cascadia Mono",Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  font-family:var(--sans); font-size:13px; color:var(--t);
+  background:#000; -webkit-font-smoothing:antialiased;
+}
+button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:3px}
+.mono{font-family:var(--mono)}
+.dot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--idle)}
+.dot.run{background:var(--run)} .dot.warn{background:var(--warn)}
+.dot.dang{background:var(--dang)} .dot.acc{background:var(--acc)}
+
+/* ---------- window shell ---------- */
+.app{
+  height:100%; display:grid; grid-template-rows:40px 1fr 30px;
+  background:var(--canvas); overflow:hidden;
+}
+.titlebar{
+  display:flex;align-items:center;gap:10px;padding:0 14px 0 16px;
+  background:var(--surface);border-bottom:1px solid var(--b-subtle);
+}
+.mark{width:14px;height:14px;border-radius:4px;background:var(--acc)}
+.titlebar .name{font-size:12.5px;font-weight:500}
+.titlebar .ver{font-family:var(--mono);font-size:11px;color:var(--t3)}
+.titlebar .spacer{flex:1}
+.wctl{display:flex;gap:4px}
+.wctl button{width:30px;height:24px;border-radius:4px;color:var(--t2);font-size:11px}
+.wctl button:hover{background:var(--hover)}
+.wctl button:last-child:hover{background:var(--dang);color:#fff}
+
+.body{display:grid;grid-template-columns:212px minmax(0,1fr) 332px;min-height:0}
+.body.no-aside{grid-template-columns:212px minmax(0,1fr)}
+
+/* ---------- sidebar ---------- */
+.side{
+  background:var(--surface);border-right:1px solid var(--b-subtle);
+  padding:12px 10px;display:flex;flex-direction:column;gap:2px;
+}
+.side .kicker{font-size:10.5px;color:var(--t3);font-weight:500;padding:0 10px 8px}
+.navitem{
+  display:flex;align-items:center;gap:10px;width:100%;
+  padding:8px 10px;border-radius:var(--r-sm);color:var(--t2);font-size:13px;text-align:left;
+}
+.navitem .glyph{width:14px;height:14px;border-radius:3px;background:var(--t3);flex:none}
+.navitem .count{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--t3)}
+.navitem:hover{background:var(--hover)}
+.navitem[aria-current="true"]{background:var(--hover);color:var(--t);font-weight:500}
+.navitem[aria-current="true"] .glyph{background:var(--acc)}
+.side .grow{flex:1}
+.svccard{
+  background:var(--elevated);border:1px solid var(--b-subtle);border-radius:var(--r-md);
+  padding:11px 12px;display:flex;flex-direction:column;gap:8px;
+}
+.svccard .row{display:flex;align-items:center;gap:7px}
+.svccard .addr{font-family:var(--mono);font-size:11.5px;color:var(--t2)}
+.svccard .auth{font-size:10.5px;color:var(--t3)}
+
+/* ---------- main / views ---------- */
+main{min-width:0;overflow:hidden;display:flex}
+.view{display:none;flex:1;min-width:0;flex-direction:column}
+.view.is-active{display:flex}
+.scroll{overflow-y:auto;min-height:0;flex:1}
+.scroll::-webkit-scrollbar{width:10px}
+.scroll::-webkit-scrollbar-thumb{background:var(--b);border-radius:5px;border:3px solid transparent;background-clip:content-box}
+
+h1{font-size:19px;font-weight:600;letter-spacing:-.01em}
+.sub{font-size:11.5px;color:var(--t3);margin-top:5px}
+.pagehead{padding:20px 22px 14px;display:flex;flex-direction:column;gap:16px}
+.headrow{display:flex;align-items:center;gap:12px}
+.headrow .spacer{flex:1}
+
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:7px 14px;border-radius:var(--r-sm);font-size:12.5px;font-weight:500;
+  background:var(--elevated);border:1px solid var(--b);color:var(--t);
+}
+.btn:hover{background:var(--hover);border-color:var(--b-strong)}
+.btn.primary{background:var(--acc);border-color:var(--acc);color:var(--on)}
+.btn.primary:hover{background:#3f7ff0}
+.btn.danger{background:var(--dang-dim);border-color:var(--dang);color:var(--dang)}
+.btn.danger:hover{background:#4d1b17}
+.btn.quiet{background:none;border-color:var(--b);color:var(--t3);font-weight:400}
+.btn.quiet:hover{color:var(--t2)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+
+.search{
+  display:flex;align-items:center;gap:8px;height:32px;padding:0 10px;
+  background:var(--input);border:1px solid var(--b);border-radius:var(--r-sm);
+  font-size:12px;color:var(--t3);
+}
+.search input{
+  flex:1;background:none;border:0;color:var(--t);font:inherit;min-width:0;
+}
+.search input::placeholder{color:var(--t3)}
+
+.chips{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.chip{
+  padding:5px 11px;border-radius:999px;border:1px solid var(--b);
+  font-size:11.5px;color:var(--t3);
+}
+.chip:hover{color:var(--t2);border-color:var(--b-strong)}
+.chip[aria-pressed="true"]{background:var(--acc-dim);border-color:var(--acc);color:var(--acc);font-weight:500}
+.chip.lv[aria-pressed="true"]{background:var(--warn-dim);border-color:var(--warn);color:var(--warn)}
+.chip.lv.err[aria-pressed="true"]{background:var(--dang-dim);border-color:var(--dang);color:var(--dang)}
+
+.tag{
+  display:inline-flex;align-items:center;padding:3px 7px;border-radius:4px;
+  font-family:var(--mono);font-size:10.5px;font-weight:500;color:var(--t2);
+  border:1px solid var(--b-subtle);
+}
+.tag.run{background:var(--run-dim);border-color:transparent;color:var(--run)}
+.tag.warn{background:var(--warn-dim);border-color:transparent;color:var(--warn)}
+.tag.dang{background:var(--dang-dim);border-color:transparent;color:var(--dang)}
+.tag.acc{background:var(--acc-dim);border-color:transparent;color:var(--acc)}
+.tag.plain{background:var(--input)}
+
+/* ---------- model list ---------- */
+.list{padding:0 22px 20px;display:flex;flex-direction:column;gap:8px}
+.mrow{
+  display:flex;align-items:center;gap:14px;width:100%;text-align:left;
+  background:var(--surface);border:1px solid var(--b-subtle);border-radius:var(--r-md);
+  padding:14px 16px;
+}
+.mrow:hover{border-color:var(--b)}
+.mrow[data-state="running"]{background:var(--elevated);border-color:var(--acc)}
+.mrow .meta{display:flex;flex-direction:column;gap:6px;min-width:0}
+.mrow .title{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.mrow .title b{font-size:13.5px;font-weight:600}
+.mrow .file{font-family:var(--mono);font-size:11px;color:var(--t3);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .spacer{flex:1}
+.mrow .specs{display:flex;gap:6px;flex:none}
+.mrow[data-state="missing"] .title b{color:var(--t2)}
+
+/* ---------- aside ---------- */
+aside{
+  background:var(--surface);border-left:1px solid var(--b-subtle);
+  padding:18px;overflow-y:auto;display:flex;flex-direction:column;gap:16px;
+}
+.body.no-aside aside{display:none}
+.panel{display:none;flex-direction:column;gap:16px}
+.panel.is-active{display:flex}
+.plabel{font-size:10.5px;color:var(--t3);font-weight:500}
+.card{
+  background:var(--elevated);border:1px solid var(--b);border-radius:var(--r-lg);
+  padding:14px;display:flex;flex-direction:column;gap:12px;
+}
+.card.flat{background:var(--input);border-color:var(--b-subtle)}
+.card .head{display:flex;align-items:center;gap:8px;font-size:14px;font-weight:600}
+.kv{display:flex;align-items:center;gap:8px;font-size:11.5px}
+.kv span:first-child{color:var(--t2)}
+.kv span:last-child{margin-left:auto;font-family:var(--mono);color:var(--t)}
+.card .actions{display:flex;gap:8px}
+.card .actions .btn{flex:1}
+.note{
+  border-radius:var(--r-md);padding:12px 13px;display:flex;flex-direction:column;gap:6px;
+  font-size:10.5px;line-height:1.5;color:var(--t2);
+}
+.note b{font-size:11.5px;font-weight:500}
+.note .row{display:flex;align-items:center;gap:8px}
+.note.warn{background:var(--warn-dim);border:1px solid var(--warn)} .note.warn b{color:var(--warn)}
+.note.acc{background:var(--acc-dim);border:1px solid var(--acc)} .note.acc b{color:var(--acc)}
+.note.flat{background:var(--input);border:1px solid var(--b-subtle)}
+.recent{display:flex;flex-direction:column;gap:6px}
+.recent button{
+  display:flex;align-items:center;gap:10px;width:100%;padding:9px 11px;
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-sm);
+  font-size:11.5px;color:var(--t2);text-align:left;
+}
+.recent button:hover{border-color:var(--b)}
+.recent .q{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--t3)}
+.recent .go{color:var(--acc);font-weight:500;font-size:11px}
+
+/* ---------- toggle ---------- */
+.tg{
+  width:32px;height:18px;border-radius:999px;background:var(--b-strong);
+  padding:2px;flex:none;display:flex;justify-content:flex-start;
+}
+.tg[aria-pressed="true"]{background:var(--acc);justify-content:flex-end}
+.tg i{width:14px;height:14px;border-radius:50%;background:#fff;display:block}
+@media (prefers-reduced-motion:no-preference){
+  .tg{transition:background .15s} .tg i{transition:transform .15s}
+}
+
+/* ---------- detail / params ---------- */
+.detailbar{
+  display:flex;align-items:center;gap:12px;padding:18px 22px;
+  border-bottom:1px solid var(--b-subtle);
+}
+.crumb{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--t3);margin-bottom:6px}
+.crumb button{color:var(--t3)} .crumb button:hover{color:var(--t2)}
+.detailbar h2{font-size:17px;font-weight:600;display:flex;align-items:center;gap:9px}
+.detailbar .spacer{flex:1}
+.params{padding:20px 22px;display:flex;flex-direction:column;gap:22px}
+.srcrow{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--t2)}
+.srcrow .hint{margin-left:auto;font-size:11px;color:var(--t3)}
+.seg{display:flex;gap:2px;padding:3px;background:var(--input);border:1px solid var(--b-subtle);border-radius:7px}
+.seg button{padding:6px 13px;border-radius:5px;font-size:12px;color:var(--t3)}
+.seg button[aria-pressed="true"]{background:var(--elevated);border:1px solid var(--b);color:var(--t);font-weight:500}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px 20px}
+.field{display:flex;flex-direction:column;gap:8px}
+.field .lab{display:flex;align-items:center;gap:7px;font-size:12px;font-weight:500;color:var(--t2)}
+.field .ctl{
+  display:flex;align-items:center;gap:8px;height:34px;padding:0 11px;
+  background:var(--input);border:1px solid var(--b);border-radius:var(--r-sm);
+}
+.field .ctl:focus-within{border-color:var(--acc)}
+.field .ctl input,.field .ctl select{
+  flex:1;min-width:0;background:none;border:0;color:var(--t);
+  font-family:var(--mono);font-size:12.5px;
+}
+.field .ctl select{font-family:var(--mono);cursor:pointer}
+.field .ctl select option{background:var(--elevated)}
+.field .ctl .suffix{font-family:var(--mono);font-size:11px;color:var(--t3)}
+.field .hint{font-size:10.5px;color:var(--t3)}
+.bar{height:4px;border-radius:2px;background:var(--b-strong);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:2px;background:var(--acc)}
+.bar.ok i{background:var(--run)} .bar.warn i{background:var(--warn)}
+.caps{display:flex;flex-direction:column;gap:7px}
+.caps .c{display:flex;align-items:center;gap:8px;font-size:11px}
+.caps .c .f{font-family:var(--mono);color:var(--t2)}
+.caps .c.off .f{color:var(--t3)}
+.caps .c .m{margin-left:auto;font-size:10px;color:var(--t3)}
+.caps .c .y{color:var(--run);font-weight:500}
+.caps .c .n{color:var(--t3)}
+
+/* ---------- api page ---------- */
+.apipage{padding:20px 22px;display:flex;flex-direction:column;gap:20px}
+.hero{
+  background:var(--elevated);border:1px solid var(--b);border-radius:var(--r-lg);
+  padding:16px 18px;display:flex;flex-direction:column;gap:14px;
+}
+.hero .top{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.hero .url{font-family:var(--mono);font-size:17px;font-weight:500}
+.hero .top .spacer{flex:1}
+.hero .stats{display:flex;gap:26px;flex-wrap:wrap}
+.hero .stats div{display:flex;flex-direction:column;gap:4px}
+.hero .stats dt{font-size:10.5px;color:var(--t3)}
+.hero .stats dd{font-family:var(--mono);font-size:12.5px;color:var(--t2)}
+.group{display:flex;flex-direction:column;gap:10px}
+.group h3{font-size:12.5px;font-weight:600;display:flex;align-items:baseline;gap:8px}
+.group h3 span{font-size:10.5px;font-weight:400;color:var(--t3)}
+.routes{background:var(--surface);border:1px solid var(--b-subtle);border-radius:var(--r-md);overflow:hidden}
+.route{display:flex;align-items:center;gap:12px;padding:11px 14px}
+.route+.route{border-top:1px solid var(--b-subtle)}
+.route .m{width:46px;justify-content:center;flex:none}
+.route .p{font-family:var(--mono);font-size:12.5px}
+.route .d{margin-left:auto;font-size:11px;color:var(--t3)}
+.limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.limits div{
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-md);
+  padding:11px 13px;display:flex;flex-direction:column;gap:6px;
+}
+.limits dt{font-size:10.5px;color:var(--t3)}
+.limits dd{font-family:var(--mono);font-size:14px;font-weight:500}
+.tokenbox{
+  display:flex;align-items:center;gap:8px;padding:9px 11px;
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-sm);
+  font-family:var(--mono);font-size:11.5px;color:var(--t3);
+}
+
+/* ---------- logs ---------- */
+.logpage{padding:20px 22px;display:flex;flex-direction:column;gap:16px;flex:1;min-height:0}
+.logbar{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  background:var(--surface);border:1px solid var(--b-subtle);border-radius:var(--r-md);
+  padding:10px 12px;
+}
+.logbar .lbl{font-size:10.5px;color:var(--t3)}
+.logbar .sep{width:1px;height:18px;background:var(--b)}
+.logbar .spacer{flex:1}
+.logbar .search{width:190px;height:30px}
+.logbar .buf{font-family:var(--mono);font-size:10.5px;color:var(--t3)}
+.stream{
+  flex:1;min-height:0;overflow-y:auto;padding:6px 0;
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-md);
+}
+.stream::-webkit-scrollbar{width:10px}
+.stream::-webkit-scrollbar-thumb{background:var(--b);border-radius:5px;border:3px solid transparent;background-clip:content-box}
+.line{display:flex;align-items:baseline;gap:10px;padding:6px 14px;font-family:var(--mono);font-size:11px}
+.line .ts{color:var(--t3);flex:none}
+.line .lv{width:50px;justify-content:center;flex:none}
+.line .src{width:62px;justify-content:center;flex:none}
+.line .msg{color:var(--t2);word-break:break-all}
+.line.ERROR{background:var(--dang-dim)} .line.ERROR .msg{color:var(--dang)}
+.line.WARN .msg{color:var(--warn)}
+.logfoot{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--t3)}
+.logfoot .spacer{flex:1}
+
+/* ---------- settings ---------- */
+.setpage{padding:22px;display:flex;justify-content:center}
+.setcol{width:100%;max-width:880px;display:flex;flex-direction:column;gap:16px}
+.sect{
+  background:var(--surface);border:1px solid var(--b-subtle);border-radius:var(--r-lg);
+  padding:15px 16px;display:flex;flex-direction:column;gap:13px;
+}
+.sect h3{font-size:13px;font-weight:600}
+.sect .desc{font-size:11px;color:var(--t3);margin-top:4px}
+.dirrow{
+  display:flex;align-items:center;gap:10px;padding:9px 12px;
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-sm);
+}
+.dirrow .p{font-family:var(--mono);font-size:12px}
+.dirrow .n{margin-left:auto;font-size:10.5px;color:var(--t3)}
+.dirrow .n.bad{color:var(--dang)}
+.dirrow .rm{font-size:11px;color:var(--t3)}
+.dirrow .rm:hover{color:var(--dang)}
+.setrow{display:flex;align-items:center;gap:14px}
+.setrow .txt{display:flex;flex-direction:column;gap:3px}
+.setrow .txt b{font-size:12px;font-weight:400;color:var(--t2)}
+.setrow .txt span{font-size:10.5px;color:var(--t3)}
+.setrow .ctlwrap{margin-left:auto;display:flex;align-items:center;gap:8px}
+.inp{
+  height:32px;padding:0 11px;background:var(--input);border:1px solid var(--b);
+  border-radius:var(--r-sm);color:var(--t);font-family:var(--mono);font-size:12px;
+}
+.inp:focus{outline:none;border-color:var(--acc)}
+.convert{
+  display:flex;align-items:center;gap:9px;padding:10px 12px;flex-wrap:wrap;
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-sm);
+  font-family:var(--mono);font-size:11px;color:var(--t3);
+}
+.convert .to{color:var(--acc)} .convert .out{color:var(--t2)}
+.convert .tag{margin-left:auto}
+.gridfields{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:14px}
+.gridfields label{display:flex;flex-direction:column;gap:7px;font-size:11.5px;color:var(--t2)}
+
+/* ---------- status bar ---------- */
+.statusbar{
+  display:flex;align-items:center;gap:14px;padding:0 16px;
+  background:var(--surface);border-top:1px solid var(--b-subtle);
+  font-family:var(--mono);font-size:11px;color:var(--t3);
+}
+.statusbar .spacer{flex:1}
+.statusbar .right{display:flex;align-items:center;gap:7px;font-family:var(--sans);color:var(--t2)}
+
+/* ---------- tray ---------- */
+.tray{
+  position:absolute;top:44px;right:14px;width:286px;z-index:40;
+  background:var(--surface);border:1px solid var(--b);border-radius:var(--r-lg);
+  box-shadow:0 8px 24px rgba(0,0,0,.55);overflow:hidden;
+}
+.tray[hidden]{display:none}
+.tray .th{padding:13px 14px 12px;border-bottom:1px solid var(--b-subtle);display:flex;flex-direction:column;gap:7px}
+.tray .th .row{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:500}
+.tray .th .m{font-family:var(--mono);font-size:10.5px;color:var(--t3)}
+.tray .g{padding:6px 0}
+.tray .g+.g{border-top:1px solid var(--b-subtle)}
+.tray .g .kicker{font-size:10px;color:var(--t3);font-weight:500;padding:2px 14px 6px}
+.tray button.item{display:flex;align-items:center;gap:10px;width:100%;padding:8px 14px;font-size:12px;color:var(--t2);text-align:left}
+.tray button.item:hover{background:var(--hover)}
+.tray button.item .q{margin-left:auto;font-family:var(--mono);font-size:10.5px;color:var(--t3)}
+.tray button.item.dang{color:var(--dang)}
+
+/* ---------- dialogs ---------- */
+.scrim{
+  position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.55);padding:20px;
+}
+.scrim[hidden]{display:none}
+.dlg{
+  width:100%;background:var(--elevated);border:1px solid var(--b);border-radius:var(--r-lg);
+  box-shadow:0 8px 24px rgba(0,0,0,.55);padding:18px 20px;
+  display:flex;flex-direction:column;gap:14px;
+}
+.dlg h2{font-size:15px;font-weight:600;display:flex;align-items:center;gap:9px}
+.dlg .foot{display:flex;gap:9px;justify-content:flex-end}
+.dlg p{font-size:11px;line-height:1.55;color:var(--t3)}
+#dlg-load .dlg{max-width:400px}
+#dlg-token .dlg{max-width:470px}
+#dlg-error .dlg{max-width:470px}
+.steps{display:flex;flex-direction:column;gap:8px;font-size:11.5px}
+.steps div{display:flex;align-items:center;gap:9px;color:var(--t2)}
+.steps .ok{color:var(--run);font-weight:500}
+.steps .now{color:var(--warn)}
+.steps .todo{color:var(--t3)}
+.steps div.todo{color:var(--t3)}
+.stderr{
+  background:var(--input);border:1px solid var(--b-subtle);border-radius:var(--r-sm);
+  padding:11px 12px;display:flex;flex-direction:column;gap:5px;
+  font-family:var(--mono);font-size:10.5px;color:var(--t3);
+}
+.fixes{display:flex;flex-direction:column;gap:7px;font-size:11.5px;color:var(--t2)}
+.fixes .k{font-size:10.5px;color:var(--t3);font-weight:500}
+
+/* ---------- responsive ---------- */
+@media (max-width:1180px){
+  .body{grid-template-columns:212px minmax(0,1fr)}
+  aside{display:none}
+}
+@media (max-width:820px){
+  .body,.body.no-aside{grid-template-columns:56px minmax(0,1fr)}
+  .side{padding:12px 8px;align-items:center}
+  .side .kicker,.navitem span,.navitem .count,.svccard{display:none}
+  .navitem{justify-content:center;padding:9px}
+  .mrow .specs,.mrow .file{display:none}
+  .statusbar span:nth-child(n+2):not(.right){display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- title bar -->
+  <div class="titlebar">
+    <div class="mark"></div>
+    <div class="name">Model Launcher</div>
+    <div class="ver">v0.4.1</div>
+    <div class="spacer"></div>
+    <button class="btn quiet" id="trayBtn" aria-expanded="false" style="padding:4px 10px;font-size:11.5px">托盘菜单</button>
+    <div class="wctl">
+      <button aria-label="最小化">—</button>
+      <button aria-label="最大化">□</button>
+      <button aria-label="关闭">✕</button>
+    </div>
+  </div>
+
+  <div class="body" id="body">
+
+    <!-- sidebar -->
+    <nav class="side">
+      <div class="kicker">导航</div>
+      <button class="navitem" data-nav="models" aria-current="true"><i class="glyph"></i><span>模型库</span><em class="count" style="font-style:normal">24</em></button>
+      <button class="navitem" data-nav="api"><i class="glyph"></i><span>API 服务</span></button>
+      <button class="navitem" data-nav="logs"><i class="glyph"></i><span>日志与诊断</span><em class="count" style="font-style:normal">3</em></button>
+      <button class="navitem" data-nav="settings"><i class="glyph"></i><span>设置</span></button>
+      <div class="grow"></div>
+      <div class="svccard">
+        <div class="row"><i class="dot run"></i><b style="font-size:11.5px;font-weight:500">API 服务运行中</b></div>
+        <div class="addr">127.0.0.1:1234</div>
+        <div class="row"><i class="dot warn" style="width:6px;height:6px"></i><span class="auth">Bearer Token 已启用</span></div>
+      </div>
+    </nav>
+
+    <main>
+
+      <!-- ===== models ===== -->
+      <section class="view is-active" data-view="models">
+        <div class="pagehead">
+          <div class="headrow">
+            <div>
+              <h1>模型库</h1>
+              <div class="sub mono">D:\models &nbsp;·&nbsp; 递归扫描 &nbsp;·&nbsp; <span id="modelCount">24</span> 个模型 &nbsp;·&nbsp; 上次扫描 14:32</div>
+            </div>
+            <div class="spacer"></div>
+            <div class="search" style="width:282px">
+              <span>⌕</span><input id="modelSearch" placeholder="搜索模型名称、架构或量化格式" aria-label="搜索模型">
+            </div>
+            <button class="btn">重新扫描</button>
+          </div>
+          <div class="headrow">
+            <div class="chips" id="modelFilters">
+              <button class="chip" data-filter="all" aria-pressed="true">全部 24</button>
+              <button class="chip" data-filter="ready">已就绪 21</button>
+              <button class="chip" data-filter="running">运行中 1</button>
+              <button class="chip" data-filter="sharded">分片模型 3</button>
+              <button class="chip" data-filter="missing">文件丢失 1</button>
+            </div>
+            <div class="spacer"></div>
+            <span style="font-size:11.5px;color:var(--t3)">排序：最近使用 ▾</span>
+          </div>
+        </div>
+        <div class="scroll"><div class="list" id="modelList"></div></div>
+      </section>
+
+      <!-- ===== detail ===== -->
+      <section class="view" data-view="detail">
+        <div class="detailbar">
+          <div>
+            <div class="crumb"><button data-nav="models">← 模型库</button><span>/</span><span>运行参数</span></div>
+            <h2>Qwen2.5-32B-Instruct <span class="tag run">运行中</span></h2>
+          </div>
+          <div class="spacer"></div>
+          <button class="btn quiet">恢复全局默认</button>
+          <button class="btn primary">保存并重启模型</button>
+        </div>
+        <div class="scroll">
+          <div class="params">
+            <div class="srcrow">
+              <span style="font-weight:500">参数来源</span>
+              <div class="seg" id="paramSrc">
+                <button data-src="global">全局默认</button>
+                <button data-src="model" aria-pressed="true">模型级覆盖</button>
+              </div>
+              <span class="hint">仅显示当前 llama-server 支持的参数</span>
+            </div>
+
+            <div class="grid2">
+              <div class="field">
+                <div class="lab">上下文长度 <span class="tag plain">--ctx-size</span></div>
+                <div class="ctl"><input value="32768" id="ctxSize"><span class="suffix">tokens</span></div>
+                <div class="bar"><i id="ctxBar" style="width:25%"></i></div>
+                <div class="hint">模型上限 131072 · 显存占用随该值线性增长</div>
+              </div>
+              <div class="field">
+                <div class="lab">GPU 卸载层数 <span class="tag plain">--n-gpu-layers</span></div>
+                <div class="ctl"><input value="65"><span class="suffix">/ 65 层</span></div>
+                <div class="bar ok"><i style="width:100%"></i></div>
+                <div class="hint">全部层已卸载到 GPU</div>
+              </div>
+              <div class="field">
+                <div class="lab">CPU 线程数 <span class="tag plain">--threads</span></div>
+                <div class="ctl"><input value="12"></div>
+                <div class="hint">建议不超过物理核心数</div>
+              </div>
+              <div class="field">
+                <div class="lab">批处理大小 <span class="tag plain">--batch-size</span></div>
+                <div class="ctl"><input value="512"></div>
+              </div>
+              <div class="field">
+                <div class="lab">并行槽位 <span class="tag plain">--parallel</span></div>
+                <div class="ctl"><input value="4"></div>
+                <div class="hint">决定可同时处理的推理请求数</div>
+              </div>
+              <div class="field">
+                <div class="lab">KV Cache 类型 <span class="tag plain">--cache-type-k / -v</span></div>
+                <div class="ctl"><select><option>q8_0</option><option>f16</option><option>q4_0</option></select></div>
+                <div class="hint">可选项由引擎探测结果决定</div>
+              </div>
+              <div class="field">
+                <div class="lab">Flash Attention <span class="tag plain">--flash-attn</span></div>
+                <div class="ctl"><span style="font-size:12.5px">已启用</span><span style="flex:1"></span>
+                  <button class="tg" aria-pressed="true" aria-label="Flash Attention"><i></i></button></div>
+                <div class="hint">当前引擎构建支持</div>
+              </div>
+            </div>
+
+            <div class="note acc"><div class="row"><i class="dot acc"></i>
+              <span style="font-size:11.5px">保存后应用会停止当前 llama-server 再以新参数启动；对外 API 地址 127.0.0.1:1234 保持不变。</span></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== api ===== -->
+      <section class="view" data-view="api">
+        <div class="scroll">
+          <div class="apipage">
+            <div>
+              <h1>API 服务</h1>
+              <div class="sub">对外地址固定不变；模型重启或切换时调用方无需改动配置</div>
+            </div>
+
+            <div class="hero">
+              <div class="top">
+                <i class="dot run"></i>
+                <span class="url">http://127.0.0.1:1234</span>
+                <button class="tag acc" id="copyUrl">复制</button>
+                <div class="spacer"></div>
+                <button class="btn">重启服务</button>
+                <button class="btn danger">停止服务</button>
+              </div>
+              <dl class="stats">
+                <div><dt>监听地址</dt><dd>127.0.0.1</dd></div>
+                <div><dt>端口</dt><dd>1234</dd></div>
+                <div><dt>已运行</dt><dd>3d 04:12:38</dd></div>
+                <div><dt>活跃连接</dt><dd>6 / 128</dd></div>
+                <div><dt>并发请求</dt><dd>2 / 16</dd></div>
+              </dl>
+            </div>
+
+            <div class="group">
+              <h3>OpenAI 兼容接口 <span>JSON 与 SSE 流式响应</span></h3>
+              <div class="routes">
+                <div class="route"><span class="tag run m">GET</span><span class="p">/v1/models</span><span class="d">列出已发现且可调用的模型</span></div>
+                <div class="route"><span class="tag acc m">POST</span><span class="p">/v1/chat/completions</span><span class="d">对话补全 · 支持 stream=true</span></div>
+                <div class="route"><span class="tag acc m">POST</span><span class="p">/v1/completions</span><span class="d">文本补全 · 支持 stream=true</span></div>
+              </div>
+            </div>
+
+            <div class="group">
+              <h3>LM Studio 兼容接口 <span>供外部工具查询与控制模型状态</span></h3>
+              <div class="routes">
+                <div class="route"><span class="tag run m">GET</span><span class="p">/api/v1/models</span><span class="d">含加载状态与模型级参数</span></div>
+                <div class="route"><span class="tag acc m">POST</span><span class="p">/api/v1/models/load</span><span class="d">按需加载 · 返回 model_starting</span></div>
+                <div class="route"><span class="tag acc m">POST</span><span class="p">/api/v1/models/unload</span><span class="d">卸载当前模型 · 推理中返回 model_busy</span></div>
+              </div>
+            </div>
+
+            <dl class="limits">
+              <div><dt>请求体上限</dt><dd>32 MB</dd></div>
+              <div><dt>请求头上限</dt><dd>16 KB</dd></div>
+              <div><dt>最大连接数</dt><dd>128</dd></div>
+              <div><dt>最大并发请求</dt><dd>16</dd></div>
+            </dl>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== logs ===== -->
+      <section class="view" data-view="logs">
+        <div class="logpage">
+          <div class="headrow">
+            <div>
+              <h1>日志与诊断</h1>
+              <div class="sub">应用日志、引擎 stdout 与 stderr 统一视图 · 有界内存缓冲，长期运行不会无限增长</div>
+            </div>
+            <div class="spacer"></div>
+            <button class="btn" id="copyLogs">复制当前日志</button>
+            <button class="btn primary">导出诊断包</button>
+          </div>
+
+          <div class="logbar">
+            <span class="lbl">来源</span>
+            <div class="chips" id="srcFilters">
+              <button class="chip" data-src="all" aria-pressed="true">全部</button>
+              <button class="chip" data-src="app">应用</button>
+              <button class="chip" data-src="stdout">引擎 stdout</button>
+              <button class="chip" data-src="stderr">引擎 stderr</button>
+            </div>
+            <div class="sep"></div>
+            <span class="lbl">等级</span>
+            <div class="chips" id="lvFilters">
+              <button class="chip lv err" data-lv="ERROR" aria-pressed="true">ERROR</button>
+              <button class="chip lv" data-lv="WARN" aria-pressed="true">WARN</button>
+              <button class="chip" data-lv="INFO" aria-pressed="true">INFO</button>
+              <button class="chip" data-lv="DEBUG">DEBUG</button>
+            </div>
+            <div class="spacer"></div>
+            <div class="search"><span>⌕</span><input id="logSearch" placeholder="过滤日志内容" aria-label="过滤日志"></div>
+            <span class="buf" id="bufCount">缓冲 3218 / 5000 行</span>
+          </div>
+
+          <div class="stream" id="stream"></div>
+
+          <div class="logfoot">
+            <span>自动滚动到底部</span>
+            <button class="tg" aria-pressed="true" aria-label="自动滚动"><i></i></button>
+            <div class="spacer"></div>
+            <span>诊断包包含：配置快照（已脱敏）· 引擎探测结果 · 最近 5000 行日志</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== settings ===== -->
+      <section class="view" data-view="settings">
+        <div class="scroll">
+          <div class="setpage"><div class="setcol">
+            <div>
+              <h1>设置</h1>
+              <div class="sub">应用不负责安装 WSL、llama.cpp 或下载模型；此处只登记它们的位置与默认参数</div>
+            </div>
+
+            <section class="sect">
+              <div><h3>模型目录</h3><div class="desc">扫描 .gguf 文件；分片模型自动识别并合并为单个条目</div></div>
+              <div class="dirrow"><i class="dot run"></i><span class="p">D:\models</span><span class="n">21 个模型</span><button class="rm">移除</button></div>
+              <div class="dirrow"><i class="dot run"></i><span class="p">D:\hf-cache\gguf</span><span class="n">3 个模型</span><button class="rm">移除</button></div>
+              <div class="dirrow"><i class="dot dang"></i><span class="p">E:\models</span><span class="n bad">目录不可用</span><button class="rm">移除</button></div>
+              <div class="setrow">
+                <button class="btn">添加目录</button>
+                <button class="btn quiet">重新扫描</button>
+                <div class="ctlwrap"><span style="font-size:11.5px;color:var(--t2)">递归扫描子目录</span>
+                  <button class="tg" aria-pressed="true" aria-label="递归扫描"><i></i></button></div>
+              </div>
+            </section>
+
+            <section class="sect">
+              <div><h3>WSL 与推理引擎</h3><div class="desc">Windows 路径在启动时自动转换为 WSL 路径</div></div>
+              <div class="setrow">
+                <div class="txt"><b>WSL 发行版</b></div>
+                <div class="ctlwrap"><select class="inp" style="width:260px"><option>Ubuntu-22.04</option><option>Debian</option></select></div>
+              </div>
+              <div class="setrow">
+                <div class="txt"><b>llama-server 路径</b><span>已验证可执行 · 版本 b4892</span></div>
+                <div class="ctlwrap">
+                  <input class="inp" style="width:360px" value="/home/yulong/llama.cpp/build/bin/llama-server">
+                  <button class="btn">验证</button>
+                </div>
+              </div>
+              <div class="convert">
+                <span>D:\models\qwen2.5-32b.gguf</span><span class="to">→</span>
+                <span class="out">/mnt/d/models/qwen2.5-32b.gguf</span><span class="tag">自动转换</span>
+              </div>
+            </section>
+
+            <section class="sect">
+              <div><h3>API 服务</h3><div class="desc">地址变更需要重启服务；非本地监听且未启用认证会显示安全警告</div></div>
+              <div class="setrow">
+                <label style="display:flex;flex-direction:column;gap:7px;font-size:12px;color:var(--t2)">监听地址
+                  <input class="inp" style="width:200px" value="127.0.0.1" id="listenAddr"></label>
+                <label style="display:flex;flex-direction:column;gap:7px;font-size:12px;color:var(--t2)">端口
+                  <input class="inp" style="width:110px" value="1234"></label>
+                <div class="ctlwrap" style="align-items:flex-end">
+                  <div style="display:flex;flex-direction:column;gap:7px">
+                    <span style="font-size:12px;color:var(--t2)">Bearer Token 认证</span>
+                    <div style="display:flex;align-items:center;gap:10px;height:32px">
+                      <button class="tg" aria-pressed="true" id="authToggle" aria-label="Bearer Token 认证"><i></i></button>
+                      <button class="btn quiet" id="regenToken">重新生成</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="note warn" id="listenWarn" hidden>
+                <div class="row"><i class="dot warn"></i><b>监听地址安全提示</b></div>
+                <span>监听 0.0.0.0 且未启用认证时，局域网内任何设备都能调用本机模型。请启用 Bearer Token 或改回 127.0.0.1。</span>
+              </div>
+            </section>
+
+            <section class="sect">
+              <div><h3>全局默认启动参数</h3><div class="desc">模型未设置模型级覆盖时使用；不受支持的参数不会传给引擎</div></div>
+              <div class="gridfields">
+                <label>上下文长度<input class="inp" value="8192"></label>
+                <label>GPU 卸载层数<input class="inp" value="auto"></label>
+                <label>CPU 线程数<input class="inp" value="12"></label>
+                <label>批处理大小<input class="inp" value="512"></label>
+                <label>并行槽位<input class="inp" value="2"></label>
+              </div>
+            </section>
+
+            <section class="sect">
+              <h3>托盘与后台运行</h3>
+              <div class="setrow"><div class="txt"><b>关闭主窗口后驻留系统托盘</b><span>API 服务与已加载模型继续运行</span></div>
+                <div class="ctlwrap"><button class="tg" aria-pressed="true" aria-label="驻留托盘"><i></i></button></div></div>
+              <div class="setrow"><div class="txt"><b>退出时停止 API 服务与受管模型进程</b><span>只终止本应用启动并记录的进程</span></div>
+                <div class="ctlwrap"><button class="tg" aria-pressed="true" aria-label="退出时停止"><i></i></button></div></div>
+              <div class="setrow"><div class="txt"><b>启动应用时恢复上次加载的模型</b><span>默认关闭：仅恢复配置与模型目录</span></div>
+                <div class="ctlwrap"><button class="tg" aria-pressed="false" aria-label="恢复上次模型"><i></i></button></div></div>
+            </section>
+
+            <section class="sect">
+              <div><h3>配置持久化</h3><div class="desc">版本化 JSON · 临时文件 + 原子替换写入</div></div>
+              <div class="convert">
+                <span class="out">%LOCALAPPDATA%\ModelLauncher\config.json</span>
+                <span class="tag acc">schema v3</span>
+                <button style="margin-left:auto;font-size:11px;color:var(--acc)">打开所在目录</button>
+              </div>
+              <div class="note warn"><div class="row"><i class="dot warn"></i>
+                <span style="font-size:11px">损坏或版本不兼容的配置会被隔离为 config.corrupt-&lt;时间&gt;.json，不会被直接覆盖</span></div></div>
+            </section>
+          </div></div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- aside -->
+    <aside id="aside">
+      <div class="panel is-active" data-panel="models">
+        <div class="plabel">当前运行</div>
+        <div class="card">
+          <div class="head"><i class="dot run"></i>Qwen2.5-32B-Instruct</div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:10.5px;color:var(--t3)">API 名称</span>
+            <span class="tag plain">qwen2.5-32b-instruct</span>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:9px">
+            <div class="kv"><span>上下文长度</span><span>32768</span></div>
+            <div class="kv"><span>GPU 卸载层</span><span>65 / 65</span></div>
+            <div class="kv"><span>CPU 线程</span><span>12</span></div>
+            <div class="kv"><span>并行槽位</span><span>4</span></div>
+            <div class="kv"><span>KV Cache</span><span>q8_0</span></div>
+            <div class="kv"><span>运行时长</span><span id="uptime">01:24:07</span></div>
+          </div>
+          <div class="actions">
+            <button class="btn danger">卸载模型</button>
+            <button class="btn" data-nav="detail">运行参数</button>
+          </div>
+        </div>
+        <div class="note warn">
+          <div class="row"><i class="dot warn"></i><b>2 个请求推理中</b></div>
+          <span>模型切换已锁定，针对其他模型的请求会返回 model_busy。</span>
+        </div>
+        <div class="plabel">最近使用</div>
+        <div class="recent">
+          <button><i class="dot"></i>DeepSeek-R1-Distill-14B<span class="q">Q5_K_M</span><span class="go">加载</span></button>
+          <button><i class="dot"></i>gemma-3-12b-it<span class="q">Q4_K_M</span><span class="go">加载</span></button>
+          <button><i class="dot"></i>Llama-3.3-70B-Instruct<span class="q">Q4_K_M</span><span class="go">加载</span></button>
+        </div>
+        <div class="note flat">
+          <div class="row"><b>按需自动加载</b><span style="flex:1"></span>
+            <button class="tg" aria-pressed="true" aria-label="按需自动加载"><i></i></button></div>
+          <span>请求中的 model 字段可触发加载或空闲切换；相同模型的并发请求共享同一次加载。</span>
+        </div>
+      </div>
+
+      <div class="panel" data-panel="detail">
+        <div class="plabel">引擎能力探测</div>
+        <div class="card">
+          <div class="head" style="font-size:12px"><i class="dot run"></i>llama-server b4892</div>
+          <div class="mono" style="font-size:10.5px;color:var(--t3);line-height:1.5;word-break:break-all">/home/yulong/llama.cpp/build/bin/llama-server</div>
+          <div style="font-size:10.5px;color:var(--t3)">通过 --help 探测 · 14 项中 11 项可用</div>
+        </div>
+        <div class="caps">
+          <div class="c"><span class="y">✓</span><span class="f">--ctx-size</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--n-gpu-layers</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--threads</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--batch-size</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--parallel</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--flash-attn</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--cache-type-k</span></div>
+          <div class="c"><span class="y">✓</span><span class="f">--cache-type-v</span></div>
+          <div class="c off"><span class="n">✕</span><span class="f">--no-kv-offload</span><span class="m">不支持 · 已隐藏</span></div>
+          <div class="c off"><span class="n">✕</span><span class="f">--mlock</span><span class="m">不支持 · 已隐藏</span></div>
+          <div class="c off"><span class="n">✕</span><span class="f">--rpc</span><span class="m">不支持 · 已隐藏</span></div>
+        </div>
+        <div class="plabel">显存估算</div>
+        <div class="card flat">
+          <div class="kv"><span>权重 + KV Cache</span><span style="color:var(--warn)" id="vramText">21.4 / 24.0 GB</span></div>
+          <div class="bar warn"><i id="vramBar" style="width:89%"></i></div>
+          <span style="font-size:10.5px;color:var(--t3)">接近显存上限，降低上下文长度或改用 q4_0 KV Cache</span>
+        </div>
+      </div>
+
+      <div class="panel" data-panel="api">
+        <div class="plabel">身份验证</div>
+        <div class="card">
+          <div class="head" style="font-size:12.5px"><i class="dot run"></i>Bearer Token 已启用</div>
+          <div class="kv"><span>存储方式</span><span>Argon2id 哈希</span></div>
+          <div class="kv"><span>明文</span><span>仅创建时显示一次</span></div>
+          <div class="kv"><span>上次轮换</span><span>2026-08-14 09:12</span></div>
+          <div class="tokenbox">sk-ml-••••••••••••••••••••••</div>
+          <div class="actions"><button class="btn danger" data-open="dlg-token">重新生成 Token</button></div>
+        </div>
+        <div class="note warn">
+          <div class="row"><i class="dot warn"></i><b>监听地址安全提示</b></div>
+          <span>当前仅监听 127.0.0.1。若改为 0.0.0.0 且未启用认证，应用会在此处和托盘持续显示高危警告。</span>
+        </div>
+        <div class="note flat">
+          <b style="color:var(--t2)">日志脱敏</b>
+          <span class="mono">Authorization: Bearer ****</span>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- status bar -->
+  <div class="statusbar">
+    <span>WSL: Ubuntu-22.04</span>
+    <span>llama-server b4892</span>
+    <span>CUDA · 24 GB VRAM</span>
+    <div class="spacer"></div>
+    <span class="right"><i class="dot run" style="width:6px;height:6px"></i>引擎能力探测完成 · 11 项参数可用</span>
+  </div>
+
+  <!-- tray -->
+  <div class="tray" id="tray" hidden>
+    <div class="th">
+      <div class="row"><i class="dot run"></i>API 服务运行中</div>
+      <div class="m">127.0.0.1:1234 &nbsp;·&nbsp; Qwen2.5-32B-Instruct</div>
+    </div>
+    <div class="g">
+      <button class="item">打开主窗口</button>
+      <button class="item dang">卸载当前模型</button>
+    </div>
+    <div class="g">
+      <div class="kicker">快速加载最近模型</div>
+      <button class="item">DeepSeek-R1-Distill-14B<span class="q">Q5_K_M</span></button>
+      <button class="item">gemma-3-12b-it<span class="q">Q4_K_M</span></button>
+      <button class="item">Llama-3.3-70B-Instruct<span class="q">Q4_K_M</span></button>
+    </div>
+    <div class="g">
+      <button class="item" data-nav="logs">查看日志</button>
+      <button class="item">退出（停止服务与模型）</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== dialogs ===== -->
+<div class="scrim" id="dlg-load" hidden>
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="loadTitle">
+    <h2 id="loadTitle"><i class="dot warn"></i><span id="loadName">正在启动模型</span></h2>
+    <div class="bar warn"><i id="loadBar" style="width:20%"></i></div>
+    <div class="steps" id="loadSteps"></div>
+    <div class="logfoot" style="font-size:10.5px">
+      <span>相同模型的并发请求共享本次加载</span>
+      <div class="spacer"></div>
+      <button class="btn quiet" data-close>取消</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="dlg-token" hidden>
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="tokTitle">
+    <h2 id="tokTitle">新的 API Token 已生成</h2>
+    <div class="note warn"><div class="row"><i class="dot warn"></i>
+      <b>此 Token 只显示这一次，关闭后无法再次查看</b></div></div>
+    <div class="tokenbox" style="padding:12px;color:var(--t);font-size:12px">
+      <span id="tokValue">sk-ml-8Kq2vR7dN4xH1pLmZ6tYbW3sF9jC0aUe</span>
+      <button class="tag acc" style="margin-left:auto" id="copyTok">复制</button>
+    </div>
+    <p>配置文件中只保存 Argon2id 哈希，不保存明文。轮换后旧 Token 立即失效，日志中的 Authorization 头始终以 Bearer **** 记录。</p>
+    <div class="foot">
+      <button class="btn quiet" data-close>稍后再说</button>
+      <button class="btn primary" data-close>我已保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim" id="dlg-error" hidden>
+  <div class="dlg" role="dialog" aria-modal="true" aria-labelledby="errTitle">
+    <h2 id="errTitle" style="color:var(--dang)"><i class="dot dang"></i>模型启动失败
+      <span class="tag dang" style="margin-left:auto">exit code 1</span></h2>
+    <div style="font-size:11.5px;color:var(--t2)" id="errWhich">Llama-3.3-70B-Instruct &nbsp;·&nbsp; 健康检查超时 (30s)</div>
+    <div class="stderr">
+      <span>ggml_cuda_host_malloc: failed to allocate 39621.44 MiB</span>
+      <span>CUDA error: out of memory</span>
+      <span>llama-server exited unexpectedly (pid 51988)</span>
+    </div>
+    <div class="fixes">
+      <span class="k">建议</span>
+      <span>· 将 GPU 卸载层数从 80 降到 42（约 22 GB 显存）</span>
+      <span>· 将 KV Cache 类型改为 q4_0</span>
+      <span>· 把上下文长度从 32768 降到 8192</span>
+    </div>
+    <div class="foot">
+      <button class="btn quiet" data-nav="logs" data-close>查看完整日志</button>
+      <button class="btn primary" data-nav="detail" data-close>调整参数后重试</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ---------------- data ---------------- */
+const MODELS = [
+  { name:"Qwen2.5-32B-Instruct", file:"qwen2.5-32b-instruct-q4_k_m.gguf", size:"18.5 GB",
+    arch:"qwen2", params:"32B", quant:"Q4_K_M", state:"running" },
+  { name:"Llama-3.3-70B-Instruct", file:"llama-3.3-70b-instruct-q4_k_m-00001-of-00004.gguf", size:"39.6 GB",
+    arch:"llama", params:"70B", quant:"Q4_K_M", state:"ready", shards:4 },
+  { name:"Qwen3-Coder-30B-A3B", file:"qwen3-coder-30b-a3b-q4_k_m.gguf", size:"18.0 GB",
+    arch:"qwen3moe", params:"30B·A3B", quant:"Q4_K_M", state:"starting" },
+  { name:"DeepSeek-R1-Distill-Qwen-14B", file:"deepseek-r1-distill-qwen-14b-q5_k_m.gguf", size:"10.5 GB",
+    arch:"qwen2", params:"14B", quant:"Q5_K_M", state:"ready" },
+  { name:"gemma-3-12b-it", file:"gemma-3-12b-it-q4_k_m.gguf", size:"7.3 GB",
+    arch:"gemma3", params:"12B", quant:"Q4_K_M", state:"ready" },
+  { name:"Mistral-Small-24B", file:"E:\\models\\mistral-small-24b-q4_k_m.gguf", size:"文件未找到",
+    arch:"mistral", params:"24B", quant:"Q4_K_M", state:"missing" }
+];
+
+const LOGS = [
+  ["14:31:58.204","INFO","app","配置已加载 · schema v3 · %LOCALAPPDATA%\\ModelLauncher\\config.json"],
+  ["14:31:58.331","WARN","app","检测到不兼容的旧配置 config.json.bak，已隔离至 config.corrupt-20260831.json"],
+  ["14:31:58.902","INFO","app","WSL 发行版 Ubuntu-22.04 就绪 · llama-server b4892"],
+  ["14:31:59.117","INFO","app","引擎能力探测完成 · 14 项中 11 项可用 · 已隐藏 --no-kv-offload / --mlock / --rpc"],
+  ["14:32:00.004","DEBUG","app","模型 ID 映射表已重建 · 24 条 · 3 条来自分片合并"],
+  ["14:32:03.480","INFO","app","扫描完成 · D:\\models · 24 个模型 · 3 个分片组已合并"],
+  ["14:32:03.512","ERROR","app","模型文件缺失 E:\\models\\mistral-small-24b-q4_k_m.gguf · 配置记录已保留"],
+  ["14:36:11.008","INFO","app","路径转换 D:\\models\\qwen2.5-32b-instruct-q4_k_m.gguf → /mnt/d/models/qwen2.5-32b-instruct-q4_k_m.gguf"],
+  ["14:36:11.240","INFO","stdout","llama_model_loader: loaded meta data with 31 key-value pairs"],
+  ["14:36:14.885","INFO","stdout","llama_kv_cache: KV self size = 4096.00 MiB, type = q8_0"],
+  ["14:36:16.302","INFO","app","健康检查通过 (2.9s) · 模型标记为可用 · slots = 4"],
+  ["14:41:02.771","INFO","app","POST /v1/chat/completions · model=qwen2.5-32b-instruct · Authorization: Bearer ****"],
+  ["14:41:02.774","WARN","app","POST /v1/chat/completions · model=gemma-3-12b-it · 拒绝：model_busy（当前模型推理中）"],
+  ["14:48:19.560","ERROR","stderr","CUDA error: out of memory · llama-server 进程退出 code=1"],
+  ["14:48:19.562","WARN","app","受管进程异常退出 pid=48213 · 指数退避重启 第 1 次 · 等待 2s"],
+  ["14:48:21.640","ERROR","app","健康检查超时 (30s) · 启动失败：显存不足，建议降低 --ctx-size 或 --n-gpu-layers"],
+  ["14:48:21.644","INFO","app","已停止重启尝试 · 仅终止本应用记录的 pid，未按进程名批量结束"]
+];
+
+const SRC_LABEL = { app:"应用", stdout:"stdout", stderr:"stderr" };
+const $  = (s, r) => (r || document).querySelector(s);
+const $$ = (s, r) => Array.from((r || document).querySelectorAll(s));
+const el = (tag, cls, txt) => { const n = document.createElement(tag);
+  if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
+
+/* ---------------- views ---------------- */
+function setView(name) {
+  $$(".view").forEach(v => v.classList.toggle("is-active", v.dataset.view === name));
+  const navKey = name === "detail" ? "models" : name;
+  $$(".navitem").forEach(b => b.setAttribute("aria-current", String(b.dataset.nav === navKey)));
+  let hasPanel = false;
+  $$(".panel").forEach(p => {
+    const on = p.dataset.panel === name;
+    p.classList.toggle("is-active", on);
+    hasPanel = hasPanel || on;
+  });
+  $("#body").classList.toggle("no-aside", !hasPanel);
+  const scroller = $(".view.is-active .scroll") || $(".view.is-active .stream");
+  if (scroller) scroller.scrollTop = 0;
+}
+
+document.addEventListener("click", e => {
+  const nav = e.target.closest("[data-nav]");
+  if (nav) { setView(nav.dataset.nav); closeTray(); }
+  const open = e.target.closest("[data-open]");
+  if (open) showDialog(open.dataset.open);
+  if (e.target.closest("[data-close]")) closeDialogs();
+  const tg = e.target.closest(".tg");
+  if (tg) tg.setAttribute("aria-pressed", tg.getAttribute("aria-pressed") !== "true");
+});
+
+/* ---------------- model list ---------------- */
+const STATE = {
+  running: { dot:"run",  tag:["运行中","run"],                 action:["卸载",""] },
+  starting:{ dot:"warn", tag:["启动中 · 等待健康检查","warn"], action:["取消","quiet"] },
+  missing: { dot:"dang", tag:["文件丢失 · 配置已保留","dang"], action:["重新连接","danger"] },
+  ready:   { dot:"",     tag:null,                             action:["加载","primary"] }
+};
+
+let modelFilter = "all", modelQuery = "";
+
+function matches(m) {
+  if (modelFilter === "ready"    && m.state !== "ready")   return false;
+  if (modelFilter === "running"  && m.state !== "running") return false;
+  if (modelFilter === "missing"  && m.state !== "missing") return false;
+  if (modelFilter === "sharded"  && !m.shards)             return false;
+  if (!modelQuery) return true;
+  const hay = (m.name + m.file + m.arch + m.quant + m.params).toLowerCase();
+  return hay.includes(modelQuery);
+}
+
+function renderModels() {
+  const list = $("#modelList");
+  list.textContent = "";
+  const rows = MODELS.filter(matches);
+  $("#modelCount").textContent = String(rows.length);
+
+  if (!rows.length) {
+    const empty = el("div", "note flat");
+    empty.append(el("b", null, "没有匹配的模型"),
+      el("span", null, "换个关键词，或把包含 .gguf 的目录添加到设置里的模型目录。"));
+    list.append(empty);
+    return;
+  }
+
+  rows.forEach(m => {
+    const s = STATE[m.state];
+    const row = el("button", "mrow");
+    row.dataset.state = m.state;
+
+    row.append(el("i", "dot " + s.dot));
+
+    const meta = el("div", "meta");
+    const title = el("div", "title");
+    title.append(el("b", null, m.name));
+    if (m.shards) title.append(el("span", "tag", "分片 ×" + m.shards));
+    if (s.tag) title.append(el("span", "tag " + s.tag[1], s.tag[0]));
+    meta.append(title, el("div", "file", m.file + "  ·  " + m.size));
+    row.append(meta, el("div", "spacer"));
+
+    const specs = el("div", "specs");
+    [m.arch, m.params, m.quant].forEach(v => specs.append(el("span", "tag plain", v)));
+    row.append(specs);
+
+    const btn = el("span", "btn " + s.action[1], s.action[0]);
+    row.append(btn);
+
+    row.addEventListener("click", ev => {
+      if (ev.target === btn || btn.contains(ev.target)) {
+        if (m.state === "ready") startLoad(m);
+        else if (m.state === "missing") showDialog("dlg-error", m);
+        return;
+      }
+      if (m.state === "running") setView("detail");
+    });
+    list.append(row);
+  });
+}
+
+$("#modelFilters").addEventListener("click", e => {
+  const c = e.target.closest(".chip"); if (!c) return;
+  modelFilter = c.dataset.filter;
+  $$("#modelFilters .chip").forEach(b => b.setAttribute("aria-pressed", String(b === c)));
+  renderModels();
+});
+$("#modelSearch").addEventListener("input", e => {
+  modelQuery = e.target.value.trim().toLowerCase();
+  renderModels();
+});
+
+/* ---------------- logs ---------------- */
+let srcFilter = "all";
+const levels = new Set(["ERROR", "WARN", "INFO"]);
+let logQuery = "";
+
+function renderLogs() {
+  const stream = $("#stream");
+  stream.textContent = "";
+  const rows = LOGS.filter(([, lv, src, msg]) =>
+    levels.has(lv) &&
+    (srcFilter === "all" || srcFilter === src) &&
+    (!logQuery || msg.toLowerCase().includes(logQuery))
+  );
+
+  if (!rows.length) {
+    const e = el("div", "line");
+    e.append(el("span", "msg", "当前筛选条件下没有日志。放宽等级或来源筛选试试。"));
+    stream.append(e);
+    return;
+  }
+
+  rows.forEach(([ts, lv, src, msg]) => {
+    const line = el("div", "line " + lv);
+    line.append(el("span", "ts", ts));
+    line.append(el("span", "tag lv " + (lv === "ERROR" ? "dang" : lv === "WARN" ? "warn" : ""), lv));
+    line.append(el("span", "tag src", SRC_LABEL[src]));
+    line.append(el("span", "msg", msg));
+    stream.append(line);
+  });
+  stream.scrollTop = stream.scrollHeight;
+  $("#bufCount").textContent = "缓冲 " + rows.length + " / 5000 行";
+}
+
+$("#srcFilters").addEventListener("click", e => {
+  const c = e.target.closest(".chip"); if (!c) return;
+  srcFilter = c.dataset.src;
+  $$("#srcFilters .chip").forEach(b => b.setAttribute("aria-pressed", String(b === c)));
+  renderLogs();
+});
+$("#lvFilters").addEventListener("click", e => {
+  const c = e.target.closest(".chip"); if (!c) return;
+  const lv = c.dataset.lv;
+  const on = c.getAttribute("aria-pressed") !== "true";
+  c.setAttribute("aria-pressed", String(on));
+  on ? levels.add(lv) : levels.delete(lv);
+  renderLogs();
+});
+$("#logSearch").addEventListener("input", e => {
+  logQuery = e.target.value.trim().toLowerCase();
+  renderLogs();
+});
+
+/* ---------------- dialogs ---------------- */
+let lastFocus = null;
+
+function showDialog(id, model) {
+  lastFocus = document.activeElement;
+  if (id === "dlg-error" && model) {
+    $("#errWhich").textContent = model.name + "  ·  健康检查超时 (30s)";
+  }
+  const d = $("#" + id);
+  d.hidden = false;
+  const f = d.querySelector("button"); if (f) f.focus();
+}
+function closeDialogs() {
+  $$(".scrim").forEach(d => d.hidden = true);
+  if (lastFocus) { lastFocus.focus(); lastFocus = null; }
+}
+$$(".scrim").forEach(s => s.addEventListener("click", e => { if (e.target === s) closeDialogs(); }));
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") { closeDialogs(); closeTray(); }
+});
+
+/* on-demand load sequence */
+const LOAD_STEPS = [
+  "转换 Windows 路径为 WSL 路径",
+  "启动 llama-server",
+  "等待健康检查 /health",
+  "注册到 API 路由表"
+];
+let loadTimer = null;
+
+function startLoad(model) {
+  $("#loadName").textContent = "正在启动 " + model.name;
+  showDialog("dlg-load");
+  let i = 0;
+  clearInterval(loadTimer);
+  const paint = () => {
+    const box = $("#loadSteps");
+    box.textContent = "";
+    LOAD_STEPS.forEach((s, n) => {
+      const cls = n < i ? "ok" : n === i ? "now" : "todo";
+      const row = el("div", cls);
+      row.append(el("span", cls, n < i ? "✓" : n === i ? "●" : "○"), el("span", null, s));
+      box.append(row);
+    });
+    $("#loadBar").style.width = Math.min(100, (i / LOAD_STEPS.length) * 100 + 12) + "%";
+  };
+  paint();
+  loadTimer = setInterval(() => {
+    i++;
+    if (i > LOAD_STEPS.length) { clearInterval(loadTimer); closeDialogs(); return; }
+    paint();
+  }, 900);
+}
+
+$("#regenToken").addEventListener("click", () => showDialog("dlg-token"));
+
+/* copy helpers */
+function flash(btn, text) {
+  const old = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = old; }, 1200);
+}
+$("#copyUrl").addEventListener("click", e => {
+  navigator.clipboard?.writeText("http://127.0.0.1:1234");
+  flash(e.currentTarget, "已复制");
+});
+$("#copyTok").addEventListener("click", e => {
+  navigator.clipboard?.writeText($("#tokValue").textContent);
+  flash(e.currentTarget, "已复制");
+});
+$("#copyLogs").addEventListener("click", e => {
+  const text = $$("#stream .line").map(l => l.textContent.replace(/\s+/g, " ").trim()).join("\n");
+  navigator.clipboard?.writeText(text);
+  flash(e.currentTarget, "已复制到剪贴板");
+});
+
+/* ---------------- tray ---------------- */
+const tray = $("#tray"), trayBtn = $("#trayBtn");
+function closeTray() { tray.hidden = true; trayBtn.setAttribute("aria-expanded", "false"); }
+trayBtn.addEventListener("click", e => {
+  e.stopPropagation();
+  const open = tray.hidden;
+  tray.hidden = !open;
+  trayBtn.setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", e => {
+  if (!tray.hidden && !tray.contains(e.target) && e.target !== trayBtn) closeTray();
+});
+
+/* ---------------- settings: live security warning ---------------- */
+function syncListenWarning() {
+  const addr = $("#listenAddr").value.trim();
+  const authOn = $("#authToggle").getAttribute("aria-pressed") === "true";
+  const local = addr === "127.0.0.1" || addr === "localhost" || addr === "::1";
+  $("#listenWarn").hidden = local || authOn;
+}
+$("#listenAddr").addEventListener("input", syncListenWarning);
+$("#authToggle").addEventListener("click", () => setTimeout(syncListenWarning, 0));
+
+/* ---------------- context length → VRAM estimate ---------------- */
+$("#ctxSize").addEventListener("input", e => {
+  const n = parseInt(e.target.value, 10) || 0;
+  const pct = Math.max(2, Math.min(100, (n / 131072) * 100));
+  $("#ctxBar").style.width = pct + "%";
+  const gb = 17.3 + (n / 32768) * 4.1;
+  const used = Math.min(gb, 24);
+  $("#vramText").textContent = used.toFixed(1) + " / 24.0 GB";
+  $("#vramBar").style.width = (used / 24 * 100) + "%";
+  const warn = used > 21;
+  $("#vramText").style.color = warn ? "var(--warn)" : "var(--run)";
+  $("#vramBar").parentElement.className = "bar " + (warn ? "warn" : "ok");
+});
+
+/* ---------------- uptime ---------------- */
+let secs = 5047;
+setInterval(() => {
+  secs++;
+  const h = String(Math.floor(secs / 3600)).padStart(2, "0");
+  const m = String(Math.floor(secs % 3600 / 60)).padStart(2, "0");
+  const s = String(secs % 60).padStart(2, "0");
+  $("#uptime").textContent = h + ":" + m + ":" + s;
+}, 1000);
+
+/* ---------------- boot ---------------- */
+renderModels();
+renderLogs();
+setView("models");
+</script>
+</body>
+</html>

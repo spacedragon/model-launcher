@@ -9,11 +9,10 @@ license.workspace = true
 model-launcher-core = { path = "../../crates/model-launcher-core" }
 model-launcher-api = { path = "../../crates/model-launcher-api" }
 model-launcher-wsl = { path = "../../crates/model-launcher-wsl" }
-model-launcher-ui = { path = "../../crates/model-launcher-ui" }
+model-launcher-ui = { path = "../../crates/model-launcher-tauri" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 thiserror.workspace = true
 futures-util = "0.3"
-slint.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]

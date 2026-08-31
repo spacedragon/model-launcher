@@ -22,9 +22,13 @@ rustc --version
 
 ```powershell
 rustup toolchain install 1.89 --component rustfmt,clippy
+npm install --prefix crates/model-launcher-tauri/frontend
+npm run build --prefix crates/model-launcher-tauri/frontend
 cargo +1.89 build -p model-launcher --release
 ./target/release/model-launcher.exe
 ```
+
+The desktop shell uses Tauri 2 with a React, TypeScript, and Vite frontend. For frontend-only development, run `npm run dev --prefix crates/model-launcher-tauri/frontend`; use `cargo +1.89 run -p model-launcher` to exercise the integrated Rust commands, native window, and tray.
 
 In **Settings**, choose the WSL distribution, the absolute Linux path to `llama-server`, and the Windows model directory, then save. The application probes `--help` before enabling supported launch controls. Use **Models** to rescan, edit a stable API key if desired, and load a model. Closing the window keeps the core/API in the tray; **Quit** shuts down the owned backend.
 
