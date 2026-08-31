@@ -64,7 +64,22 @@ function Invoke-Api([string]$Method, [string]$Path, $Body = $null) {
     $headers = @{}; if ($Token) { $headers.Authorization = "Bearer $Token" }
     $requestParameters = @{ Method = $Method; Uri = [uri]::new($BaseUrl, $Path); Headers = $headers; TimeoutSec = $TimeoutSeconds }
     if ($null -ne $Body) { $requestParameters.ContentType = "application/json"; $requestParameters.Body = ($Body | ConvertTo-Json -Depth 8 -Compress) }
-    Invoke-RestMethod @requestParameters
+    try { Invoke-RestMethod @requestParameters }
+    catch {
+        if ($_.ErrorDetails.Message) { throw "API $Method $Path failed: $($_.ErrorDetails.Message)" }
+        $response = $_.Exception.Response
+        if ($null -ne $response) {
+            try {
+                $reader = [IO.StreamReader]::new($response.GetResponseStream())
+                $detail = $reader.ReadToEnd()
+                $reader.Dispose()
+                if ($detail) { throw "API $Method $Path failed: $detail" }
+            } catch {
+                if ($_.Exception.Message -like "API $Method $Path failed:*") { throw }
+            }
+        }
+        throw
+    }
 }
 function New-ShutdownSentinel {
     New-Item -ItemType Directory -Force $ArtifactDir | Out-Null
@@ -194,14 +209,14 @@ try {
     Add-Check "backend identity" "PASS" "unique executable/model match with /proc starttime recorded"
     $models = Invoke-Api GET "/v1/models"
     if ($ModelKey -notin @($models.data | ForEach-Object { $_.id })) { throw "OpenAI model list omitted ModelKey" }
-    $chat = Invoke-Api POST "/v1/chat/completions" @{ model = $ModelKey; stream = $false; messages = @(@{ role = "user"; content = "Reply with OK" }) }
+    $chat = Invoke-Api POST "/v1/chat/completions" @{ model = $ModelKey; stream = $false; max_tokens = 8; messages = @(@{ role = "user"; content = "Reply with OK" }) }
     if (-not $chat.choices) { throw "non-streaming chat returned no choices" }; Add-Check "chat non-streaming" "PASS" "response contained choices"
     $headers = @{ Accept = "text/event-stream"; Authorization = "Bearer $Token" }
-    $sseBody = @{ model = $ModelKey; stream = $true; messages = @(@{ role = "user"; content = "Reply with OK" }) } | ConvertTo-Json -Depth 6 -Compress
+    $sseBody = @{ model = $ModelKey; stream = $true; max_tokens = 8; messages = @(@{ role = "user"; content = "Reply with OK" }) } | ConvertTo-Json -Depth 6 -Compress
     $sse = Invoke-WebRequest -UseBasicParsing -Method Post -Uri ([uri]::new($BaseUrl, "/v1/chat/completions")) -Headers $headers -ContentType "application/json" -Body $sseBody -TimeoutSec $TimeoutSeconds
     if ($sse.Content -notmatch "data:") { throw "streaming chat returned no SSE data" }; Add-Check "chat streaming" "PASS" "SSE data observed"
     Invoke-Api POST "/api/v1/models/unload" @{ instance_id = $loaded.model_instance_id } | Out-Null; Add-Check "unload" "PASS" "primary ejected"
-    $jit = Invoke-Api POST "/v1/completions" @{ model = $ModelKey; stream = $false; prompt = "Reply with OK" }
+    $jit = Invoke-Api POST "/v1/completions" @{ model = $ModelKey; stream = $false; max_tokens = 8; prompt = "Reply with OK" }
     if (-not $jit.choices) { throw "JIT completion returned no choices" }; Add-Check "JIT load" "PASS" "completion triggered load"
     if ($SecondModelKey) { Add-Check "model_busy" "NOT_RUN" "Timing-sensitive busy check is operator-local" }
 
@@ -221,7 +236,7 @@ try {
         else { Add-Check "post_cycle_active_model" "PASS" "owned WSL backend PID survived all window cycles" }
         if ($ModelKey -notin @($survivalModels.data | ForEach-Object { $_.id })) { Add-Check "post_cycle_api" "FAIL" "model list unavailable after cycles" }
         else {
-            $survivalChat = Invoke-Api POST "/v1/chat/completions" @{ model = $ModelKey; stream = $false; messages = @(@{ role = "user"; content = "Reply with OK" }) }
+            $survivalChat = Invoke-Api POST "/v1/chat/completions" @{ model = $ModelKey; stream = $false; max_tokens = 8; messages = @(@{ role = "user"; content = "Reply with OK" }) }
             Add-Check "post_cycle_api" ($(if ($survivalChat.choices) { "PASS" } else { "FAIL" })) "API and active-model chat checked after cycles"
         }
         $cpu0 = (Get-Process -Id $script:OwnedLauncherPid).CPU; Start-Sleep -Seconds 30; $cpu1 = (Get-Process -Id $script:OwnedLauncherPid).CPU

@@ -961,11 +961,17 @@ impl EngineProcess for WslEngineProcess {
                 )
                 .await
                 .map_err(app_error)?;
-            if out.success {
-                Ok(())
-            } else {
-                Err(app_error(WslError::Command(out.stderr)))
+            if !out.success {
+                return Err(app_error(WslError::Command(out.stderr)));
             }
+            self.child
+                .as_mut()
+                .expect("owned child")
+                .wait_for_exit()
+                .await
+                .map_err(app_error)?;
+            self.owned_active = false;
+            Ok(())
         })
     }
     fn force_shutdown(&mut self) -> EngineFuture<'_, ()> {
@@ -978,11 +984,17 @@ impl EngineProcess for WslEngineProcess {
                 )
                 .await
                 .map_err(app_error)?;
-            if out.success {
-                Ok(())
-            } else {
-                Err(app_error(WslError::Command(out.stderr)))
+            if !out.success {
+                return Err(app_error(WslError::Command(out.stderr)));
             }
+            self.child
+                .as_mut()
+                .expect("owned child")
+                .wait_for_exit()
+                .await
+                .map_err(app_error)?;
+            self.owned_active = false;
+            Ok(())
         })
     }
     fn wait_for_exit(&mut self) -> EngineFuture<'_, i32> {
@@ -1499,6 +1511,62 @@ mod tests {
         async fn spawn(&self, _: &str, _: &[String]) -> Result<Box<dyn WslChild>, WslError> {
             Ok(Box::new(self.children.lock().unwrap().pop_front().unwrap()))
         }
+    }
+
+    struct ExitObservedChild(Arc<AtomicBool>);
+    #[async_trait]
+    impl WslChild for ExitObservedChild {
+        async fn pid_control_line(&mut self) -> Result<String, WslError> {
+            unreachable!()
+        }
+        async fn wait_ready(&mut self, _: Duration) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn check_health(&mut self) -> Result<(), WslError> {
+            unreachable!()
+        }
+        async fn wait_for_exit(&mut self) -> Result<i32, WslError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(0)
+        }
+        async fn is_running(&mut self) -> Result<bool, WslError> {
+            Ok(false)
+        }
+        async fn abort_host(&mut self) -> Result<(), WslError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_confirms_owned_child_exit_before_completing() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let runner = Arc::new(AttemptRunner {
+            children: Mutex::new(VecDeque::new()),
+            signals: Mutex::new(Vec::new()),
+        });
+        let mut process = WslEngineProcess {
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+            distribution: "Ubuntu".into(),
+            pid: 11,
+            owned_pid: OwnedPid {
+                pid: 11,
+                start_time: 101,
+            },
+            runner: runner.clone(),
+            child: Some(Box::new(ExitObservedChild(exited.clone()))),
+            retry: None,
+            owned_active: true,
+            cleanup_observer: Arc::new(CleanupObserver::default()),
+        };
+
+        process.graceful_shutdown().await.unwrap();
+
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(!process.owned_active);
+        assert_eq!(
+            &runner.signals.lock().unwrap()[0][6..],
+            &["TERM", "11", "101"]
+        );
     }
 
     #[tokio::test]
