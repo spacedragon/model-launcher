@@ -375,6 +375,27 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn guarded_signal_script_runs_under_posix_sh_and_respects_identity() {
+        fn signal(pid: u32, start_time: u64) -> std::process::Output {
+            let mut signal = std::process::Command::new("/bin/sh")
+                .args([
+                    "-s",
+                    SIGNAL_SENTINEL,
+                    "TERM",
+                    &pid.to_string(),
+                    &start_time.to_string(),
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(
+                signal.stdin.as_mut().unwrap(),
+                format!("{GUARDED_SIGNAL_SCRIPT}\n").as_bytes(),
+            )
+            .unwrap();
+            signal.wait_with_output().unwrap()
+        }
+
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -390,33 +411,13 @@ mod tests {
             let _ = child.wait();
             return;
         };
-        let mismatch = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                GUARDED_SIGNAL_SCRIPT,
-                SIGNAL_SENTINEL,
-                "TERM",
-                &pid.to_string(),
-                &(start_time + 1).to_string(),
-            ])
-            .output()
-            .unwrap();
+        let mismatch = signal(pid, start_time + 1);
         assert_eq!(
             String::from_utf8_lossy(&mismatch.stdout),
             "IdentityMismatch\n"
         );
         assert!(child.try_wait().unwrap().is_none());
-        let matched = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                GUARDED_SIGNAL_SCRIPT,
-                SIGNAL_SENTINEL,
-                "TERM",
-                &pid.to_string(),
-                &start_time.to_string(),
-            ])
-            .output()
-            .unwrap();
+        let matched = signal(pid, start_time);
         assert_eq!(String::from_utf8_lossy(&matched.stdout), "Signaled\n");
         let _ = child.wait();
     }
