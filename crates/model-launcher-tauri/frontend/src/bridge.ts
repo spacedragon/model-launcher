@@ -4,6 +4,8 @@ import type { Bootstrap, ContextEstimate, LaunchSettings, LogRecord } from "./ty
 
 export const bridge = {
   bootstrap: () => invoke<Bootstrap>("get_bootstrap"),
+  chatCompletion: (request: { model: string; messages: Array<{ role: "user" | "assistant"; content: string }>; token?: string }) =>
+    invoke<string>("chat_completion", { request }),
   estimateContext: (id: string, settings: LaunchSettings) =>
     invoke<ContextEstimate | undefined>("estimate_model_context", { request: { id, settings } }),
   load: (id: string, key: string, settings: LaunchSettings) =>
