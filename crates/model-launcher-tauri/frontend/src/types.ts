@@ -75,3 +75,19 @@ export type LogRecord = {
   level: "trace" | "debug" | "info" | "warn" | "error";
   message: string;
 };
+
+export type BenchmarkRequest = {
+  id: string;
+  model: string;
+  prompt: string;
+  maxTokens: number;
+  token?: string;
+};
+
+export type BenchmarkResult = {
+  latencyMs: number;
+  ttftMs?: number;
+  completionTokens?: number;
+  tokensPerSecond?: number;
+  tokenCountEstimated: boolean;
+};

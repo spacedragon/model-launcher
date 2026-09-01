@@ -2120,12 +2120,15 @@ dependencies = [
 name = "model-launcher-ui"
 version = "0.2.0"
 dependencies = [
+ "futures-util",
  "model-launcher-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]

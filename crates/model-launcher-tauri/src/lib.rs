@@ -1,15 +1,19 @@
+use futures_util::StreamExt;
 use model_launcher_core::{
     CatalogMetadata, ContextEstimate, EngineCapabilities, LaunchSettings, LifecycleSnapshot,
     LogFilter, LogLevel, LogRecord, LogSource, ModelId, ModelRecord, ModelState, estimate_context,
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     net::IpAddr,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
+    time::Instant,
 };
 use tauri::{Emitter, Manager, WebviewWindow};
+use tokio::sync::watch;
 
 #[derive(Clone, Debug)]
 pub struct AppSnapshot {
@@ -118,6 +122,7 @@ struct LifecycleDto {
 struct DesktopState {
     address: String,
     actions: UiActions,
+    benchmark_runs: Mutex<HashMap<String, watch::Sender<bool>>>,
 }
 
 fn bootstrap(state: &DesktopState) -> Bootstrap {
@@ -278,6 +283,214 @@ fn generate_token(state: tauri::State<'_, DesktopState>) {
     (state.actions.generate_token)();
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BenchmarkRequest {
+    id: String,
+    model: String,
+    prompt: String,
+    max_tokens: u32,
+    token: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BenchmarkResult {
+    latency_ms: f64,
+    ttft_ms: Option<f64>,
+    completion_tokens: Option<u64>,
+    tokens_per_second: Option<f64>,
+    token_count_estimated: bool,
+}
+
+#[tauri::command]
+async fn run_benchmark(
+    state: tauri::State<'_, DesktopState>,
+    request: BenchmarkRequest,
+) -> Result<BenchmarkResult, String> {
+    if request.id.is_empty() || request.id.len() > 128 {
+        return Err("Invalid benchmark run id".into());
+    }
+    if request.model.trim().is_empty() || request.prompt.trim().is_empty() {
+        return Err("Model and prompt are required".into());
+    }
+    if request.prompt.len() > 8_192 || !(1..=512).contains(&request.max_tokens) {
+        return Err("Benchmark configuration is outside the supported range".into());
+    }
+    let (cancel, receiver) = watch::channel(false);
+    state
+        .benchmark_runs
+        .lock()
+        .expect("benchmark run lock poisoned")
+        .insert(request.id.clone(), cancel);
+    let result = execute_benchmark(&state.address, &request, receiver).await;
+    state
+        .benchmark_runs
+        .lock()
+        .expect("benchmark run lock poisoned")
+        .remove(&request.id);
+    result
+}
+
+#[tauri::command]
+fn cancel_benchmark(state: tauri::State<'_, DesktopState>, id: String) -> bool {
+    state
+        .benchmark_runs
+        .lock()
+        .expect("benchmark run lock poisoned")
+        .get(&id)
+        .is_some_and(|cancel| cancel.send(true).is_ok())
+}
+
+async fn execute_benchmark(
+    address: &str,
+    request: &BenchmarkRequest,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<BenchmarkResult, String> {
+    let started = Instant::now();
+    let client = reqwest::Client::new();
+    let mut outgoing = client
+        .post(format!("http://{address}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": &request.model,
+            "messages": [{ "role": "user", "content": &request.prompt }],
+            "max_tokens": request.max_tokens,
+            "temperature": 0,
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }));
+    if let Some(token) = request
+        .token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        outgoing = outgoing.bearer_auth(token.trim());
+    }
+    let response = tokio::select! {
+        changed = cancel.changed() => {
+            let _ = changed;
+            return Err("Benchmark cancelled".into());
+        }
+        response = outgoing.send() => response.map_err(|error| format!("API request failed: {error}"))?,
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| body.trim().to_owned());
+        return Err(if message.is_empty() {
+            format!("API returned {status}")
+        } else {
+            format!("API returned {status}: {message}")
+        });
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut parser = BenchmarkStream::default();
+    loop {
+        tokio::select! {
+            changed = cancel.changed() => {
+                let _ = changed;
+                return Err("Benchmark cancelled".into());
+            }
+            item = stream.next() => match item {
+                Some(Ok(bytes)) => parser.push(&bytes, started.elapsed()),
+                Some(Err(error)) => return Err(format!("API stream failed: {error}")),
+                None => break,
+            }
+        }
+    }
+    parser.finish(started.elapsed())
+}
+
+#[derive(Default)]
+struct BenchmarkStream {
+    pending: Vec<u8>,
+    ttft_ms: Option<f64>,
+    completion_tokens: Option<u64>,
+    content_events: u64,
+}
+
+impl BenchmarkStream {
+    fn push(&mut self, bytes: &[u8], elapsed: std::time::Duration) {
+        self.pending.extend_from_slice(bytes);
+        while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line: Vec<u8> = self.pending.drain(..=index).collect();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            self.consume_line(&line, elapsed);
+        }
+    }
+
+    fn consume_line(&mut self, line: &[u8], elapsed: std::time::Duration) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+            return;
+        };
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            self.consume_value(&value, Some(elapsed));
+        }
+    }
+
+    fn consume_value(&mut self, value: &serde_json::Value, elapsed: Option<std::time::Duration>) {
+        let content = value
+            .pointer("/choices/0/delta/content")
+            .and_then(|value| value.as_str());
+        if content.is_some_and(|content| !content.is_empty()) {
+            self.content_events += 1;
+            if self.ttft_ms.is_none() {
+                self.ttft_ms = elapsed.map(|value| value.as_secs_f64() * 1_000.0);
+            }
+        }
+        self.completion_tokens = value
+            .pointer("/usage/completion_tokens")
+            .or_else(|| value.pointer("/timings/predicted_n"))
+            .and_then(serde_json::Value::as_u64)
+            .or(self.completion_tokens);
+    }
+
+    fn finish(mut self, elapsed: std::time::Duration) -> Result<BenchmarkResult, String> {
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            if pending.starts_with(b"data:") {
+                self.consume_line(&pending, elapsed);
+            } else if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&pending) {
+                self.consume_value(&value, None);
+            }
+        }
+        let estimated = self.completion_tokens.is_none() && self.content_events > 0;
+        let completion_tokens = self
+            .completion_tokens
+            .or(estimated.then_some(self.content_events));
+        let generation_start = self.ttft_ms.unwrap_or(0.0) / 1_000.0;
+        let generation_seconds = elapsed.as_secs_f64() - generation_start;
+        let tokens_per_second = completion_tokens
+            .filter(|tokens| *tokens > 0 && generation_seconds > 0.0)
+            .map(|tokens| tokens as f64 / generation_seconds);
+        Ok(BenchmarkResult {
+            latency_ms: elapsed.as_secs_f64() * 1_000.0,
+            ttft_ms: self.ttft_ms,
+            completion_tokens,
+            tokens_per_second,
+            token_count_estimated: estimated,
+        })
+    }
+}
+
 #[tauri::command]
 fn minimize(window: WebviewWindow) -> Result<(), String> {
     window.minimize().map_err(|error| error.to_string())
@@ -350,6 +563,7 @@ pub fn run_desktop(
     let state = DesktopState {
         address,
         actions: actions.clone(),
+        benchmark_runs: Mutex::new(HashMap::new()),
     };
     tauri::Builder::default()
         .manage(state)
@@ -364,6 +578,8 @@ pub fn run_desktop(
             get_logs,
             export_logs,
             generate_token,
+            run_benchmark,
+            cancel_benchmark,
             minimize,
             toggle_maximize,
             close_window
@@ -514,5 +730,48 @@ fn format_bytes(value: u64) -> String {
         format!("{:.1} GB", value as f64 / GB)
     } else {
         format!("{:.0} MB", value as f64 / MB)
+    }
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::BenchmarkStream;
+    use std::time::Duration;
+
+    #[test]
+    fn streaming_metrics_handle_split_frames_and_usage() {
+        let mut stream = BenchmarkStream::default();
+        stream.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"he",
+            Duration::from_millis(40),
+        );
+        stream.push(
+            b"llo\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":8}}\n\n",
+            Duration::from_millis(100),
+        );
+        let result = stream.finish(Duration::from_millis(120)).unwrap();
+
+        assert_eq!(result.ttft_ms, Some(100.0));
+        assert_eq!(result.completion_tokens, Some(8));
+        assert!(!result.token_count_estimated);
+        assert!((result.tokens_per_second.unwrap() - 400.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn streaming_metrics_fall_back_to_content_events() {
+        let mut stream = BenchmarkStream::default();
+        stream.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n",
+            Duration::from_millis(20),
+        );
+        stream.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+            Duration::from_millis(40),
+        );
+        let result = stream.finish(Duration::from_millis(60)).unwrap();
+
+        assert_eq!(result.completion_tokens, Some(2));
+        assert!(result.token_count_estimated);
+        assert!((result.tokens_per_second.unwrap() - 50.0).abs() < 1e-9);
     }
 }
