@@ -323,6 +323,29 @@ pub fn report_status(message: impl Into<String>) {
     emit("operation-status", message.into());
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadFinished {
+    model_id: ModelId,
+    success: bool,
+    message: String,
+}
+
+pub fn report_load_finished(model_id: ModelId, result: Result<(), impl std::fmt::Display>) {
+    let (success, message) = match result {
+        Ok(()) => (true, "模型已加载并可以使用。".to_owned()),
+        Err(error) => (false, error.to_string()),
+    };
+    emit(
+        "load-finished",
+        LoadFinished {
+            model_id,
+            success,
+            message,
+        },
+    );
+}
+
 pub fn report_settings_saved() {
     report_status("设置已保存");
     request_refresh();

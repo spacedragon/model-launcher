@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { bridge } from "./bridge";
-import type { Bootstrap, ContextEstimate, LaunchSettings, LogRecord, Model } from "./types";
+import type { Bootstrap, ContextEstimate, LaunchSettings, LoadFinished, LogRecord, Model } from "./types";
 
 type Page = "models" | "api" | "logs" | "settings" | "detail";
+type LoadPhase = "loading" | "cancelling" | "cancelled" | "success" | "failure";
+type LoadOperation = { modelId: string; modelName: string; phase: LoadPhase; message: string; startedAt: number };
 const nav: Array<[Page, string, string]> = [
   ["models", "模型库", "◆"], ["api", "API 服务", "▦"],
   ["logs", "日志与诊断", "⌁"], ["settings", "设置", "⚙"],
@@ -17,6 +19,7 @@ export default function App() {
   const [status, setStatus] = useState("");
   const [token, setToken] = useState<string>();
   const [loading, setLoading] = useState(false);
+  const [loadOperation, setLoadOperation] = useState<LoadOperation>();
 
   const refresh = useCallback(async () => {
     const next = await bridge.bootstrap();
@@ -31,6 +34,12 @@ export default function App() {
     void bridge.listen<string>("operation-status", message => setStatus(message)).then(fn => removers.push(fn));
     void bridge.listen<string>("token-generated", value => setToken(value)).then(fn => removers.push(fn));
     void bridge.listen<string>("close-notice", message => setStatus(message)).then(fn => removers.push(fn));
+    void bridge.listen<LoadFinished>("load-finished", result => setLoadOperation(current => {
+      if (!current || current.modelId !== result.modelId) return current;
+      if (result.success) return { ...current, phase:"success", message:result.message };
+      if (current.phase === "cancelling" && result.message === "load cancelled") return { ...current, phase:"cancelled", message:"加载已取消，启动中的进程已安全停止。" };
+      return { ...current, phase:"failure", message:result.message };
+    })).then(fn => removers.push(fn));
     return () => removers.forEach(remove => remove());
   }, [refresh]);
 
@@ -47,6 +56,15 @@ export default function App() {
     try { await action(); await refresh(); }
     catch (error) { setStatus(String(error)); }
     finally { setLoading(false); }
+  };
+
+  const beginLoad = (model: Model, key: string, settings: LaunchSettings) => {
+    setLoadOperation({ modelId:model.id, modelName:model.name, phase:"loading", message:"正在提交启动请求…", startedAt:Date.now() });
+    void bridge.load(model.id, key, settings).catch(error => {
+      setLoadOperation(current => current?.modelId === model.id
+        ? { ...current, phase:"failure", message:String(error) }
+        : current);
+    });
   };
 
   if (!data) return <div className="boot"><i className="spinner" />正在连接 Model Launcher…</div>;
@@ -80,7 +98,7 @@ export default function App() {
           load={model => { setSelectedId(model.id); setPage("detail"); }}
           eject={() => void run(bridge.eject)} loading={loading} />}
         {page === "detail" && selected && <DetailPage model={selected} data={data} back={() => setPage("models")}
-          save={(key, settings) => void run(() => bridge.load(selected.id, key, settings))} />}
+          save={(key, settings) => beginLoad(selected, key, settings)} />}
         {page === "api" && <ApiPage data={data} generate={() => void bridge.generateToken()} />}
         {page === "logs" && <LogsPage exportLogs={() => void bridge.exportLogs()} />}
         {page === "settings" && <SettingsPage data={data} saveEngine={settings => void run(() => bridge.saveEngine(settings))}
@@ -94,6 +112,11 @@ export default function App() {
     </div>
 
     <footer><span>WSL: {data.engineSettings.distribution}</span><span>{data.engineSettings.executable}</span><div className="grow" /><span><i className="dot run" />{status || `${data.lifecycle.inFlight} 个活动请求`}</span></footer>
+    {loadOperation && <LoadDialog operation={loadOperation} lifecycle={data.lifecycle}
+      cancel={() => {
+        setLoadOperation(current => current && { ...current, phase:"cancelling", message:"正在取消加载并清理启动中的进程…" });
+        void bridge.eject();
+      }} close={() => setLoadOperation(undefined)} />}
     {token && <Modal title="新的 API Token 已生成" close={() => setToken(undefined)}><div className="notice warn">此 Token 只显示一次，关闭后无法再次查看。</div><div className="token"><code>{token}</code><button className="tag blue" onClick={() => void navigator.clipboard.writeText(token)}>复制</button></div><p>配置文件只保存 Argon2id 哈希，不保存明文。</p></Modal>}
   </div>;
 }
@@ -170,6 +193,48 @@ function CapabilityPanel({ data }: { data: Bootstrap }) { return <div className=
 function ApiPage({ data, generate }: { data: Bootstrap; generate(): void }) { return <section className="view scroll"><div className="api-page"><h1>API 服务</h1><p>模型重启或切换时，对外地址保持不变。</p><div className="hero"><div><i className="dot run" /><code>{data.baseUrl}</code><button className="tag blue" onClick={() => void navigator.clipboard.writeText(data.baseUrl)}>复制</button><div className="grow" /><span>{data.authenticationStatus}</span></div><dl><Kv k="监听地址" v={data.serverSettings.bind_address} /><Kv k="端口" v={String(data.serverSettings.port)} /><Kv k="活动请求" v={String(data.lifecycle.inFlight)} /></dl></div><RouteGroup title="OpenAI 兼容接口" routes={[["GET","/v1/models"],["POST","/v1/chat/completions"],["POST","/v1/completions"]]} /><RouteGroup title="LM Studio 兼容接口" routes={[["GET","/api/v1/models"],["POST","/api/v1/models/load"],["POST","/api/v1/models/unload"]]} /><div className="notice warn"><b>Bearer Token</b><span>明文只在生成时显示一次，配置仅保存 Argon2id 哈希。</span><button className="btn danger" onClick={generate}>重新生成 Token</button></div></div></section> }
 
 function LogsPage({ exportLogs }: { exportLogs(): void }) { const [logs, setLogs] = useState<LogRecord[]>([]); const [source, setSource] = useState<string>(); const [level, setLevel] = useState("info"); const [query, setQuery] = useState(""); useEffect(() => { const refresh = () => void bridge.logs(source, level).then(setLogs); refresh(); const id = window.setInterval(refresh, 1200); return () => clearInterval(id); }, [source, level]); const shown = logs.filter(log => log.message.toLowerCase().includes(query.toLowerCase())); return <section className="view logs-page"><div className="headrow"><div><h1>日志与诊断</h1><p>应用日志、引擎 stdout 与 stderr 的统一视图</p></div><div className="grow" /><button className="btn" onClick={() => void navigator.clipboard.writeText(shown.map(l => l.message).join("\n"))}>复制当前日志</button><button className="btn primary" onClick={exportLogs}>导出诊断日志</button></div><div className="log-toolbar"><select value={source ?? ""} onChange={e => setSource(e.target.value || undefined)}><option value="">全部来源</option><option value="application">应用</option><option value="engine_stdout">引擎 stdout</option><option value="engine_stderr">引擎 stderr</option></select><select value={level} onChange={e => setLevel(e.target.value)}><option value="trace">TRACE</option><option value="debug">DEBUG</option><option value="info">INFO</option><option value="warn">WARN</option><option value="error">ERROR</option></select><label className="search"><input value={query} onChange={e => setQuery(e.target.value)} placeholder="过滤日志内容" /></label><div className="grow" /><code>{shown.length} 行</code></div><div className="log-stream">{shown.map((log, i) => <div key={`${log.timestamp_ms}-${i}`} className={log.level}><time>{new Date(log.timestamp_ms).toLocaleTimeString()}</time><b>{log.level.toUpperCase()}</b><span>{log.source}</span><code>{log.message}</code></div>)}</div></section> }
+
+function LoadDialog({ operation, lifecycle, cancel, close }: {
+  operation: LoadOperation; lifecycle: Bootstrap["lifecycle"]; cancel(): void; close(): void;
+}) {
+  const [logs, setLogs] = useState<LogRecord[]>([]);
+  const active = operation.phase === "loading" || operation.phase === "cancelling";
+  useEffect(() => {
+    let disposed = false;
+    const refresh = () => void bridge.logs(undefined, "trace").then(records => {
+      if (disposed) return;
+      setLogs(records.filter(record => record.timestamp_ms >= operation.startedAt - 1000
+        && (!record.model_id || record.model_id === operation.modelId)));
+    });
+    refresh();
+    if (!active) return () => { disposed = true; };
+    const id = window.setInterval(refresh, 300);
+    return () => { disposed = true; clearInterval(id); };
+  }, [active, operation.modelId, operation.startedAt]);
+
+  const state = loadDialogState(operation, lifecycle);
+  return <div className="scrim load-scrim" role="presentation"><section className="modal load-modal" role="dialog" aria-modal="true" aria-labelledby="load-title">
+    <div className="load-title"><div><h2 id="load-title">加载 {operation.modelName}</h2><p>{state.status}</p></div><span className={`load-result ${operation.phase}`}>{state.label}</span></div>
+    <div className="progress" role="progressbar" aria-label="模型加载进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={state.progress}><i style={{width:`${state.progress}%`}} /></div>
+    <div className={`load-message ${operation.phase}`}>{operation.phase === "loading" && <i className="spinner" />}{operation.message}</div>
+    <div className="load-logs" aria-label="实时启动日志" aria-live="polite">{logs.length === 0
+      ? <div className="log-placeholder">等待启动日志…</div>
+      : logs.map((log, index) => <div key={`${log.timestamp_ms}-${index}`} className={log.level}><time>{new Date(log.timestamp_ms).toLocaleTimeString()}</time><b>{log.level.toUpperCase()}</b><code>{log.message}</code></div>)}</div>
+    <div className="modal-actions">{active
+      ? <button className="btn danger" onClick={cancel} disabled={operation.phase === "cancelling"}>{operation.phase === "cancelling" ? "正在取消…" : "取消加载"}</button>
+      : <button className="btn primary" onClick={close}>关闭</button>}</div>
+  </section></div>;
+}
+
+function loadDialogState(operation: LoadOperation, lifecycle: Bootstrap["lifecycle"]) {
+  if (operation.phase === "success") return { progress:100, label:"加载完成", status:"模型已就绪" };
+  if (operation.phase === "cancelled") return { progress:100, label:"已取消", status:"启动进程已安全停止" };
+  if (operation.phase === "failure") return { progress:100, label:"未加载", status:"加载已结束" };
+  if (operation.phase === "cancelling") return { progress:85, label:"正在取消", status:"安全停止启动进程" };
+  if (lifecycle.state === "stopping") return { progress:30, label:"准备切换", status:"正在停止当前模型" };
+  if (lifecycle.state === "starting" && lifecycle.desiredModel === operation.modelId) return { progress:65, label:"正在启动", status:"正在等待推理引擎就绪" };
+  return { progress:10, label:"排队中", status:"正在准备模型启动" };
+}
 
 function SettingsPage({ data, saveEngine, saveServer }: { data: Bootstrap; saveEngine(v: Bootstrap["engineSettings"]): void; saveServer(v: Bootstrap["serverSettings"]): void }) { const [engine, setEngine] = useState(data.engineSettings); const [server, setServer] = useState(data.serverSettings); return <section className="view scroll"><div className="settings-page"><div><h1>设置</h1><p>登记模型目录、WSL 引擎位置与默认启动参数。</p></div><SettingsSection title="模型目录" description="递归扫描 .gguf 文件并自动识别分片模型。"><div className="directory"><i className="dot run" /><code>{engine.model_directory || "尚未配置"}</code></div><label>模型目录<input value={engine.model_directory} onChange={e => setEngine({...engine, model_directory:e.target.value})} /></label></SettingsSection><SettingsSection title="WSL 与推理引擎" description="Windows 路径会在启动模型时转换为 WSL 路径。"><div className="settings-row"><label>WSL 发行版<input value={engine.distribution} onChange={e => setEngine({...engine, distribution:e.target.value})} /></label><label className="wide">llama-server 路径<input value={engine.executable} onChange={e => setEngine({...engine, executable:e.target.value})} /></label><button className="btn primary" onClick={() => saveEngine(engine)}>保存并验证</button></div></SettingsSection><SettingsSection title="API 服务" description="非本地监听且未启用认证会产生安全警告。"><div className="settings-row"><label>监听地址<input value={server.bind_address} onChange={e => setServer({...server, bind_address:e.target.value})} /></label><label>端口<input type="number" value={server.port} onChange={e => setServer({...server, port:Number(e.target.value)})} /></label><Toggle label="Bearer Token 认证" checked={server.auth_enabled} onChange={auth_enabled => setServer({...server,auth_enabled})} /><button className="btn primary" onClick={() => saveServer(server)}>保存服务设置</button></div>{data.serverWarning && <div className="notice warn">{data.serverWarning}</div>}</SettingsSection><SettingsSection title="持久化与后台运行" description="配置使用版本化 JSON 和原子替换写入。"><div className="settings-list"><Toggle label="关闭主窗口后驻留系统托盘" checked onChange={() => undefined} /><Toggle label="退出时停止 API 服务与受管模型" checked onChange={() => undefined} /><Toggle label="启动时恢复上次模型（默认关闭）" checked={false} onChange={() => undefined} /></div></SettingsSection></div></section> }
 
