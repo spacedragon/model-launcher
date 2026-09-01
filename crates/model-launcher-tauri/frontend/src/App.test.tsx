@@ -6,6 +6,7 @@ const { bootstrap, load } = vi.hoisted(() => ({ bootstrap: vi.fn(), load: vi.fn(
 vi.mock("./bridge", () => ({
   bridge: {
     bootstrap,
+    chatCompletion: vi.fn(),
     estimateContext: vi.fn().mockResolvedValue(undefined),
     listen: vi.fn().mockResolvedValue(() => undefined),
     logs: vi.fn().mockResolvedValue([]),
@@ -44,6 +45,14 @@ describe("Model Launcher", () => {
     await screen.findAllByText("Qwen 8B");
     fireEvent.click(screen.getByRole("button", { name:/API 服务/ }));
     await waitFor(() => expect(screen.getByText("OpenAI 兼容接口")).toBeInTheDocument());
+  });
+
+  it("exposes chat navigation for the running model", async () => {
+    render(<App />);
+    await screen.findAllByText("Qwen 8B");
+    fireEvent.click(screen.getByRole("button", { name: /Chat/ }));
+    expect(await screen.findByText("Start a local conversation")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Message qwen")).toBeInTheDocument();
   });
 
   it("opens model parameters before loading", async () => {

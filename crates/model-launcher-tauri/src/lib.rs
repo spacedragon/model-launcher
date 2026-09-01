@@ -118,6 +118,7 @@ struct LifecycleDto {
 struct DesktopState {
     address: String,
     actions: UiActions,
+    http: reqwest::Client,
 }
 
 fn bootstrap(state: &DesktopState) -> Bootstrap {
@@ -177,6 +178,82 @@ fn bootstrap(state: &DesktopState) -> Bootstrap {
 #[tauri::command]
 fn get_bootstrap(state: tauri::State<'_, DesktopState>) -> Bootstrap {
     bootstrap(&state)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ChatMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatCompletionRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OpenAiChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+}
+
+#[tauri::command]
+async fn chat_completion(
+    state: tauri::State<'_, DesktopState>,
+    request: ChatCompletionRequest,
+) -> Result<String, String> {
+    post_chat_completion(&state.http, &state.address, request).await
+}
+
+async fn post_chat_completion(
+    client: &reqwest::Client,
+    address: &str,
+    request: ChatCompletionRequest,
+) -> Result<String, String> {
+    let url = format!("http://{address}/v1/chat/completions");
+    let body = OpenAiChatRequest {
+        model: &request.model,
+        messages: &request.messages,
+        stream: false,
+    };
+    let mut outgoing = client.post(&url).json(&body);
+    if let Some(token) = request.token.as_deref().filter(|token| !token.is_empty()) {
+        outgoing = outgoing.bearer_auth(token);
+    }
+    let response = outgoing.send().await.map_err(|_| {
+        format!(
+            "Could not reach the local API at http://{address}. Make sure Model Launcher is running and try again."
+        )
+    })?;
+    let status = response.status();
+    let payload: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| "The local API returned an invalid response.".to_owned())?;
+    if !status.is_success() {
+        let detail = payload
+            .pointer("/error/message")
+            .or_else(|| payload.get("error"))
+            .and_then(serde_json::Value::as_str);
+        return Err(detail.map_or_else(
+            || match status.as_u16() {
+                401 => "The API token was rejected. Paste a valid Bearer token and try again.".to_owned(),
+                503 => "The local model server is unavailable. Check that the model is running and try again.".to_owned(),
+                code => format!("The local API returned HTTP {code}."),
+            },
+            str::to_owned,
+        ));
+    }
+    payload
+        .pointer("/choices/0/message/content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "The server returned an empty assistant response.".to_owned())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -350,11 +427,17 @@ pub fn run_desktop(
     let state = DesktopState {
         address,
         actions: actions.clone(),
+        http: reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("chat HTTP client configuration is valid"),
     };
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_bootstrap,
+            chat_completion,
             estimate_model_context,
             load_model,
             eject_model,
@@ -514,5 +597,81 @@ fn format_bytes(value: u64) -> String {
         format!("{:.1} GB", value as f64 / GB)
     } else {
         format!("{:.0} MB", value as f64 / MB)
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::{ChatCompletionRequest, ChatMessage, post_chat_completion};
+    use axum::{Json, Router, http::HeaderMap, routing::post};
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn chat_command_posts_to_the_configured_local_gateway() {
+        let received = Arc::new(Mutex::new(None));
+        let captured = received.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let captured = captured.clone();
+                async move {
+                    *captured.lock().unwrap() = Some((headers, body));
+                    Json(json!({"choices":[{"message":{"content":"Local reply"}}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let reply = post_chat_completion(
+            &reqwest::Client::new(),
+            &address.to_string(),
+            ChatCompletionRequest {
+                model: "qwen".to_owned(),
+                messages: vec![ChatMessage {
+                    role: "user".to_owned(),
+                    content: "Hello".to_owned(),
+                }],
+                token: Some("secret".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reply, "Local reply");
+        let (headers, body) = received.lock().unwrap().take().unwrap();
+        assert_eq!(headers["authorization"], "Bearer secret");
+        assert_eq!(body["model"], "qwen");
+        assert_eq!(body["messages"][0]["content"], "Hello");
+        assert_eq!(body["stream"], false);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_command_reports_an_unavailable_gateway() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let error = post_chat_completion(
+            &client,
+            &address.to_string(),
+            ChatCompletionRequest {
+                model: "qwen".to_owned(),
+                messages: vec![],
+                token: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("Could not reach the local API"));
+        assert!(error.contains(&address.to_string()));
     }
 }
