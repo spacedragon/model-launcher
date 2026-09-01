@@ -70,26 +70,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         CloseNoticeStore::new(base.join("close-to-tray-notice")),
         None,
     )));
+    let (load_cancel, _) = tokio::sync::watch::channel(0_u64);
     let actions = UiActions {
         load: Arc::new({
             let handle = handle.clone();
             let runtime_handle = runtime_handle.clone();
+            let load_cancel = load_cancel.clone();
             move |request: model_launcher_ui::UiLoadRequest| {
                 let handle = handle.clone();
+                let mut cancelled = load_cancel.subscribe();
                 runtime_handle.spawn(async move {
-                    let result = handle
-                        .load_model_with_profile(request.id, request.key, request.settings)
-                        .await;
-                    if let Err(error) = result {
+                    let model_id = request.id;
+                    let load =
+                        handle.load_model_with_profile(request.id, request.key, request.settings);
+                    tokio::pin!(load);
+                    let result: Result<(), String> = tokio::select! {
+                        biased;
+                        changed = cancelled.changed() => {
+                            if changed.is_ok() {
+                                match handle.eject().await {
+                                    Ok(()) => Err("load cancelled".into()),
+                                    Err(error) => Err(format!("load cancellation failed: {error}")),
+                                }
+                            } else {
+                                load.await.map_err(|error| error.to_string())
+                            }
+                        }
+                        result = &mut load => result.map_err(|error| error.to_string()),
+                    };
+                    if let Err(error) = &result {
                         model_launcher_ui::report_status(format!("Load failed: {error}"));
                     }
+                    model_launcher_ui::report_load_finished(model_id, result);
                 });
             }
         }),
         eject: Arc::new({
             let handle = handle.clone();
             let runtime_handle = runtime_handle.clone();
+            let load_cancel = load_cancel.clone();
             move || {
+                load_cancel.send_modify(|generation| *generation = generation.wrapping_add(1));
                 let handle = handle.clone();
                 runtime_handle.spawn(async move {
                     let _ = handle.eject().await;
