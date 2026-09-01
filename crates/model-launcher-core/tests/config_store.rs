@@ -10,7 +10,7 @@ use std::{
 
 use model_launcher_core::{
     CatalogIdentity, ConfigDiagnosticKind, ConfigIoStage, ConfigStore, FileReplacer,
-    LauncherConfig, ModelId, ModelKey, ModelRecord, ModelState,
+    LaunchSettings, LauncherConfig, ModelId, ModelKey, ModelRecord, ModelState, SpeculativeType,
 };
 use uuid::Uuid;
 
@@ -121,6 +121,24 @@ fn configuration_round_trips() {
     store.save(&config).expect("save config");
 
     assert_eq!(store.load().expect("reload config"), config);
+}
+
+#[test]
+fn dflash_draft_model_selection_round_trips() {
+    let dir = TestDir::new();
+    let store = ConfigStore::new(&dir.0);
+    let config = LauncherConfig {
+        default_launch_settings: LaunchSettings {
+            speculative_type: Some(SpeculativeType::DraftDflash),
+            draft_model: Some(PathBuf::from(r"D:\models\qwen-dflash.gguf")),
+            ..LaunchSettings::default()
+        },
+        ..LauncherConfig::default()
+    };
+
+    store.save(&config).expect("save DFlash configuration");
+
+    assert_eq!(store.load().expect("reload DFlash configuration"), config);
 }
 
 #[test]
