@@ -21,7 +21,7 @@ const fixture = {
     { id:"1", key:"qwen", name:"Qwen 8B", path:"D:\\models\\qwen.gguf", fileName:"qwen.gguf", sizeBytes:4, size:"4 GB", state:"ready", running:true, settings:{}, metadata:{architecture:"qwen",context_length:32768} },
     { id:"2", key:"llama", name:"Llama 3B", path:"D:\\models\\llama.gguf", fileName:"llama.gguf", sizeBytes:2, size:"2 GB", state:"ready", running:false, settings:{}, metadata:{architecture:"llama",context_length:8192} },
   ],
-  recentModels: [], lifecycle:{state:"running",desiredModel:"1",inFlight:0}, capabilities:{context_length:true},
+  recentModels: [], lifecycle:{state:"running",desiredModel:"1",inFlight:0}, capabilities:{context_length:true,speculative_type:true,draft_model:true},
   authenticationStatus:"Bearer Token 已启用",serverWarning:"",engineValid:true,
   engineSettings:{distribution:"Ubuntu",executable:"/usr/bin/llama-server",model_directory:"D:\\models",defaults:{}},
   serverSettings:{bind_address:"127.0.0.1",port:1234,auth_enabled:true},baseUrl:"http://127.0.0.1:1234",
@@ -62,5 +62,25 @@ describe("Model Launcher", () => {
     fireEvent.click(row!.querySelector("button")!);
     expect((await screen.findAllByText("8,192 tokens")).length).toBeGreaterThan(0);
     expect(load).not.toHaveBeenCalled();
+  });
+
+  it("requires and submits a separate DFlash 2 draft model", async () => {
+    render(<App />);
+    await screen.findByText("Llama 3B");
+    const row = screen.getByText("Llama 3B").closest("article");
+    fireEvent.click(row!.querySelector("button")!);
+
+    fireEvent.change(await screen.findByLabelText("投机解码"), { target:{value:"draft-dflash"} });
+    const save = screen.getByRole("button", { name:"保存并加载" });
+    expect(screen.getByLabelText("DFlash 2 草稿模型")).toBeInTheDocument();
+    expect(save).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("DFlash 2 草稿模型"), { target:{value:"D:\\models\\qwen.gguf"} });
+    fireEvent.click(save);
+
+    await waitFor(() => expect(load).toHaveBeenCalledWith("2", "llama", expect.objectContaining({
+      speculative_type:"draft-dflash",
+      draft_model:"D:\\models\\qwen.gguf",
+    })));
   });
 });
