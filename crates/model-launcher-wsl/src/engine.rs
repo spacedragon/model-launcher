@@ -637,7 +637,7 @@ pub struct ProbeCache {
 pub struct ProbeRefreshError {
     #[source]
     pub source: WslError,
-    pub prior: Option<ProbeSnapshot>,
+    pub prior: Option<Box<ProbeSnapshot>>,
 }
 impl ProbeCache {
     #[must_use]
@@ -659,11 +659,11 @@ impl ProbeCache {
             .await
             .map_err(|source| ProbeRefreshError {
                 source,
-                prior: ProbeSnapshot::load(&self.path).ok(),
+                prior: ProbeSnapshot::load(&self.path).ok().map(Box::new),
             })?;
         save_snapshot_atomic(&self.path, &snapshot).map_err(|error| ProbeRefreshError {
             source: WslError::Command(error.to_string()),
-            prior: ProbeSnapshot::load(&self.path).ok(),
+            prior: ProbeSnapshot::load(&self.path).ok().map(Box::new),
         })?;
         Ok(snapshot)
     }
@@ -1359,7 +1359,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("help failed"));
-        assert_eq!(error.prior.as_ref(), Some(&saved));
+        assert_eq!(error.prior.as_deref(), Some(&saved));
         assert_eq!(ProbeSnapshot::load(&cache_path).unwrap(), saved);
     }
     struct BarrierProbeRunner {
