@@ -7,6 +7,7 @@ export type LaunchSettings = {
   flash_attention?: boolean;
   kv_cache_type?: "f16" | "q8_0" | "q4_0";
   speculative_type?: "draft-mtp" | "draft-dflash";
+  draft_model?: string;
 };
 
 export type ModelMetadata = {
