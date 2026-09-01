@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { bridge } from "./bridge";
+import { BenchmarkPage } from "./BenchmarkPage";
 import ChatPage from "./ChatPage";
 import type { Bootstrap, ContextEstimate, LaunchSettings, LoadFinished, LogRecord, Model } from "./types";
 
-type Page = "models" | "chat" | "api" | "logs" | "settings" | "detail";
+type Page = "models" | "chat" | "api" | "benchmark" | "logs" | "settings" | "detail";
 type LoadPhase = "loading" | "cancelling" | "cancelled" | "success" | "failure";
 type LoadOperation = { modelId: string; modelName: string; phase: LoadPhase; message: string; startedAt: number };
 const nav: Array<[Page, string, string]> = [
-  ["models", "模型库", "◆"], ["chat", "Chat", "✦"], ["api", "API 服务", "▦"],
+  ["models", "模型库", "◆"], ["chat", "Chat", "✦"], ["api", "API 服务", "▦"], ["benchmark", "基准测试", "◫"],
   ["logs", "日志与诊断", "⌁"], ["settings", "设置", "⚙"],
 ];
 
@@ -83,7 +84,7 @@ export default function App() {
       </div>
     </header>
 
-    <div className={`body ${page === "chat" || page === "logs" || page === "settings" ? "no-aside" : ""}`}>
+    <div className={`body ${page === "chat" || page === "logs" || page === "settings" || page === "benchmark" ? "no-aside" : ""}`}>
       <nav className="sidebar" aria-label="主导航">
         <span className="kicker">导航</span>
         {nav.map(([id, label, icon]) => <button key={id} aria-current={activePage === id} onClick={() => setPage(id)}>
@@ -102,12 +103,13 @@ export default function App() {
           save={(key, settings) => beginLoad(selected, key, settings)} />}
         {page === "chat" && <ChatPage baseUrl={data.baseUrl} model={data.models.find(model => model.running)?.key} authenticationEnabled={data.serverSettings.auth_enabled} complete={bridge.chatCompletion} />}
         {page === "api" && <ApiPage data={data} generate={() => void bridge.generateToken()} />}
+        {page === "benchmark" && <BenchmarkPage baseUrl={data.baseUrl} model={data.models.find(model => model.running)} authEnabled={data.serverSettings.auth_enabled} />}
         {page === "logs" && <LogsPage exportLogs={() => void bridge.exportLogs()} />}
         {page === "settings" && <SettingsPage data={data} saveEngine={settings => void run(() => bridge.saveEngine(settings))}
           saveServer={settings => void run(() => bridge.saveServer(settings))} />}
       </main>
 
-      {page !== "chat" && page !== "logs" && page !== "settings" && <aside>
+      {page !== "chat" && page !== "logs" && page !== "settings" && page !== "benchmark" && <aside>
         {page === "detail" ? <CapabilityPanel data={data} /> : <ContextPanel data={data} selected={selected}
           details={() => setPage("detail")} eject={() => void run(bridge.eject)} load={model => { setSelectedId(model.id); setPage("detail"); }} />}
       </aside>}

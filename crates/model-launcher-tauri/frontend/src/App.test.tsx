@@ -60,6 +60,14 @@ describe("Model Launcher", () => {
     await waitFor(() => expect(screen.getByText("OpenAI 兼容接口")).toBeInTheDocument());
   });
 
+  it("exposes the benchmark page in navigation", async () => {
+    render(<App />);
+    await screen.findAllByText("Qwen 8B");
+    fireEvent.click(screen.getByRole("button", { name: /基准测试/ }));
+    expect(await screen.findByRole("heading", { name: "基准测试" })).toBeInTheDocument();
+    expect(screen.getByText("http://127.0.0.1:1234/v1/chat/completions")).toBeInTheDocument();
+  });
+
   it("exposes chat navigation for the running model", async () => {
     render(<App />);
     await screen.findAllByText("Qwen 8B");
