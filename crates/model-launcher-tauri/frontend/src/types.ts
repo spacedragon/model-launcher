@@ -74,5 +74,14 @@ export type LogRecord = {
   timestamp_ms: number;
   source: "application" | "engine_stdout" | "engine_stderr";
   level: "trace" | "debug" | "info" | "warn" | "error";
+  generation?: number;
+  model_id?: string;
+  message: string;
+  truncated?: boolean;
+};
+
+export type LoadFinished = {
+  modelId: string;
+  success: boolean;
   message: string;
 };
