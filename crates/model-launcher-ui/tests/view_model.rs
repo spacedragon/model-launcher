@@ -90,6 +90,7 @@ fn model(name: &str, size: u64) -> ModelRecord {
         path: PathBuf::from(format!("/models/{name}.gguf")),
         file_identity: CatalogIdentity::default(),
         size_bytes: size,
+        metadata: Default::default(),
         state: ModelState::Available,
         launch_profile: LaunchProfile::default(),
     }

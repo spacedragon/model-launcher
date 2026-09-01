@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["model-launcher-ui/custom-protocol"]
+
 [dependencies]
 model-launcher-core = { path = "../../crates/model-launcher-core" }
 model-launcher-api = { path = "../../crates/model-launcher-api" }

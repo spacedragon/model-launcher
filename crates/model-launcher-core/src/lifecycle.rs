@@ -222,7 +222,7 @@ struct AcquireWaiter {
 
 enum ProcessEvent<T> {
     Process(Result<T, AppError>),
-    Command(Option<Command>),
+    Command(Box<Option<Command>>),
     Release(LeaseRelease),
 }
 
@@ -236,7 +236,7 @@ enum StopDirective {
 enum StopEvent {
     Graceful(Result<(), AppError>),
     Timeout,
-    Command(Option<Command>),
+    Command(Box<Option<Command>>),
     Release(LeaseRelease),
 }
 
@@ -356,7 +356,7 @@ async fn select_exit(
 ) -> ProcessEvent<i32> {
     tokio::select! {
         result = process.wait_for_exit() => ProcessEvent::Process(result),
-        command = commands.recv() => ProcessEvent::Command(command),
+        command = commands.recv() => ProcessEvent::Command(Box::new(command)),
         Some(release) = releases.recv() => ProcessEvent::Release(release),
     }
 }
@@ -604,7 +604,7 @@ impl Actor {
                     self.failures = self.failures.saturating_add(1);
                     return Box::pin(self.backoff(model, generation)).await;
                 }
-                ProcessEvent::Command(command) => match command {
+                ProcessEvent::Command(command) => match *command {
                     Some(Command::Acquire {
                         model: same,
                         releases,
@@ -824,18 +824,19 @@ impl Actor {
                 let event = tokio::select! {
                     result = &mut graceful => StopEvent::Graceful(result),
                     () = &mut timeout => StopEvent::Timeout,
-                    command = self.commands.recv(), if commands_open => StopEvent::Command(command),
+                    command = self.commands.recv(), if commands_open => StopEvent::Command(Box::new(command)),
                     Some(release) = self.releases.recv() => StopEvent::Release(release),
                 };
                 match event {
                     StopEvent::Graceful(result) => break result.is_err(),
                     StopEvent::Timeout => break true,
-                    StopEvent::Command(None) => {
-                        commands_open = false;
-                        directive = StopDirective::Shutdown;
-                    }
                     StopEvent::Command(command) => {
-                        self.handle_stop_command(command, &mut directive, &mut waiters)
+                        if let Some(command) = *command {
+                            self.handle_stop_command(command, &mut directive, &mut waiters)
+                        } else {
+                            commands_open = false;
+                            directive = StopDirective::Shutdown;
+                        }
                     }
                     StopEvent::Release(release) => self.handle_release(release),
                 }
@@ -852,7 +853,7 @@ impl Actor {
                     let event = tokio::select! {
                         result = &mut force => StopEvent::Graceful(result),
                         () = &mut timeout => StopEvent::Timeout,
-                        command = self.commands.recv(), if commands_open => StopEvent::Command(command),
+                        command = self.commands.recv(), if commands_open => StopEvent::Command(Box::new(command)),
                         Some(release) = self.releases.recv() => StopEvent::Release(release),
                     };
                     match event {
@@ -860,12 +861,13 @@ impl Actor {
                             break result.map_err(|error| error.to_string());
                         }
                         StopEvent::Timeout => break Err("force shutdown timed out".to_owned()),
-                        StopEvent::Command(None) => {
-                            commands_open = false;
-                            directive = StopDirective::Shutdown;
-                        }
                         StopEvent::Command(command) => {
-                            self.handle_stop_command(command, &mut directive, &mut waiters)
+                            if let Some(command) = *command {
+                                self.handle_stop_command(command, &mut directive, &mut waiters)
+                            } else {
+                                commands_open = false;
+                                directive = StopDirective::Shutdown;
+                            }
                         }
                         StopEvent::Release(release) => self.handle_release(release),
                     }
@@ -882,12 +884,12 @@ impl Actor {
 
     fn handle_stop_command(
         &mut self,
-        command: Option<Command>,
+        command: Command,
         directive: &mut StopDirective,
         waiters: &mut Vec<oneshot::Sender<Result<(), AppError>>>,
     ) {
         match command {
-            Some(Command::Eject { reply }) => {
+            Command::Eject { reply } => {
                 if *directive != StopDirective::Shutdown {
                     *directive = StopDirective::Cancel;
                 }
@@ -895,19 +897,18 @@ impl Actor {
                 self.publish();
                 waiters.push(reply);
             }
-            Some(Command::Shutdown { reply }) => {
+            Command::Shutdown { reply } => {
                 *directive = StopDirective::Shutdown;
                 self.desired = None;
                 self.publish();
                 waiters.push(reply);
             }
-            Some(Command::Load { reply, .. }) => {
+            Command::Load { reply, .. } => {
                 let _ = reply.send(Err(AppError::ModelStarting));
             }
-            Some(Command::Acquire { reply, .. }) => {
+            Command::Acquire { reply, .. } => {
                 let _ = reply.send(Err(AppError::ModelStarting));
             }
-            None => *directive = StopDirective::Shutdown,
         }
     }
 

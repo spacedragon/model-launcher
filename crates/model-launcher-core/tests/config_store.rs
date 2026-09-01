@@ -87,6 +87,7 @@ fn model(state: ModelState) -> ModelRecord {
         path: PathBuf::from("models/qwen.gguf"),
         file_identity: CatalogIdentity::Unavailable,
         size_bytes: 4_294_967_296,
+        metadata: Default::default(),
         state,
         launch_profile: Default::default(),
     }

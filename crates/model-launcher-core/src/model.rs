@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use uuid::Uuid;
 
-use crate::{AppError, CatalogIdentity, LaunchSettings};
+use crate::{AppError, CatalogIdentity, CatalogMetadata, LaunchSettings};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -103,6 +103,8 @@ pub struct ModelRecord {
     #[serde(default)]
     pub file_identity: CatalogIdentity,
     pub size_bytes: u64,
+    #[serde(default)]
+    pub metadata: CatalogMetadata,
     pub state: ModelState,
     pub launch_profile: LaunchProfile,
 }
