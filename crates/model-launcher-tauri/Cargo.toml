@@ -21,5 +21,9 @@ tokio.workspace = true
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "http2"] }
 
+[dev-dependencies]
+axum = "0.8"
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+
 [build-dependencies]
 tauri-build = "2.4"

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use model_launcher_core::{
     AppError, EngineCapabilities, EngineFuture, EngineLogFramer, EngineProcess, EngineSpec,
     InferenceEngine, LaunchSettings, LogLevel, LogRecord, LogSource, LogStore,
-    MAX_ENGINE_LOG_LINE_BYTES, ModelId, ModelRecord,
+    MAX_ENGINE_LOG_LINE_BYTES, ModelId, ModelRecord, SpeculativeType,
 };
 use std::{
     io::{self, Write},
@@ -789,6 +789,34 @@ impl LlamaCppWslEngine {
 fn app_error(error: impl std::error::Error + Send + Sync + 'static) -> AppError {
     AppError::EngineProcess(Box::new(error))
 }
+
+fn prepare_launch_settings(
+    model: &ModelRecord,
+    settings: &LaunchSettings,
+) -> Result<LaunchSettings, AppError> {
+    let mut prepared = settings.clone();
+    match (settings.speculative_type, settings.draft_model.as_deref()) {
+        (Some(SpeculativeType::DraftDflash), Some(path)) => {
+            if !path.is_file() {
+                return Err(AppError::InvalidSetting("draft_model"));
+            }
+            if model.path == path {
+                return Err(AppError::InvalidSetting("draft_model"));
+            }
+            let path = path
+                .to_str()
+                .ok_or(AppError::InvalidSetting("draft_model"))?;
+            prepared.draft_model = Some(PathBuf::from(
+                windows_to_wsl_path(path).map_err(|_| AppError::InvalidSetting("draft_model"))?,
+            ));
+        }
+        (Some(SpeculativeType::DraftDflash), None) | (_, Some(_)) => {
+            return Err(AppError::InvalidSetting("draft_model"));
+        }
+        _ => {}
+    }
+    Ok(prepared)
+}
 async fn establish_pid(child: &mut dyn WslChild) -> Result<OwnedPid, WslError> {
     let result = child.pid_control_line().await.and_then(|line| {
         parse_ownership_handshake(&line).map_err(|error| WslError::Command(error.to_string()))
@@ -828,6 +856,7 @@ impl InferenceEngine for LlamaCppWslEngine {
                     .ok_or_else(|| app_error(io::Error::other("non-Unicode model path")))?,
             )
             .map_err(|e| app_error(io::Error::other(e.to_string())))?;
+            let settings = prepare_launch_settings(model, settings)?;
             let caps = self.probe().await.map_err(app_error)?.capabilities;
             if settings.render(&caps).unsupported.is_empty() {
                 Ok(())
@@ -843,6 +872,7 @@ impl InferenceEngine for LlamaCppWslEngine {
     ) -> EngineFuture<'a, Box<dyn EngineProcess>> {
         Box::pin(async move {
             let snapshot = self.probe().await.map_err(app_error)?;
+            let settings = prepare_launch_settings(model, settings)?;
             let rendered = settings.render(&snapshot.capabilities);
             if !rendered.unsupported.is_empty() {
                 return Err(AppError::InvalidSetting("unsupported_by_engine"));
@@ -1207,6 +1237,67 @@ mod tests {
         atomic::{AtomicBool, Ordering},
     };
     use std::{collections::VecDeque, net::SocketAddr};
+
+    fn model_with_path(path: impl Into<PathBuf>) -> ModelRecord {
+        ModelRecord {
+            id: ModelId::new(),
+            key: model_launcher_core::ModelKey::parse("target").unwrap(),
+            display_name: "Target".into(),
+            path: path.into(),
+            file_identity: model_launcher_core::CatalogIdentity::Unavailable,
+            size_bytes: 1,
+            metadata: model_launcher_core::CatalogMetadata::default(),
+            state: model_launcher_core::ModelState::Available,
+            launch_profile: model_launcher_core::LaunchProfile::default(),
+        }
+    }
+
+    #[test]
+    fn dflash_requires_a_separate_draft_model() {
+        let target = model_with_path(r"C:\models\target.gguf");
+        let missing = LaunchSettings {
+            speculative_type: Some(SpeculativeType::DraftDflash),
+            ..LaunchSettings::default()
+        };
+        let unrelated = LaunchSettings {
+            draft_model: Some(PathBuf::from(r"C:\models\draft.gguf")),
+            ..LaunchSettings::default()
+        };
+
+        assert!(matches!(
+            prepare_launch_settings(&target, &missing),
+            Err(AppError::InvalidSetting("draft_model"))
+        ));
+        assert!(matches!(
+            prepare_launch_settings(&target, &unrelated),
+            Err(AppError::InvalidSetting("draft_model"))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dflash_draft_path_is_validated_and_translated_for_wsl() {
+        let directory = tempfile::tempdir().unwrap();
+        let target_path = directory.path().join("target.gguf");
+        let draft_path = directory.path().join("draft.gguf");
+        std::fs::write(&target_path, b"target").unwrap();
+        std::fs::write(&draft_path, b"draft").unwrap();
+        let settings = LaunchSettings {
+            speculative_type: Some(SpeculativeType::DraftDflash),
+            draft_model: Some(draft_path.clone()),
+            ..LaunchSettings::default()
+        };
+
+        let prepared = prepare_launch_settings(&model_with_path(target_path), &settings).unwrap();
+
+        assert!(
+            prepared
+                .draft_model
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("/mnt/")
+        );
+    }
 
     #[derive(Default)]
     struct FakeRunner {

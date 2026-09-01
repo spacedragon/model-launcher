@@ -2120,6 +2120,7 @@ dependencies = [
 name = "model-launcher-ui"
 version = "0.2.0"
 dependencies = [
+ "axum",
  "futures-util",
  "model-launcher-core",
  "reqwest",
