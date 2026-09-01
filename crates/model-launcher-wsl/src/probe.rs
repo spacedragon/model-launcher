@@ -144,6 +144,7 @@ pub fn capabilities_from_help(help: &str) -> EngineCapabilities {
         flash_attention: has(&["--flash-attn", "--flash-attention"]),
         kv_cache_type: has(&["--cache-type-k"]) && has(&["--cache-type-v"]),
         speculative_type: has(&["--spec-type"]),
+        draft_model: has(&["--spec-draft-model", "--model-draft", "-md"]),
     }
 }
 
@@ -158,7 +159,7 @@ mod tests {
             vec!["-d", "Ubuntu 24.04", "--", "/opt/llama server", "--version"]
         );
         let caps = capabilities_from_help(
-            "--ctx-size --n-gpu-layers --threads --batch-size --parallel --flash-attn --cache-type-k --cache-type-v --spec-type",
+            "--ctx-size --n-gpu-layers --threads --batch-size --parallel --flash-attn --cache-type-k --cache-type-v --spec-type --spec-draft-model",
         );
         assert!(
             caps.context_length
@@ -169,7 +170,9 @@ mod tests {
                 && caps.flash_attention
                 && caps.kv_cache_type
                 && caps.speculative_type
+                && caps.draft_model
         );
+        assert!(capabilities_from_help("--model-draft").draft_model);
         assert!(!capabilities_from_help("--unknown").context_length);
         assert_eq!(
             capture_version("llama-server version 4123\n"),

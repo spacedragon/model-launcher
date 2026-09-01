@@ -1,4 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::path::PathBuf;
 
 use crate::{AppError, CatalogMetadata};
 
@@ -99,6 +100,7 @@ pub struct LaunchSettings {
     pub flash_attention: Option<bool>,
     pub kv_cache_type: Option<KvCacheType>,
     pub speculative_type: Option<SpeculativeType>,
+    pub draft_model: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +114,7 @@ pub enum SettingId {
     FlashAttention,
     KvCacheType,
     SpeculativeType,
+    DraftModel,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -196,6 +199,16 @@ impl LaunchSettings {
                 unsupported.push(SettingId::SpeculativeType);
             }
         }
+        if let Some(value) = &self.draft_model {
+            if capabilities.draft_model {
+                args.extend([
+                    "--spec-draft-model".into(),
+                    value.to_string_lossy().into_owned(),
+                ]);
+            } else {
+                unsupported.push(SettingId::DraftModel);
+            }
+        }
         RenderedLaunchSettings { args, unsupported }
     }
 }
@@ -227,6 +240,7 @@ pub struct EngineCapabilities {
     pub flash_attention: bool,
     pub kv_cache_type: bool,
     pub speculative_type: bool,
+    pub draft_model: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -445,6 +459,30 @@ mod tests {
         assert_eq!(
             settings.to_args(&capabilities),
             ["--spec-type", "draft-mtp"]
+        );
+    }
+
+    #[test]
+    fn dflash_uses_the_selected_draft_model_with_current_llama_cpp_arguments() {
+        let settings = LaunchSettings {
+            speculative_type: Some(SpeculativeType::DraftDflash),
+            draft_model: Some(PathBuf::from("/models/qwen-dflash.gguf")),
+            ..LaunchSettings::default()
+        };
+        let capabilities = EngineCapabilities {
+            speculative_type: true,
+            draft_model: true,
+            ..EngineCapabilities::default()
+        };
+
+        assert_eq!(
+            settings.to_args(&capabilities),
+            [
+                "--spec-type",
+                "draft-dflash",
+                "--spec-draft-model",
+                "/models/qwen-dflash.gguf",
+            ]
         );
     }
 
