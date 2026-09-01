@@ -267,6 +267,7 @@ fn model(name: &str) -> ModelRecord {
         path: PathBuf::from(format!("/{name}.gguf")),
         file_identity: CatalogIdentity::Unavailable,
         size_bytes: 1,
+        metadata: Default::default(),
         state: ModelState::Available,
         launch_profile: LaunchProfile::default(),
     }

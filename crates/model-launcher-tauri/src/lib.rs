@@ -1,6 +1,6 @@
 use model_launcher_core::{
-    EngineCapabilities, LaunchSettings, LifecycleSnapshot, LogFilter, LogLevel, LogRecord,
-    LogSource, ModelId, ModelRecord, ModelState,
+    CatalogMetadata, ContextEstimate, EngineCapabilities, LaunchSettings, LifecycleSnapshot,
+    LogFilter, LogLevel, LogRecord, LogSource, ModelId, ModelRecord, ModelState, estimate_context,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,6 +22,14 @@ pub struct AppSnapshot {
     pub engine_valid: bool,
     pub engine_diagnostic: Option<String>,
     pub configuration_diagnostic: Option<String>,
+    pub gpu_memory: Option<GpuMemoryInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMemoryInfo {
+    pub name: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -78,6 +86,7 @@ struct Bootstrap {
     engine_settings: EngineSettings,
     server_settings: UiServerSettings,
     base_url: String,
+    gpu_memory: Option<GpuMemoryInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -93,6 +102,8 @@ struct ModelDto {
     state: String,
     running: bool,
     settings: LaunchSettings,
+    metadata: CatalogMetadata,
+    context_estimate: Option<ContextEstimate>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -130,6 +141,16 @@ fn bootstrap(state: &DesktopState) -> Bootstrap {
         },
         running: running == Some(model.id),
         settings: model.launch_profile.settings.clone(),
+        metadata: model.metadata.clone(),
+        context_estimate: snapshot.gpu_memory.as_ref().map(|gpu| {
+            estimate_context(
+                &model.metadata,
+                model.size_bytes,
+                &model.launch_profile.settings,
+                gpu.total_bytes,
+                gpu.free_bytes,
+            )
+        }),
     };
     Bootstrap {
         models: snapshot.models.iter().map(convert).collect(),
@@ -149,12 +170,39 @@ fn bootstrap(state: &DesktopState) -> Bootstrap {
         engine_settings: (state.actions.engine_settings)(),
         server_settings: (state.actions.server_settings)(),
         base_url: format!("http://{}", state.address),
+        gpu_memory: snapshot.gpu_memory,
     }
 }
 
 #[tauri::command]
 fn get_bootstrap(state: tauri::State<'_, DesktopState>) -> Bootstrap {
     bootstrap(&state)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ContextEstimateRequest {
+    id: ModelId,
+    settings: LaunchSettings,
+}
+
+#[tauri::command]
+fn estimate_model_context(
+    state: tauri::State<'_, DesktopState>,
+    request: ContextEstimateRequest,
+) -> Option<ContextEstimate> {
+    let snapshot = (state.actions.snapshot)();
+    let gpu = snapshot.gpu_memory?;
+    let model = snapshot
+        .models
+        .iter()
+        .find(|model| model.id == request.id)?;
+    Some(estimate_context(
+        &model.metadata,
+        model.size_bytes,
+        &request.settings,
+        gpu.total_bytes,
+        gpu.free_bytes,
+    ))
 }
 
 #[tauri::command]
@@ -307,6 +355,7 @@ pub fn run_desktop(
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_bootstrap,
+            estimate_model_context,
             load_model,
             eject_model,
             rescan_models,

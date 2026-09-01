@@ -2,8 +2,8 @@ use model_launcher::{EngineSettingsManager, LauncherSettings, Service, ServiceOp
 use model_launcher_api::{Authentication, GatewayConfig, GatewayLimits, TokenStore};
 use model_launcher_core::{LogFilter, LogStore, LogStoreLimits};
 use model_launcher_ui::{
-    AppSnapshot, CloseNoticeStore, UiActions, UiServerSettings, configuration_diagnostic_status,
-    run_desktop, server_authentication_status, server_lan_warning,
+    AppSnapshot, CloseNoticeStore, GpuMemoryInfo, UiActions, UiServerSettings,
+    configuration_diagnostic_status, run_desktop, server_authentication_status, server_lan_warning,
 };
 use model_launcher_wsl::{LlamaCppWslEngine, ProbeCache, TokioCommandRunner, WslProber};
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -134,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     configuration_diagnostic: configuration_diagnostic_status(
                         snapshot.config_diagnostic.as_ref(),
                     ),
+                    gpu_memory: detect_gpu_memory(),
                 }
             }
         }),
@@ -326,12 +327,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             configuration_diagnostic: configuration_diagnostic_status(
                 snapshot.config_diagnostic.as_ref(),
             ),
+            gpu_memory: detect_gpu_memory(),
         },
         handle.local_addr().to_string(),
         actions,
     )?;
     runtime.block_on(handle.shutdown())?;
     Ok(())
+}
+
+fn detect_gpu_memory() -> Option<GpuMemoryInfo> {
+    const MIB: u64 = 1024 * 1024;
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()?
+        .to_owned();
+    let mut fields = line.split(',').map(str::trim);
+    let name = fields.next()?.to_owned();
+    let total_bytes = fields.next()?.parse::<u64>().ok()?.checked_mul(MIB)?;
+    let free_bytes = fields.next()?.parse::<u64>().ok()?.checked_mul(MIB)?;
+    Some(GpuMemoryInfo {
+        name,
+        total_bytes,
+        free_bytes,
+    })
 }
 
 struct ProductionEngineSettings {

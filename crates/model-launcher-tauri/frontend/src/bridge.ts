@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { Bootstrap, LaunchSettings, LogRecord } from "./types";
+import type { Bootstrap, ContextEstimate, LaunchSettings, LogRecord } from "./types";
 
 export const bridge = {
   bootstrap: () => invoke<Bootstrap>("get_bootstrap"),
+  estimateContext: (id: string, settings: LaunchSettings) =>
+    invoke<ContextEstimate | undefined>("estimate_model_context", { request: { id, settings } }),
   load: (id: string, key: string, settings: LaunchSettings) =>
     invoke("load_model", { request: { id, key, settings } }),
   eject: () => invoke("eject_model"),

@@ -222,6 +222,7 @@ fn api_model() -> ApiModel {
             path: PathBuf::from("tiny.gguf"),
             file_identity: CatalogIdentity::Unavailable,
             size_bytes: 42,
+            metadata: Default::default(),
             state: ModelState::Available,
             launch_profile: LaunchProfile::default(),
         },

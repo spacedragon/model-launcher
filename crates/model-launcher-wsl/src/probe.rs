@@ -142,7 +142,8 @@ pub fn capabilities_from_help(help: &str) -> EngineCapabilities {
         batch_size: has(&["--batch-size", "-b"]),
         parallel_slots: has(&["--parallel", "-np"]),
         flash_attention: has(&["--flash-attn", "--flash-attention"]),
-        kv_cache_type: has(&["--cache-type-k"]),
+        kv_cache_type: has(&["--cache-type-k"]) && has(&["--cache-type-v"]),
+        speculative_type: has(&["--spec-type"]),
     }
 }
 
@@ -157,7 +158,7 @@ mod tests {
             vec!["-d", "Ubuntu 24.04", "--", "/opt/llama server", "--version"]
         );
         let caps = capabilities_from_help(
-            "--ctx-size --n-gpu-layers --threads --batch-size --parallel --flash-attn --cache-type-k",
+            "--ctx-size --n-gpu-layers --threads --batch-size --parallel --flash-attn --cache-type-k --cache-type-v --spec-type",
         );
         assert!(
             caps.context_length
@@ -167,6 +168,7 @@ mod tests {
                 && caps.parallel_slots
                 && caps.flash_attention
                 && caps.kv_cache_type
+                && caps.speculative_type
         );
         assert!(!capabilities_from_help("--unknown").context_length);
         assert_eq!(

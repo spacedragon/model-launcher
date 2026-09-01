@@ -194,13 +194,20 @@ fn system_time_nanos(value: std::time::SystemTime) -> i128 {
         .unwrap_or_default()
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogMetadata {
     pub architecture: Option<String>,
     pub parameter_count: Option<u64>,
     pub quantization: Option<String>,
     pub quantization_version: Option<u64>,
     pub context_length: Option<u64>,
+    pub block_count: Option<u64>,
+    pub embedding_length: Option<u64>,
+    pub attention_head_count: Option<u64>,
+    pub attention_head_count_kv: Option<u64>,
+    pub attention_key_length: Option<u64>,
+    pub attention_value_length: Option<u64>,
+    pub full_attention_interval: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,8 +257,10 @@ pub const MAX_CATALOG_TENSORS: u64 = 100_000;
 /// Aggregate tensor descriptor budget across a scan. Catalog never reads tensor payloads, but the
 /// pinned GGUF reader still validates descriptors, so storms of otherwise-small files are capped.
 pub const MAX_TOTAL_CATALOG_TENSORS: u64 = 250_000;
-pub const MAX_CATALOG_METADATA_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_CATALOG_DECODED_METADATA_BYTES: usize = 8 * 1024 * 1024;
+// Modern GGUF tokenizers can legitimately make the metadata section larger than 10 MiB. Keep the
+// parser bounded, but leave enough room for current llama.cpp vocabularies.
+pub const MAX_CATALOG_METADATA_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CATALOG_DECODED_METADATA_BYTES: usize = 32 * 1024 * 1024;
 
 /// Recursively scans `root` without following symlinks. This prevents both directory loops and
 /// traversal through a link outside the configured root. Entry failures are retained as diagnostics.
@@ -861,11 +870,32 @@ fn read_model(
             (
                 string("general.name").unwrap_or_else(|| fallback.clone()),
                 CatalogMetadata {
-                    architecture,
+                    architecture: architecture.clone(),
                     parameter_count: integer("general.parameter_count"),
                     quantization,
                     quantization_version: integer("general.quantization_version"),
                     context_length,
+                    block_count: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.block_count"))),
+                    embedding_length: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.embedding_length"))),
+                    attention_head_count: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.attention.head_count"))),
+                    attention_head_count_kv: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.attention.head_count_kv"))),
+                    attention_key_length: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.attention.key_length"))),
+                    attention_value_length: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.attention.value_length"))),
+                    full_attention_interval: architecture
+                        .as_deref()
+                        .and_then(|arch| integer(&format!("{arch}.full_attention_interval"))),
                 },
             )
         }
@@ -1080,6 +1110,7 @@ pub fn reconcile_catalog(
             record.path = model.path;
             record.file_identity = model.identity;
             record.size_bytes = model.size_bytes;
+            record.metadata = model.metadata;
             record.state = ModelState::Available;
         } else {
             let key = unique_key(&model.display_name, &mut used_keys);
@@ -1090,6 +1121,7 @@ pub fn reconcile_catalog(
                 path: model.path,
                 file_identity: model.identity,
                 size_bytes: model.size_bytes,
+                metadata: model.metadata,
                 state: ModelState::Available,
                 launch_profile: LaunchProfile {
                     settings: saved.default_launch_settings.clone(),
