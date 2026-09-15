@@ -23,11 +23,12 @@
 //!    **Ownership rule (PGID-reuse safety, ADR-0002)**: a group signal
 //!    is only ever sent for a PGID whose ownership is verifiable —
 //!    while the child (group leader) is alive, or because a group
-//!    member recorded in the `group_members` snapshot (pid + starttime,
-//!    scanned while the child was alive) still exists, which keeps the
-//!    PGID number from having been freed and reused. Once the leader is
-//!    gone and no snapshot member can be found, the PGID is never
-//!    signaled again. Accepted residual gap: a descendant spawned in the
+//!    member recorded in the `group_members` snapshot (pid + pgrp +
+//!    starttime, scanned while the child was alive) still exists, which
+//!    keeps the PGID number from having been freed and reused. Once the
+//!    leader is gone and no snapshot member can be found, the PGID is
+//!    never signaled again. Settle/timeout decisions additionally ignore
+//!    zombie members (they hold the PGID number but no pipes). Accepted residual gap: a descendant spawned in the
 //!    last refresh interval before the leader's exit may survive
 //!    (killing a stranger is strictly worse than a survivor); M2's
 //!    dedicated cgroup closes even that gap.
@@ -111,14 +112,13 @@ pub struct ChildSupervisor {
     stderr_total: u64,
     stderr_tail: Vec<u8>,
     exited: bool,
-    /// Unix: `(pid, starttime)` of every process seen in our group
-    /// WHILE THE CHILD WAS ALIVE (see `refresh_ownership` /
-    /// `group_is_ours`). Only members from this snapshot may justify
-    /// signaling the group after the leader has exited — a PGID whose
-    /// snapshot members are all gone may already have been freed and
-    /// reused, and is never signaled.
+    /// Unix: every process seen in our group WHILE THE CHILD WAS ALIVE
+    /// (see `refresh_ownership` / `group_is_ours`). Only members from
+    /// this snapshot may justify signaling the group after the leader
+    /// has exited — a PGID whose snapshot members are all gone may
+    /// already have been freed and reused, and is never signaled.
     #[cfg(unix)]
-    group_members: Vec<(u32, u64)>,
+    group_members: Vec<GroupMember>,
     #[cfg(unix)]
     pgid: u32,
 }
@@ -257,9 +257,26 @@ impl ChildSupervisor {
     #[cfg(unix)]
     fn group_is_ours(&self) -> bool {
         let pgid = self.pgid;
+        // Zombies count: they still hold the PGID number, so the number
+        // cannot have been freed and reused — signaling `-pgid` is safe.
         self.group_members
             .iter()
-            .any(|(pid, st)| member_still_there(*pid, *st, pgid))
+            .any(|m| member_still_there(m.pid, m.starttime, pgid, false))
+    }
+
+    /// (unix) True when at least one snapshotted member is still a
+    /// **live** (non-zombie) process in this group. This is the
+    /// predicate that decides whether the group still has work to do
+    /// (pipes can only be held by live processes): a group whose
+    /// remaining members are all zombies has settled even if PID 1 has
+    /// not reaped them yet, so `terminate` must not wait the full hard
+    /// timeout for it.
+    #[cfg(unix)]
+    fn group_has_live_ours(&self) -> bool {
+        let pgid = self.pgid;
+        self.group_members
+            .iter()
+            .any(|m| member_still_there(m.pid, m.starttime, pgid, true))
     }
 
     /// Read stdout for up to `budget`, continuously. This is the whole
@@ -476,6 +493,8 @@ impl ChildSupervisor {
         // caller happened to poll it first.
         self.reap()?;
         if self.exited {
+            // (ownership cleanup below; never a group signal for a PGID
+            // with no verifiable ownership — see ADR-0002).
             // The direct child is reaped, but on unix group descendants
             // (e.g. a backgrounded `sleep` that outlived its leader) may
             // still be alive and holding the stdout pipe.
@@ -498,10 +517,13 @@ impl ChildSupervisor {
                     let _ = signal_group(pgid, "KILL");
                 }
                 let deadline = Instant::now() + POST_KILL_HARD_TIMEOUT;
-                while self.group_is_ours() && Instant::now() < deadline {
+                // Settle on LIVE members: zombies (pending reaping by
+                // PID 1) hold the PGID number but no pipes, so they do
+                // not keep the group from settling.
+                while self.group_has_live_ours() && Instant::now() < deadline {
                     sleep(POLL).await;
                 }
-                if self.group_is_ours() {
+                if self.group_has_live_ours() {
                     return Err(IoError::new(
                         ErrorKind::TimedOut,
                         "child group still alive after force kill",
@@ -510,6 +532,17 @@ impl ChildSupervisor {
             }
             return Ok(TerminateOutcome::AlreadyExited);
         }
+        // The child is confirmed alive (the `reap` above) ⇒ the PGID is
+        // provably ours: take an ownership snapshot BEFORE signaling, so
+        // that if the leader dies during grace the post-exit cleanup can
+        // still verify group ownership. Without this, a `terminate()`
+        // called straight after spawn (no prior `is_alive`) would have an
+        // empty snapshot, and a TERM-ignoring descendant surviving the
+        // leader's death would be invisible to `group_is_ours` —
+        // misreported as `Graceful` while leaking the descendant and its
+        // pipes.
+        #[cfg(unix)]
+        self.refresh_ownership();
         // Phase 1 — graceful.
         #[cfg(unix)]
         {
@@ -555,7 +588,10 @@ impl ChildSupervisor {
                     // using the number is NOT verifiably ours and is
                     // never signaled — `Graceful` is correct: nothing we
                     // own holds the pipes.
-                    if !self.group_is_ours() {
+                    // Settle on LIVE members: all-zombie remnants hold
+                    // the PGID number but no pipes — `Graceful` is
+                    // correct for them (nothing of ours can block an EOF).
+                    if !self.group_has_live_ours() {
                         return Ok(TerminateOutcome::Graceful);
                     }
                     // Verified-own group members survived TERM ⇒ escalate.
@@ -605,7 +641,7 @@ impl ChildSupervisor {
         loop {
             if self.reap()? {
                 #[cfg(unix)]
-                let survivors = self.group_is_ours();
+                let survivors = self.group_has_live_ours();
                 #[cfg(not(unix))]
                 let survivors = false;
                 if !survivors {
@@ -822,13 +858,26 @@ fn signal_group(pgid: u32, name: &str) -> std::io::Result<()> {
     }
 }
 
-/// (unix) `(pid, starttime)` of every process in process group `pgid`
-/// (zombies included — a zombie still holds the PGID number, which is
-/// exactly what makes it a valid ownership anchor). Linux `/proc` scan;
-/// returns empty when `/proc` is unavailable, which callers treat as
-/// "no ownership evidence" (never a signal).
+/// (unix) A process observed in our group while the child was alive.
+/// (Zombie state is intentionally NOT cached: it changes as PID 1 reaps
+/// the process, so every decision re-queries `/proc` via
+/// `member_still_there` — a zombie *still holds the PGID number*, which
+/// is exactly what makes a member a valid ownership anchor.)
 #[cfg(unix)]
-fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
+#[derive(Debug, Clone, Copy)]
+struct GroupMember {
+    pid: u32,
+    starttime: u64,
+}
+
+/// (unix) Every process in process group `pgid` (zombies included — a
+/// zombie still holds the PGID number, which is exactly what makes it a
+/// valid ownership anchor). Linux `/proc` scan; returns empty when
+/// `/proc` is unavailable, which callers treat as "no ownership
+/// evidence" (never a signal). Current zombie state is re-queried at
+/// decision time, not cached here.
+#[cfg(unix)]
+fn scan_group_members(pgid: u32) -> Vec<GroupMember> {
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -842,8 +891,8 @@ fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
             continue;
         };
         // comm is parenthesized and may contain spaces/parens; the
-        // numeric fields start after the LAST `)`: state, ppid, pgrp,
-        // ..., starttime (index 19).
+        // numeric fields start after the LAST `)`: state(0), ppid(1),
+        // pgrp(2), ..., starttime(19).
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
@@ -851,15 +900,12 @@ fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
             continue;
         };
         let fields: Vec<&str> = stat[paren_end + 1..].split_whitespace().collect();
-        let (Some(pgrp), Some(starttime)) = (fields.get(2), fields.get(19)) else {
-            continue;
-        };
-        let pgrp_match = *pgrp == target.as_str();
-        let Ok(starttime) = starttime.parse::<u64>() else {
+        let pgrp_match = fields.get(2).copied() == Some(target.as_str());
+        let Some(starttime) = fields.get(19).and_then(|s| s.parse::<u64>().ok()) else {
             continue;
         };
         if pgrp_match {
-            out.push((pid, starttime));
+            out.push(GroupMember { pid, starttime });
         }
     }
     out
@@ -870,8 +916,10 @@ fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
 /// a different starttime, and a member that left the group via
 /// `setpgid`/`setsid` has a different pgrp (it no longer holds the
 /// PGID number, so it must not be used to authorize a group signal).
+/// `require_live` additionally requires a non-zombie state (a zombie
+/// holds the PGID but no pipes).
 #[cfg(unix)]
-fn member_still_there(pid: u32, starttime: u64, pgid: u32) -> bool {
+fn member_still_there(pid: u32, starttime: u64, pgid: u32, require_live: bool) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -881,7 +929,8 @@ fn member_still_there(pid: u32, starttime: u64, pgid: u32) -> bool {
     let fields: Vec<&str> = stat[paren_end + 1..].split_whitespace().collect();
     let same_start = fields.get(19).and_then(|s| s.parse::<u64>().ok()) == Some(starttime);
     let same_pgrp = fields.get(2).copied() == Some(&pgid.to_string());
-    same_start && same_pgrp
+    let live = !require_live || fields.first().copied() != Some("Z");
+    same_start && same_pgrp && live
 }
 
 #[cfg(test)]
