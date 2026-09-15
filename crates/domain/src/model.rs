@@ -7,10 +7,17 @@
 //!
 //! Field names and wire casing follow `docs/api.md` so the same structs can be
 //! serialized to the management / LM Studio / `OpenAI` responses directly.
+//!
+//! Encapsulation policy: all data fields are public so sibling crates can
+//! construct and read the types directly. Lifecycle state is moved through the
+//! validated `with_state` helpers (which run the target through the state
+//! machines in `crate::state_machine`) rather than raw field assignment, so an
+//! illegal transition is rejected, not stored.
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ErrorCode;
+use crate::error::{ErrorCode, Result};
+use crate::state_machine::{transition_instance, transition_operation};
 
 /// The artifact format on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -40,33 +47,33 @@ pub enum RuntimeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Model {
     /// Stable internal UUID.
-    id: String,
+    pub id: String,
     /// Unique readable identifier used by the API; generated on scan, may be
     /// overridden by an admin.
-    key: String,
+    pub key: String,
     /// Canonical absolute path of the artifact.
-    path: String,
+    pub path: String,
     /// Artifact format (`gguf` / `ninfer`).
-    artifact_kind: ArtifactKind,
+    pub artifact_kind: ArtifactKind,
     /// Artifact size in bytes.
-    size_bytes: u64,
+    pub size_bytes: u64,
     /// Last modification time, RFC 3339 UTC.
-    mtime: String,
+    pub mtime: String,
     /// Human display name (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
+    pub display_name: Option<String>,
     /// Default runtime to load this model with (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    default_runtime_id: Option<String>,
+    pub default_runtime_id: Option<String>,
     /// Default load configuration (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    default_load_config: Option<LoadConfig>,
+    pub default_load_config: Option<LoadConfig>,
     /// Opaque metadata read from the artifact, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    metadata: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
     /// True when a prior scan saw this model but it is no longer on disk.
     #[serde(default)]
-    deleted: bool,
+    pub deleted: bool,
 }
 
 impl Model {
@@ -112,20 +119,20 @@ pub struct Capabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runtime {
     /// Stable runtime id.
-    id: String,
+    pub id: String,
     /// Engine family.
-    kind: RuntimeKind,
+    pub kind: RuntimeKind,
     /// Absolute path to the executable.
-    executable_path: String,
+    pub executable_path: String,
     /// Whether the runtime may be used for loads.
     #[serde(default)]
-    enabled: bool,
+    pub enabled: bool,
     /// Version text captured from a probe (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    version_text: Option<String>,
+    pub version_text: Option<String>,
     /// Capabilities captured from a probe.
     #[serde(default)]
-    capabilities: Capabilities,
+    pub capabilities: Capabilities,
 }
 
 impl Runtime {
@@ -216,25 +223,25 @@ pub struct EngineConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadConfig {
     /// Context length in tokens.
-    context_length: u32,
+    pub context_length: u32,
     /// Max concurrent requests (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_concurrency: Option<u32>,
+    pub max_concurrency: Option<u32>,
     /// Evaluation / decode batch size (optional; llama.cpp & LM Studio).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    eval_batch_size: Option<u32>,
+    pub eval_batch_size: Option<u32>,
     /// Whether flash attention is enabled (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    flash_attention: Option<bool>,
+    pub flash_attention: Option<bool>,
     /// Whether the KV cache is offloaded to the GPU (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    offload_kv_cache_to_gpu: Option<bool>,
+    pub offload_kv_cache_to_gpu: Option<bool>,
     /// Number of layers on the GPU (optional; primarily llama.cpp).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    n_gpu_layers: Option<u32>,
+    pub n_gpu_layers: Option<u32>,
     /// Engine-specific parameters (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    engine_config: Option<EngineConfig>,
+    pub engine_config: Option<EngineConfig>,
 }
 
 impl LoadConfig {
@@ -339,26 +346,26 @@ pub struct InstanceFailure {
 )]
 pub struct Operation {
     /// Stable operation id (`op_...`).
-    operation_id: String,
+    pub operation_id: String,
     /// What the operation does.
-    kind: OperationKind,
+    pub kind: OperationKind,
     /// Progress state.
-    state: OperationState,
+    pub state: OperationState,
     /// The instance this operation acts on / produces (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    instance_id: Option<String>,
+    pub instance_id: Option<String>,
     /// The model the operation targets (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    model_id: Option<String>,
+    pub model_id: Option<String>,
     /// When the operation was created, RFC 3339 UTC (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<String>,
+    pub created_at: Option<String>,
     /// When the operation reached a terminal state, RFC 3339 UTC (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    finished_at: Option<String>,
+    pub finished_at: Option<String>,
     /// Structured result error, set when the operation is `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    error: Option<OperationError>,
+    pub error: Option<OperationError>,
 }
 
 impl Operation {
@@ -372,6 +379,20 @@ impl Operation {
     #[must_use]
     pub fn operation_id(&self) -> &str {
         &self.operation_id
+    }
+
+    /// Apply a validated operation-state transition and return the updated
+    /// clone (see [`crate::state_machine::transition_operation`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InvalidStateTransition`] when `to` is not reachable from
+    /// the current state.
+    pub fn with_state(self, to: OperationState) -> Result<Self> {
+        let state = transition_operation(self.state, to)?;
+        let mut this = self;
+        this.state = state;
+        Ok(this)
     }
 }
 
@@ -424,37 +445,37 @@ pub struct OperationError {
 )]
 pub struct Instance {
     /// Unique id for this load instance; also used by LM Studio unload.
-    instance_id: String,
+    pub instance_id: String,
     /// The model loaded in this instance.
-    model_id: String,
+    pub model_id: String,
     /// The runtime used to load it.
-    runtime_id: String,
+    pub runtime_id: String,
     /// The resolved load configuration.
-    load_config: LoadConfig,
+    pub load_config: LoadConfig,
     /// Current lifecycle state.
-    state: InstanceState,
+    pub state: InstanceState,
     /// Child PID, set once the supervisor confirms it (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pid: Option<u32>,
+    pub pid: Option<u32>,
     /// Loopback port, set once the supervisor confirms it (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    port: Option<u16>,
+    pub port: Option<u16>,
     /// When the instance started, RFC 3339 UTC (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    started_at: Option<String>,
+    pub started_at: Option<String>,
     /// Last time the instance served a request, RFC 3339 UTC (optional);
     /// drives LRU idle eviction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    last_used_at: Option<String>,
+    pub last_used_at: Option<String>,
     /// Number of in-flight requests (hard eviction-protection signal).
     #[serde(default)]
-    active_requests: u32,
+    pub active_requests: u32,
     /// Last health probe (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    health: Option<InstanceHealth>,
+    pub health: Option<InstanceHealth>,
     /// Structured failure, set in `failed`/`crashed` states (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    failure: Option<InstanceFailure>,
+    pub failure: Option<InstanceFailure>,
 }
 
 impl Instance {
@@ -469,6 +490,24 @@ impl Instance {
     #[must_use]
     pub fn instance_id(&self) -> &str {
         &self.instance_id
+    }
+
+    /// Apply a validated load-state transition and return the updated clone.
+    ///
+    /// This is the intended way to move an instance between states: the target
+    /// runs through [`crate::state_machine::transition_instance`], so an
+    /// illegal move is rejected rather than stored. (The fields are public, so
+    /// direct assignment is also possible, but it bypasses validation.)
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorCode::InvalidStateTransition`] when `to` is not reachable from
+    /// the current state.
+    pub fn with_state(self, to: InstanceState) -> Result<Self> {
+        let state = transition_instance(self.state, to)?;
+        let mut this = self;
+        this.state = state;
+        Ok(this)
     }
 }
 
