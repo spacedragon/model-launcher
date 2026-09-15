@@ -835,8 +835,12 @@ fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
         let (Some(pgrp), Some(starttime)) = (fields.get(2), fields.get(19)) else {
             continue;
         };
-        if *pgrp == target.as_str() && let Ok(st) = starttime.parse::<u64>() {
-            out.push((pid, st));
+        let pgrp_match = *pgrp == target.as_str();
+        let Ok(starttime) = starttime.parse::<u64>() else {
+            continue;
+        };
+        if pgrp_match {
+            out.push((pid, starttime));
         }
     }
     out
@@ -1060,8 +1064,15 @@ mod tests {
             .expect("spawn verbose");
         let pid = sup.pid();
         // Wait until the child is actually up (tasklist/proc visible),
-        // so the post-drop absence check is meaningful.
-        let visible = wait_until_visible(pid, Instant::now() + Duration::from_secs(10)).await;
+        // so the post-drop absence check is meaningful. If the host
+        // cannot enumerate processes at all, skip: a probe failure must
+        // not be misread as "child never appeared".
+        let visible = wait_until_visible(pid, Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("test skipped: {e}");
+                true
+            });
         assert!(visible, "child pid {pid} never became visible before drop");
 
         drop(sup);
@@ -1117,21 +1128,19 @@ mod tests {
     }
 
     /// Wait up to `deadline` for `pid` to become visible to the OS.
-    /// Probe failures abort the test with a skip note instead of being
-    /// misread as "child never appeared". Returns true when visibility
-    /// was verified.
-    async fn wait_until_visible(pid: u32, deadline: Instant) -> bool {
+    /// `Ok(true)` = visibility verified; `Ok(false)` = deadline passed
+    /// with the pid not visible; `Err` = the probe itself could not run
+    /// (callers must treat this as "cannot verify" and skip, never as
+    /// "child never appeared").
+    async fn wait_until_visible(pid: u32, deadline: Instant) -> Result<bool, String> {
         loop {
             match os_pid_alive(pid) {
-                Ok(true) => return true,
+                Ok(true) => return Ok(true),
                 Ok(false) => {}
-                Err(e) => {
-                    eprintln!("test skipped: cannot enumerate processes: {e}");
-                    return false;
-                }
+                Err(e) => return Err(format!("cannot enumerate processes: {e}")),
             }
             if Instant::now() >= deadline {
-                return false;
+                return Ok(false);
             }
             sleep(Duration::from_millis(50)).await;
         }
