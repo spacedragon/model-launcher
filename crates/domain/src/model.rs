@@ -133,6 +133,11 @@ pub struct Runtime {
     /// Capabilities captured from a probe.
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Administrator-defined fixed argument template, appended to the
+    /// adapter-generated load arguments. An argv array, never a shell string
+    /// (`docs/architecture.md` §3: 固定参数模板, 不允许存储任意 shell command).
+    #[serde(default)]
+    pub fixed_args: Vec<String>,
 }
 
 impl Runtime {
@@ -366,6 +371,11 @@ pub struct Operation {
     /// Structured result error, set when the operation is `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<OperationError>,
+    /// Structured result payload, set when the operation is `succeeded`
+    /// (e.g. a rescan's discovered models). Opaque JSON so each operation
+    /// kind carries its own shape (`docs/api.md` §5: 结构化结果).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 impl Operation {
@@ -460,6 +470,11 @@ pub struct Instance {
     /// Loopback port, set once the supervisor confirms it (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// GPU device indices this instance occupies (empty = CPU / unassigned).
+    /// Reserved for multi-GPU placement & resource accounting
+    /// (`docs/architecture.md` §6: 数据模型保留 `device_ids`).
+    #[serde(default)]
+    pub device_ids: Vec<u32>,
     /// When the instance started, RFC 3339 UTC (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
@@ -514,6 +529,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn sample_model() -> Model {
         Model {
@@ -588,6 +604,7 @@ mod tests {
             enabled: true,
             version_text: Some("b4200".into()),
             capabilities: Capabilities::default(),
+            fixed_args: vec![],
         };
         assert!(rt.is_enabled());
         let v = serde_json::to_value(&rt).expect("serialize runtime");
@@ -707,6 +724,7 @@ mod tests {
             state: InstanceState::Ready,
             pid: Some(4242),
             port: Some(8080),
+            device_ids: vec![0],
             started_at: Some("2026-08-01T12:00:05Z".into()),
             last_used_at: None,
             active_requests: 2,
@@ -723,6 +741,7 @@ mod tests {
         assert_eq!(v["pid"], 4242);
         assert_eq!(v["port"], 8080);
         assert_eq!(v["active_requests"], 2);
+        assert_eq!(v["device_ids"], json!([0]));
         assert!(v.get("last_used_at").is_none());
     }
 
@@ -740,11 +759,36 @@ mod tests {
                 code: ErrorCode::StartupTimeout,
                 message: "no healthy upstream after 30s".into(),
             }),
+            result: None,
         };
         assert!(op.is_terminal());
         assert_eq!(op.operation_id(), "op-1");
         let v = serde_json::to_value(&op).expect("serialize");
         assert_eq!(v["state"], "failed");
         assert_eq!(v["error"]["code"], "startup_timeout");
+        // a failed op carries an error and no result.
+        assert!(v.get("result").is_none());
+    }
+
+    /// A succeeded operation carries its structured result payload
+    /// (`docs/api.md` §5), e.g. a rescan's per-model counts.
+    #[test]
+    fn succeeded_operation_carries_structured_result() {
+        let op = Operation {
+            operation_id: "op-scan-1".into(),
+            kind: OperationKind::Rescan,
+            state: OperationState::Succeeded,
+            instance_id: None,
+            model_id: None,
+            created_at: Some("2026-08-01T12:00:00Z".into()),
+            finished_at: Some("2026-08-01T12:00:02Z".into()),
+            error: None,
+            result: Some(json!({ "added": 3, "removed": 1, "unchanged": 42 })),
+        };
+        assert!(op.is_terminal());
+        let v = serde_json::to_value(&op).expect("serialize");
+        assert_eq!(v["state"], "succeeded");
+        assert_eq!(v["result"]["added"], 3);
+        assert_eq!(v["result"]["removed"], 1);
     }
 }

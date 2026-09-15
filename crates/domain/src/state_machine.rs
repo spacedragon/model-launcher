@@ -57,13 +57,19 @@ impl InstanceState {
         self.transitions().contains(&target)
     }
 
-    /// Whether `self` has no outgoing transition (i.e. cannot change). For this
-    /// machine no state is truly terminal — even `unloaded` can be re-queued —
-    /// so this is always `false`; it exists for symmetry with
-    /// [`OperationState::is_terminal`].
+    /// Whether the instance lifecycle is settled (no in-flight process).
+    ///
+    /// This is the property `docs/architecture.md` §8 needs: on daemon start,
+    /// records whose state is *not* terminal — a process was expected to be
+    /// running (`queued`/`loading`/`ready`/`draining`/`unloading`) — are
+    /// marked `crashed`/recovery-required, while `unloaded`/`failed`/`crashed`
+    /// are already settled and left alone. It is deliberately NOT "no outgoing
+    /// transition": `unloaded` can be re-queued, so every state has an
+    /// outgoing edge and edge-based terminality is always false, which would
+    /// wrongly flag clean/historical records for recovery.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
-        self.transitions().is_empty()
+        matches!(self, Self::Unloaded | Self::Failed | Self::Crashed)
     }
 
     /// The states that can legally follow a `ready` instance (drain / crash).
@@ -233,6 +239,21 @@ mod tests {
             transition_instance(S::Draining, S::Crashed).expect("draining->crashed"),
             S::Crashed
         );
+    }
+
+    /// `is_terminal` marks settled lifecycles (no in-flight process) — what
+    /// restart crash-recovery filters on (`docs/architecture.md` §8) — not
+    /// "no outgoing edge" (always false for this machine).
+    #[test]
+    fn instance_terminality_marks_settled_states_only() {
+        assert!(S::Unloaded.is_terminal());
+        assert!(S::Failed.is_terminal());
+        assert!(S::Crashed.is_terminal());
+        assert!(!S::Queued.is_terminal());
+        assert!(!S::Loading.is_terminal());
+        assert!(!S::Ready.is_terminal());
+        assert!(!S::Draining.is_terminal());
+        assert!(!S::Unloading.is_terminal());
     }
 
     #[test]
