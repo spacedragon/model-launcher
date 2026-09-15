@@ -33,6 +33,11 @@
 //! - Any running state (`loading`/`ready`/`draining`) may reach `crashed` on an
 //!   unexpected child exit (`docs/architecture.md` §5: 任意运行态 → crashed), so
 //!   `draining` (still a live process serving existing requests) also crashes.
+//! - On daemon restart, recovery marks *every non-terminal* state
+//!   (`queued`/`loading`/`ready`/`draining`/`unloading`) `crashed` — a process
+//!   was expected to be running but is now orphaned (`docs/architecture.md`
+//!   §8). The table therefore lets every non-terminal state reach `crashed` so
+//!   recovery uses the validated path, not a raw state write.
 
 use crate::error::{DomainError, ErrorCode, Result};
 use crate::model::{InstanceState, OperationState};
@@ -42,11 +47,11 @@ impl InstanceState {
     const fn transitions(self) -> &'static [InstanceState] {
         use InstanceState as S;
         match self {
-            S::Queued => &[S::Loading, S::Unloaded, S::Failed],
+            S::Queued => &[S::Loading, S::Unloaded, S::Failed, S::Crashed],
             S::Loading => &[S::Ready, S::Failed, S::Unloading, S::Crashed],
             S::Ready => &[S::Draining, S::Crashed],
             S::Draining => &[S::Unloading, S::Ready, S::Crashed],
-            S::Unloading => &[S::Unloaded],
+            S::Unloading => &[S::Unloaded, S::Crashed],
             S::Unloaded | S::Failed | S::Crashed => &[S::Queued],
         }
     }
@@ -256,6 +261,23 @@ mod tests {
         assert!(!S::Unloading.is_terminal());
     }
 
+    /// Restart crash-recovery (`docs/architecture.md` §8): every non-terminal
+    /// state must reach `crashed` through the validated transition, so the
+    /// supervisor marks an interrupted instance crashed without bypassing the
+    /// state machine. Settled states need no recovery.
+    #[test]
+    fn every_nonterminal_state_can_crash() {
+        for state in [S::Queued, S::Loading, S::Ready, S::Draining, S::Unloading] {
+            assert!(
+                state.can_transition_to(S::Crashed),
+                "non-terminal {state:?} must reach crashed for recovery"
+            );
+        }
+        for state in [S::Unloaded, S::Failed, S::Crashed] {
+            assert!(state.is_terminal(), "settled {state:?} needs no recovery");
+        }
+    }
+
     #[test]
     fn failed_and_crashed_resume_via_explicit_load() {
         assert_eq!(
@@ -291,11 +313,12 @@ mod tests {
         // ready cannot go to loading.
         assert!(!S::Ready.can_transition_to(S::Loading));
 
-        // unloading has only one successor (unloaded), not a crash.
-        assert!(!S::Unloading.can_transition_to(S::Crashed));
-
         // a self-loop is not a legal step.
         assert!(!S::Ready.can_transition_to(S::Ready));
+
+        // settled states cannot re-enter an active state directly.
+        assert!(!S::Unloaded.can_transition_to(S::Ready));
+        assert!(!S::Failed.can_transition_to(S::Ready));
     }
 
     #[test]
@@ -312,14 +335,17 @@ mod tests {
     fn instance_transition_matrix_is_exact() {
         let expected: &[(&InstanceState, &[InstanceState])] = &[
             (&S::Unloaded, &[S::Queued]),
-            (&S::Queued, &[S::Loading, S::Unloaded, S::Failed]),
+            (
+                &S::Queued,
+                &[S::Loading, S::Unloaded, S::Failed, S::Crashed],
+            ),
             (
                 &S::Loading,
                 &[S::Ready, S::Failed, S::Unloading, S::Crashed],
             ),
             (&S::Ready, &[S::Draining, S::Crashed]),
             (&S::Draining, &[S::Unloading, S::Ready, S::Crashed]),
-            (&S::Unloading, &[S::Unloaded]),
+            (&S::Unloading, &[S::Unloaded, S::Crashed]),
             (&S::Failed, &[S::Queued]),
             (&S::Crashed, &[S::Queued]),
         ];
