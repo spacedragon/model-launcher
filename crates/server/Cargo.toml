@@ -1,0 +1,29 @@
+[package]
+name = "model-serving-server"
+edition = "2024"
+description = "model-serving daemon: management API, OpenAI-compatible gateway and static Web UI hosting"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+model-serving-runtime = { workspace = true }
+model-serving-runtime-llamacpp = { workspace = true }
+model-serving-runtime-ninfer = { workspace = true }
+model-serving-api-types = { workspace = true }
+model-serving-persistence = { workspace = true }
+
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[[bin]]
+name = "model-serving"
+path = "src/main.rs"
+
+[lints]
+workspace = true

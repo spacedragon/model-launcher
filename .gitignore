@@ -1,0 +1,24 @@
+# Rust
+/target
+Cargo.lock.bak
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Editor / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
+*.swp
+
+# Local logs / state
+*.log
+.tmp/
+*.sqlite
+*.sqlite3
+# local npm cache
+frontend/.npm-cache/

@@ -1,0 +1,15 @@
+[package]
+name = "model-serving-runtime-ninfer"
+edition = "2024"
+description = "NInfer (ninfer-serve) parameter mapping and capability snapshot"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+model-serving-runtime = { workspace = true }
+
+[lints]
+workspace = true

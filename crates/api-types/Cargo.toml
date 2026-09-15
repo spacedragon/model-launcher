@@ -1,0 +1,16 @@
+[package]
+name = "model-serving-api-types"
+edition = "2024"
+description = "Wire DTOs for the OpenAI-compatible, LM Studio and management APIs"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

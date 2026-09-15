@@ -1,0 +1,16 @@
+[package]
+name = "model-serving-persistence"
+edition = "2024"
+description = "SQLite repositories, migrations and event/audit persistence"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

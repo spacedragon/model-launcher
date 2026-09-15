@@ -1,0 +1,3 @@
+# Formatting is pinned to the style edition of the workspace (edition 2024).
+# Defaults are used otherwise; add overrides here only with a reason.
+edition = "2024"

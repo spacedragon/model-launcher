@@ -1,0 +1,16 @@
+[package]
+name = "model-serving-domain"
+edition = "2024"
+description = "Domain model and shared error catalog: Model, Runtime, Instance, Operation, LoadConfig"
+documentation = "src/lib.rs"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

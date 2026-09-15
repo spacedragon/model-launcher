@@ -1,0 +1,14 @@
+[package]
+name = "model-serving-runtime"
+edition = "2024"
+description = "RuntimeAdapter trait and process supervision shared by all inference engines"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+
+[lints]
+workspace = true
