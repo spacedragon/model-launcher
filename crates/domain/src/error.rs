@@ -100,150 +100,215 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// The single source of truth for a code's wire attributes:
-    /// `(code_str, title, default_status, openai_type)`.
+    /// `(code_str, title, default_status, openai_type, problem_type)`.
+    ///
+    /// `problem_type` is the semantic category of the native-management
+    /// Problem Details `type` URN (`urn:model-serving:error:{problem_type}`),
+    /// deliberately separate from the machine `code_str` (`docs/api.md` §2.2:
+    /// `gpu_memory_insufficient` reports `type: "...:resource-exhausted"` while
+    /// `code: "gpu_memory_insufficient"`).
     #[allow(
         clippy::too_many_lines,
         reason = "One exhaustive match over every ErrorCode (docs/api.md §2.2); decomposing it would hide the wire source of truth."
     )]
-    const fn meta(self) -> (&'static str, &'static str, u16, &'static str) {
+    const fn meta(self) -> (&'static str, &'static str, u16, &'static str, &'static str) {
         match self {
             Self::Unauthorized => (
                 "unauthorized",
                 "Authentication required",
                 401,
                 "authentication_error",
+                "unauthorized",
             ),
             Self::Forbidden => (
                 "forbidden",
                 "Insufficient permissions",
                 403,
                 "permission_error",
+                "forbidden",
             ),
             Self::InvalidRequest => (
                 "invalid_request",
                 "Request is invalid",
                 400,
                 "invalid_request_error",
+                "invalid-request",
             ),
             Self::UnsupportedField => (
                 "unsupported_field",
                 "Field not supported by runtime",
                 422,
                 "invalid_request_error",
+                "unsupported-field",
             ),
             Self::UnsupportedCapability => (
                 "unsupported_capability",
                 "Capability not supported",
                 422,
                 "invalid_request_error",
+                "unsupported-capability",
             ),
             Self::BodyTooLarge => (
                 "body_too_large",
                 "Request body too large",
                 413,
                 "invalid_request_error",
+                "payload-too-large",
             ),
             Self::HeaderTooLarge => (
                 "header_too_large",
                 "Request headers too large",
                 431,
                 "invalid_request_error",
+                "header-too-large",
             ),
             Self::RateLimited => (
                 "rate_limited",
                 "Too many requests",
                 429,
                 "invalid_request_error",
+                "rate-limited",
             ),
             Self::ModelNotFound => (
                 "model_not_found",
                 "Model not found",
                 404,
                 "invalid_request_error",
+                "model-not-found",
             ),
             Self::ModelNotLoaded => (
                 "model_not_loaded",
                 "Model is not loaded",
                 404,
                 "invalid_request_error",
+                "model-not-loaded",
             ),
-            Self::ModelNotReady => ("model_not_ready", "Model is not ready", 503, "api_error"),
+            Self::ModelNotReady => (
+                "model_not_ready",
+                "Model is not ready",
+                503,
+                "api_error",
+                "model-unavailable",
+            ),
             Self::UpstreamUnavailable => (
                 "upstream_unavailable",
                 "Upstream is unavailable",
                 503,
                 "server_error",
+                "upstream-unavailable",
             ),
             Self::GpuMemoryInsufficient => (
                 "gpu_memory_insufficient",
                 "Insufficient GPU memory",
                 409,
                 "api_error",
+                "resource-exhausted",
             ),
             Self::GpuOomLikely => (
                 "gpu_oom_likely",
                 "Out of GPU memory (likely)",
                 409,
                 "api_error",
+                "resource-exhausted",
             ),
-            Self::ResourceExhausted => {
-                ("resource_exhausted", "Resource exhausted", 409, "api_error")
-            }
+            Self::ResourceExhausted => (
+                "resource_exhausted",
+                "Resource exhausted",
+                409,
+                "api_error",
+                "resource-exhausted",
+            ),
             Self::EvictionConflict => (
                 "eviction_conflict",
                 "Eviction conflict",
                 409,
                 "permission_error",
+                "state-conflict",
             ),
-            Self::PortConflict => ("port_conflict", "Port conflict", 409, "api_error"),
+            Self::PortConflict => (
+                "port_conflict",
+                "Port conflict",
+                409,
+                "api_error",
+                "state-conflict",
+            ),
             Self::InvalidModel => (
                 "invalid_model",
                 "Model artifact is invalid",
                 400,
                 "invalid_request_error",
+                "invalid-request",
             ),
             Self::StartupTimeout => (
                 "startup_timeout",
                 "Instance failed to start in time",
                 504,
                 "api_error",
+                "startup-timeout",
             ),
             Self::ProcessCrash => (
                 "process_crash",
                 "Inference process crashed",
                 503,
                 "server_error",
+                "process-crash",
             ),
             Self::UpstreamProtocolError => (
                 "upstream_protocol_error",
                 "Upstream protocol error",
                 502,
                 "api_error",
+                "upstream-protocol-error",
             ),
-            Self::UpstreamTimeout => ("upstream_timeout", "Upstream timed out", 504, "api_error"),
+            Self::UpstreamTimeout => (
+                "upstream_timeout",
+                "Upstream timed out",
+                504,
+                "api_error",
+                "upstream-timeout",
+            ),
             Self::UpstreamError => (
                 "upstream_error",
                 "Upstream returned an error",
                 502,
                 "api_error",
+                "upstream-error",
             ),
             Self::InstanceNotFound => (
                 "instance_not_found",
                 "Instance not found",
                 404,
                 "invalid_request_error",
+                "instance-not-found",
             ),
             Self::InvalidStateTransition => (
                 "invalid_state_transition",
                 "Invalid state transition",
                 409,
                 "api_error",
+                "state-conflict",
             ),
-            Self::EndpointNotFound => {
-                ("endpoint_not_found", "Endpoint not found", 404, "api_error")
-            }
-            Self::NotImplemented => ("not_implemented", "Not implemented", 501, "api_error"),
-            Self::Internal => ("internal", "Internal error", 500, "server_error"),
+            Self::EndpointNotFound => (
+                "endpoint_not_found",
+                "Endpoint not found",
+                404,
+                "api_error",
+                "endpoint-not-found",
+            ),
+            Self::NotImplemented => (
+                "not_implemented",
+                "Not implemented",
+                501,
+                "api_error",
+                "not-implemented",
+            ),
+            Self::Internal => (
+                "internal",
+                "Internal error",
+                500,
+                "server_error",
+                "internal",
+            ),
         }
     }
 
@@ -271,11 +336,22 @@ impl ErrorCode {
         self.meta().3
     }
 
+    /// Problem Details category for the native-management `type` URN.
+    ///
+    /// Deliberately separate from [`Self::code_str`]: the management API
+    /// reports a coarse category (`docs/api.md` §2.2) while `code` carries
+    /// the precise machine token.
+    #[must_use]
+    pub fn problem_type(self) -> &'static str {
+        self.meta().4
+    }
+
     /// Problem Details `type` URN for the native management API, e.g.
-    /// `"urn:model-serving:error:gpu_memory_insufficient"`.
+    /// `"urn:model-serving:error:resource-exhausted"`. Built from the
+    /// category [`Self::problem_type`], not the machine `code_str`.
     #[must_use]
     pub fn urn(self) -> String {
-        format!("urn:model-serving:error:{}", self.code_str())
+        format!("urn:model-serving:error:{}", self.problem_type())
     }
 
     /// Build the OpenAI-style gateway error body (`docs/api.md` §2.2).
@@ -488,11 +564,16 @@ mod tests {
     }
 
     #[test]
-    fn urn_is_namespaced_by_code_str() {
+    fn urn_is_namespaced_by_problem_type() {
         let code = ErrorCode::GpuMemoryInsufficient;
-        assert_eq!(
+        // The management `type` URN uses the category, not the machine code
+        // (docs/api.md §2.2): code stays `gpu_memory_insufficient` while the
+        // type is the `resource-exhausted` category.
+        assert_eq!(code.urn(), "urn:model-serving:error:resource-exhausted");
+        assert_eq!(code.code_str(), "gpu_memory_insufficient");
+        assert_ne!(
             code.urn(),
-            "urn:model-serving:error:gpu_memory_insufficient"
+            format!("urn:model-serving:error:{}", code.code_str())
         );
     }
 
@@ -545,7 +626,7 @@ mod tests {
         assert_eq!(
             v,
             json!({
-                "type": "urn:model-serving:error:gpu_memory_insufficient",
+                "type": "urn:model-serving:error:resource-exhausted",
                 "title": "Insufficient GPU memory",
                 "status": 409,
                 "detail": "No idle instance can be evicted safely",

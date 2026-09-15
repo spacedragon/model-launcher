@@ -30,6 +30,9 @@
 //!   a serving (`ready`) process ends in `crashed`. A spawned-but-not-ready
 //!   process may also be torn down via `unloading`.
 //! - `draining -> ready` is the drain-cancelled / timed-out fallback.
+//! - Any running state (`loading`/`ready`/`draining`) may reach `crashed` on an
+//!   unexpected child exit (`docs/architecture.md` §5: 任意运行态 → crashed), so
+//!   `draining` (still a live process serving existing requests) also crashes.
 
 use crate::error::{DomainError, ErrorCode, Result};
 use crate::model::{InstanceState, OperationState};
@@ -42,7 +45,7 @@ impl InstanceState {
             S::Queued => &[S::Loading, S::Unloaded, S::Failed],
             S::Loading => &[S::Ready, S::Failed, S::Unloading, S::Crashed],
             S::Ready => &[S::Draining, S::Crashed],
-            S::Draining => &[S::Unloading, S::Ready],
+            S::Draining => &[S::Unloading, S::Ready, S::Crashed],
             S::Unloading => &[S::Unloaded],
             S::Unloaded | S::Failed | S::Crashed => &[S::Queued],
         }
@@ -221,6 +224,17 @@ mod tests {
         );
     }
 
+    /// A draining instance is still a live process serving existing requests,
+    /// so an unexpected child exit is a crash, not a clean unload
+    /// (`docs/architecture.md` §5: 任意运行态 → crashed).
+    #[test]
+    fn draining_can_crash() {
+        assert_eq!(
+            transition_instance(S::Draining, S::Crashed).expect("draining->crashed"),
+            S::Crashed
+        );
+    }
+
     #[test]
     fn failed_and_crashed_resume_via_explicit_load() {
         assert_eq!(
@@ -283,7 +297,7 @@ mod tests {
                 &[S::Ready, S::Failed, S::Unloading, S::Crashed],
             ),
             (&S::Ready, &[S::Draining, S::Crashed]),
-            (&S::Draining, &[S::Unloading, S::Ready]),
+            (&S::Draining, &[S::Unloading, S::Ready, S::Crashed]),
             (&S::Unloading, &[S::Unloaded]),
             (&S::Failed, &[S::Queued]),
             (&S::Crashed, &[S::Queued]),
