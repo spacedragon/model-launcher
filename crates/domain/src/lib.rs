@@ -1,13 +1,34 @@
-//! Domain model of the model-serving control plane.
+//! Domain model and shared error catalog of the `model-serving` control plane.
 //!
-//! Planned content (see `docs/architecture.md` §3, implemented in a later
-//! job): `Model`, `Runtime`, `Instance`, `Operation`, `LoadConfig` and the
-//! shared error catalog. Until then this crate only carries the module
-//! skeleton so the workspace compiles and the dependency direction
-//! (everything -> domain) is fixed from day one.
+//! Pure domain library: **no I/O, HTTP, storage, or async code**. It fixes the
+//! dependency direction (everything -> `domain`) described in
+//! `docs/architecture.md` §2 and is the single source of truth for the field
+//! names and wire shapes in `docs/api.md`.
+//!
+//! # Contents
+//!
+//! - [`model`]: core objects — [`model::Model`], [`model::Runtime`],
+//!   [`model::Instance`], [`model::Operation`] and [`model::LoadConfig`] — plus
+//!   their enums (`ArtifactKind`, `RuntimeKind`, `InstanceState`,
+//!   `OperationState`, `FailureClass`, `KvCapacity`, engine configs).
+//! - [`error`]: the stable [`error::ErrorCode`] catalog and the shared
+//!   [`error::DomainError`], with pure mappers to the two wire shapes —
+//!   OpenAI-style (`/v1/*`) and Problem Details (`/admin/v1/*`).
+//! - [`state_machine`]: the pure instance load-state machine and operation
+//!   state machine (`can_transition` / `transition`), per `docs/api.md` §5.
+//!
+//! # Conventions
+//!
+//! - IDs are opaque stable strings; timestamps are RFC 3339 UTC strings so the
+//!   crate avoids a date dependency.
+//! - Serde wire casing follows `docs/api.md`: `snake_case` enums, camelCase
+//!   fields (e.g. `contextLength` in the native API is *not* used — the native
+//!   and LM Studio shapes are kept in their own DTOs in `api-types`; here the
+//!   domain uses its own consistent `snake_case` field names).
 
 pub mod error;
 pub mod model;
+pub mod state_machine;
 
 #[cfg(test)]
 mod tests {
