@@ -5,7 +5,7 @@
 | # | Job | 状态 | 说明 / codex review 结论 |
 |---|-----|------|--------------------------|
 | 1 | Workspace/CI/tooling | passed/committed | 分支 job/1-workspace-ci-tooling @ 19ec93a（main 受环境 hook 保护，合入待人工）。codex review 两轮通过（P2: 端口配置严格校验、tracing subscriber、workspace 元数据继承、代理端口一致）。注意：本机 npm 走 npmmirror（user-level），lockfile 已改回 npmjs |
-| S1 | M0 风险 spike + fixtures + ADR | in-progress | ✅ Spike A (SSE 透明转发/中断取消，crates/spike，5 tests，ADR-0004，codex 两轮通过)；⏳ Spike B 子进程 TERM/KILL、Spike C 端口竞态、ADR-0001/0002/0003、fixtures/ |
+| S1 | M0 风险 spike + fixtures + ADR | reviewing | ✅ Spike A (SSE 转发/中断取消, ADR-0004, codex 两轮通过)；✅ Spike B 子进程 (subprocess.rs: stdout+stderr 双路 drain / TERM→KILL 升级+双路 EOF / unix 组杀 / in-terminate in-loop pump, 4 常规 + 1 unix 测试)；✅ Spike C 端口竞态 (port_race.rs: A 预分配 100/100 失败 vs B child 自选 100/100 成功)；✅ ADR-0002(accepted)；ADR-0001/0003 为 proposed——真实 runtime ready-line 契约与 b5555 基线待 WSL 现场 fixture（本 WSL 无 llama.cpp/NInfer/cargo，M2 llama adapter 开工门槛）；fixtures/upstream ✅ 字节级核对，fixtures/runtimes 为占位（PENDING WSL 现场采集）。codex review 进行中 |
 | 2 | Domain types + error catalog | pending | Model/Runtime/Instance/Operation/LoadConfig + 错误码（docs/api.md） |
 | 3 | SQLite migrations/repositories | pending | WAL、事务、测试 fixture |
 | 4 | Secure model scanner | pending | `.gguf`/`.ninfer` 扫描、key 冲突、mtime 增量、删除标记、路径逃逸防护 |

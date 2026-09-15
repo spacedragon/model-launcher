@@ -1,0 +1,5 @@
+{"line":"data: evt-1\r\n\r\n"}
+{"raw":": this line is not valid SSE ###\r\n### trailing garbage\r\n\r\n","note":"non-SSE text passed through verbatim (upstream may emit anything; gateway is byte-transparent)"}
+{"raw_hex":"00010d0a0d0a","note":"NUL + 0x01 control bytes, no text codec survives these"}
+{"raw_hex":"e2800d0a0d0a","note":"truncated UTF-8 (0xE2 0x80 expects a third byte)"}
+{"line":"data: evt-2\r\n\r\n"}

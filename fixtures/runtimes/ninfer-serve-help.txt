@@ -1,0 +1,11 @@
+# PENDING: 需在 WSL 现场采集
+# 采集命令: ninfer-serve --help > fixtures/runtimes/ninfer-serve-help.txt
+#
+# 说明:
+# - 本文件是 NInfer `ninfer-serve` 的 --help 输出快照（capability fixture）。
+# - 采集环境: WSL2 实际部署机（现场 qwen .ninfer artifact 所在环境）。
+# - 采集后需按 ADR-0003/ADR-0001 复核: 是否支持 --port 0 及 ready 行形态
+#   （不支持则启用 ADR-0001 回退策略）、/health 语义（{"status":"ok"}）、
+#   NInfer 专属参数（--kv-capacity、--kv-dtype、--prefill-chunk、
+#   --max-concurrency、spec/vision/thinking flags）的准确拼写与取值。
+# - M4（NInfer adapter）开工前必须完成采集；每次更新版本基线时同步更新。

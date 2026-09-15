@@ -6,3 +6,5 @@
 
 pub mod fake_upstream;
 pub mod forwarder;
+pub mod port_race;
+pub mod subprocess;

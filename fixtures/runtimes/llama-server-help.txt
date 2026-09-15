@@ -1,0 +1,10 @@
+# PENDING: 需在 WSL 现场采集
+# 采集命令: llama-server --help > fixtures/runtimes/llama-server-help.txt
+#
+# 说明:
+# - 本文件是 llama.cpp `llama-server` 的 --help 输出快照（capability fixture）。
+# - 采集环境: WSL2 实际部署机（含 GPU 驱动环境），记录 llama-server 版本
+#   （llama-server --version 首行一并放入文件头注释）。
+# - 采集后需按 ADR-0003 复核: 最低支持版本（当前基线 b5555）、
+#   `--port 0` 行为（ADR-0001 ready 行协议）、/health 与 /v1/models 端点。
+# - 每次更新版本基线时本文件必须同步更新（docs/development-plan.md M0 完成条件）。

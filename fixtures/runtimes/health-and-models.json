@@ -1,0 +1,26 @@
+[
+  {
+    "endpoint": "GET /health",
+    "label": "llama.cpp /health (readiness, 占位样例 — WSL 现场采集后覆盖)",
+    "runtime": "llamacpp",
+    "body": "{\"status\":\"ok\"}\n"
+  },
+  {
+    "endpoint": "GET /v1/models",
+    "label": "llama.cpp /v1/models (identity 校验, 占位样例)",
+    "runtime": "llamacpp",
+    "body": "{\"data\":[{\"id\":\"qwen2.5-7b-instruct-q4_k_m\",\"object\":\"model\",\"owned_by\":\"llama.cpp\",\"root\":\"/mnt/d/models/qwen2.5-7b-instruct-q4_k_m.gguf\"}],\"object\":\"list\"}"
+  },
+  {
+    "endpoint": "GET /health",
+    "label": "NInfer /health (readiness, 占位样例 — 现场采集后覆盖)",
+    "runtime": "ninfer",
+    "body": "{\"status\":\"ok\"}\n"
+  },
+  {
+    "endpoint": "GET /v1/models",
+    "label": "NInfer /v1/models (identity 校验, 占位样例)",
+    "runtime": "ninfer",
+    "body": "{\"data\":[{\"id\":\"qwen-2.5-7b-instruct\",\"object\":\"model\",\"owned_by\":\"ninfer\"}],\"object\":\"list\"}"
+  }
+]
