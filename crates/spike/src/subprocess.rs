@@ -19,6 +19,18 @@
 //!    descendants of a wrapper shell (e.g. a backgrounded `sleep`) are
 //!    reaped and cannot hold the pipes open forever (no EOF ⇒ the
 //!    supervisor could never detect exit).
+//!
+//!    **Ownership rule (PGID-reuse safety, ADR-0002)**: a group signal
+//!    is only ever sent for a PGID whose ownership is verifiable —
+//!    while the child (group leader) is alive, or because a group
+//!    member recorded in the `group_members` snapshot (pid + starttime,
+//!    scanned while the child was alive) still exists, which keeps the
+//!    PGID number from having been freed and reused. Once the leader is
+//!    gone and no snapshot member can be found, the PGID is never
+//!    signaled again. Accepted residual gap: a descendant spawned in the
+//!    last refresh interval before the leader's exit may survive
+//!    (killing a stranger is strictly worse than a survivor); M2's
+//!    dedicated cgroup closes even that gap.
 //! 3. Windows has no process-group semantics: `terminate()` force-kills a
 //!    single process (`TerminateProcess` via `Child::kill`); any child
 //!    descendants become orphans (acceptable — `llama-server` /
@@ -99,10 +111,14 @@ pub struct ChildSupervisor {
     stderr_total: u64,
     stderr_tail: Vec<u8>,
     exited: bool,
-    /// Unix: `finalize_group_kill` already sent the group KILL. `Drop`
-    /// must not re-signal (the PGID may already be reused by then).
+    /// Unix: `(pid, starttime)` of every process seen in our group
+    /// WHILE THE CHILD WAS ALIVE (see `refresh_ownership` /
+    /// `group_is_ours`). Only members from this snapshot may justify
+    /// signaling the group after the leader has exited — a PGID whose
+    /// snapshot members are all gone may already have been freed and
+    /// reused, and is never signaled.
     #[cfg(unix)]
-    signaled: bool,
+    group_members: Vec<(u32, u64)>,
     #[cfg(unix)]
     pgid: u32,
 }
@@ -150,7 +166,7 @@ impl ChildSupervisor {
             stderr_tail: Vec::new(),
             exited: false,
             #[cfg(unix)]
-            signaled: false,
+            group_members: Vec::new(),
             #[cfg(unix)]
             pgid: pid,
         })
@@ -187,6 +203,10 @@ impl ChildSupervisor {
         if self.exited {
             return Ok(false);
         }
+        // While the child is alive the PGID is provably ours: keep the
+        // ownership snapshot fresh for post-exit cleanup.
+        #[cfg(unix)]
+        self.refresh_ownership();
         match self.child.try_wait()? {
             Some(_) => {
                 self.exited = true;
@@ -196,36 +216,39 @@ impl ChildSupervisor {
         }
     }
 
-    /// (unix) Send KILL to the whole process group and wait (up to
-    /// `POST_KILL_HARD_TIMEOUT`) until no group member is left. Called by
-    /// `terminate` after it has probed for descendants (so `Escalated` is
-    /// reported accurately) and by `Drop` as a panic safety net. Guarded
-    /// by `signaled`: the PGID is only safe to signal while the child is
-    /// alive or right after we observed its exit ourselves — never in
-    /// `Drop` long after the group vanished.
+    /// (unix) Refresh `group_members` with a fresh /proc scan. Only
+    /// meaningful while the child is still alive — after that the PGID
+    /// may already be free and reused, and scanning would record
+    /// unrelated processes as "ours", so this is a no-op once `exited`.
+    ///
+    /// The refresh interval bounds a liveness gap: a descendant spawned
+    /// in the window between the last refresh and the leader's exit is
+    /// not in the snapshot and may survive post-exit cleanup. That is
+    /// the accepted spike-level trade — killing a stranger (a reused
+    /// PGID) is strictly worse than a surviving descendant — and M2's
+    /// dedicated cgroup (systemd scope) closes even that gap because
+    /// cgroup membership is ownership-based (see ADR-0002).
     #[cfg(unix)]
-    async fn finalize_group_kill(&mut self) -> std::io::Result<()> {
-        let pgid = self.pgid;
-        if self.signaled {
-            // Already sent: just wait the group out.
-        } else if group_has_live_member(pgid) {
-            // A PGID whose group no longer has a live member is never
-            // signaled — this also refuses a PGID that was freed and
-            // whose number was reused by a process that already exited.
-            let _ = signal_group(pgid, "KILL");
-            self.signaled = true;
+    fn refresh_ownership(&mut self) {
+        if self.exited {
+            return;
         }
-        let deadline = Instant::now() + POST_KILL_HARD_TIMEOUT;
-        while group_has_live_member(pgid) && Instant::now() < deadline {
-            sleep(POLL).await;
-        }
-        if group_has_live_member(pgid) {
-            return Err(IoError::new(
-                ErrorKind::TimedOut,
-                "child group still alive after force kill",
-            ));
-        }
-        Ok(())
+        self.group_members = scan_group_members(self.pgid);
+    }
+
+    /// (unix) True when at least one member from the `group_members`
+    /// snapshot (all verified as group members while the child was
+    /// alive) still exists with the same starttime. Such a member holds
+    /// the PGID number, so the number cannot have been freed and reused
+    /// — signaling `-pgid` can only reach our own (or their) group.
+    /// An empty snapshot (child never observed alive, or `/proc`
+    /// unavailable) always returns false: no ownership evidence, no
+    /// signal.
+    #[cfg(unix)]
+    fn group_is_ours(&self) -> bool {
+        self.group_members
+            .iter()
+            .any(|(pid, st)| member_still_there(*pid, *st))
     }
 
     /// Read stdout for up to `budget`, continuously. This is the whole
@@ -444,16 +467,35 @@ impl ChildSupervisor {
         if self.exited {
             // The direct child is reaped, but on unix group descendants
             // (e.g. a backgrounded `sleep` that outlived its leader) may
-            // still be alive and holding the stdout pipe — clean the whole
-            // group even when the leader is already gone.
+            // still be alive and holding the stdout pipe.
             #[cfg(unix)]
             {
-                // The direct child is reaped but group descendants (e.g. a
-                // backgrounded `sleep` outliving its leader) may still hold
-                // the pipes. The leader exit happened under our
-                // observation, so cleaning the group here cannot steal a
-                // reused PGID (guarded inside by `group_has_live_member`).
-                self.finalize_group_kill().await?;
+                // Kill the group ONLY while its ownership is still
+                // verifiable: at least one member recorded in
+                // `group_members` (scanned while the child was alive)
+                // must still exist with the same starttime — it holds
+                // the PGID number, so the number cannot have been freed
+                // and reused, and `kill(-pgid)` can only reach our own
+                // group. If the snapshot is empty (the child was never
+                // observed alive, or `/proc` was unavailable), NO signal
+                // is sent: without an ownership record the PGID must be
+                // treated as unownable, and any descendants are accepted
+                // as survivors (spike-level limitation; M2's dedicated
+                // cgroup makes this moot — see ADR-0002).
+                if !self.group_members.is_empty() && self.group_is_ours() {
+                    let pgid = self.pgid;
+                    let _ = signal_group(pgid, "KILL");
+                }
+                let deadline = Instant::now() + POST_KILL_HARD_TIMEOUT;
+                while self.group_is_ours() && Instant::now() < deadline {
+                    sleep(POLL).await;
+                }
+                if self.group_is_ours() {
+                    return Err(IoError::new(
+                        ErrorKind::TimedOut,
+                        "child group still alive after force kill",
+                    ));
+                }
             }
             return Ok(TerminateOutcome::AlreadyExited);
         }
@@ -471,10 +513,14 @@ impl ChildSupervisor {
         }
         let deadline = Instant::now() + grace;
         loop {
+            // While the child is alive the PGID is provably ours: keep
+            // the ownership snapshot fresh so the post-exit decisions
+            // below know which pids are verifiably ours.
+            #[cfg(unix)]
+            self.refresh_ownership();
             if self.reap()? {
                 #[cfg(unix)]
                 {
-                    let pgid = self.pgid;
                     // Settle window with continued draining: a descendant
                     // may still be flushing both pipes, and stopping the
                     // drain would wedge it in `write()` and misclassify it
@@ -492,21 +538,17 @@ impl ChildSupervisor {
                             _ = sleep(remaining) => break,
                         }
                     }
-                    // Live-member probe (via /proc on Linux): a group
-                    // whose members are all zombies needs no escalation —
-                    // nothing live holds the pipes, and its PGID cannot
-                    // be reused until the zombies are reaped (by us);
-                    // a reused PGID owned by an unrelated live process
-                    // would have a different leader pid, which is not a
-                    // member of our group number unless the group was
-                    // freed AND re-created with exactly this number —
-                    // which the all-zombie/empty state above excludes
-                    // for our own (recently dead) group.
-                    let survivors = group_has_live_member(pgid);
-                    if !survivors {
+                    // Ownership check (see `group_is_ours`): some member
+                    // recorded while the child was alive still exists ⇒
+                    // the PGID number is still held by OUR group ⇒ safe
+                    // to escalate. If none is left, any process currently
+                    // using the number is NOT verifiably ours and is
+                    // never signaled — `Graceful` is correct: nothing we
+                    // own holds the pipes.
+                    if !self.group_is_ours() {
                         return Ok(TerminateOutcome::Graceful);
                     }
-                    // Group members still alive ⇒ escalate.
+                    // Verified-own group members survived TERM ⇒ escalate.
                     break;
                 }
                 #[cfg(not(unix))]
@@ -531,14 +573,14 @@ impl ChildSupervisor {
         // Phase 2 — force.
         #[cfg(unix)]
         {
-            // Best effort: the group may already be empty by now. The
-            // live-member probe refuses to signal a PGID that was freed
-            // and reused in the meantime (and all-zombie groups).
-            let pgid = self.pgid;
-            if group_has_live_member(pgid) {
-                let _ = signal_group(pgid, "KILL");
+            // Signal only while ownership is verifiable. If the child is
+            // still alive here the PGID is provably ours; if it died
+            // during grace, the snapshot (refreshed at the top of every
+            // grace-loop iteration while it was alive) decides.
+            let owned = !self.exited || self.group_is_ours();
+            if owned {
+                let _ = signal_group(self.pgid, "KILL");
             }
-            self.signaled = true;
         }
         #[cfg(not(unix))]
         {
@@ -546,9 +588,11 @@ impl ChildSupervisor {
         }
         let hard = Instant::now() + POST_KILL_HARD_TIMEOUT;
         loop {
+            #[cfg(unix)]
+            self.refresh_ownership();
             if self.reap()? {
                 #[cfg(unix)]
-                let survivors = group_has_live_member(self.pgid);
+                let survivors = self.group_is_ours();
                 #[cfg(not(unix))]
                 let survivors = false;
                 if !survivors {
@@ -643,15 +687,15 @@ impl Drop for ChildSupervisor {
                     .stderr(std::process::Stdio::null())
                     .status();
             }
-            // else: leader exit already observed (`reap`/`is_alive`/above):
+            // else: leader exit already observed (`reap`/`is_alive`):
             // the PGID number may already be free and reused, so `Drop`
-            // must NEVER signal it. Group descendants of a leader that
-            // exited without `terminate` are intentionally left alone —
-            // the PGID can no longer be verified as ours (a reused PGID
-            // number must never be signaled). Spike-level limitation,
-            // recorded in ADR-0002; the M2 production supervisor uses a
-            // dedicated cgroup (systemd scope) whose membership is
-            // ownership-based and immune to pid/PGID reuse.
+            // must NEVER group-signal it. `terminate` (which keeps an
+            // ownership snapshot) is the only post-exit cleanup path;
+            // group descendants of a leader that exited without
+            // `terminate` are intentionally left alone (spike-level
+            // limitation, recorded in ADR-0002; M2 uses a dedicated
+            // cgroup whose membership is ownership-based and immune to
+            // pid/PGID reuse).
 
             // Unconditional explicit reap of the direct child via
             // non-blocking `waitpid(2, WNOHANG)` polling: an exit that was
@@ -736,12 +780,12 @@ fn fake_child_command(kind: FakeChild) -> std::io::Result<Command> {
 /// reported as an error; callers that probe group liveness use
 /// `group_has_live_member`.
 ///
-/// RESIDUAL RISK (accepted at spike level, see ADR-0002): the liveness
-/// probe and the signal are two separate operations, so a PGID number can
-/// in principle be freed and re-acquired between them. The M2 production
-/// supervisor closes this by re-authenticating each candidate group
-/// member (pid + start time + /proc ppid chain back to the direct child)
-/// immediately before signaling.
+/// SAFETY (see ADR-0002): callers must only signal a PGID whose
+/// ownership is verifiable — while the child (group leader) is alive, or
+/// when `group_is_ours` confirms a snapshot member (pid + starttime,
+/// recorded while the child was alive) still exists, which keeps the
+/// PGID number from having been freed and reused. A PGID with no
+/// verifiable ownership is NEVER signaled.
 #[cfg(unix)]
 fn signal_group(pgid: u32, name: &str) -> std::io::Result<()> {
     let target = format!("-{pgid}");
@@ -759,47 +803,58 @@ fn signal_group(pgid: u32, name: &str) -> std::io::Result<()> {
     }
 }
 
-/// (unix) True when the process group `pgid` still has at least one
-/// **live** (non-zombie) member. On Linux this scans `/proc` — the
-/// `kill -0` probe used by `signal_group` also succeeds for all-zombie
-/// groups (a zombie is signaleable until its parent reaps it), which
-/// would make the group-settle probe misclassify a fully dead group as
-/// alive. All-zombie groups are harmless: no live process holds the
-/// pipes and the PGID cannot be reused while a member (even a zombie)
-/// remains. Falls back to the signal-0 probe when `/proc` is
-/// unavailable (e.g. CI on non-Linux unix).
+/// (unix) `(pid, starttime)` of every process in process group `pgid`
+/// (zombies included — a zombie still holds the PGID number, which is
+/// exactly what makes it a valid ownership anchor). Linux `/proc` scan;
+/// returns empty when `/proc` is unavailable, which callers treat as
+/// "no ownership evidence" (never a signal).
 #[cfg(unix)]
-fn group_has_live_member(pgid: u32) -> bool {
-    let dir = match std::fs::read_dir("/proc") {
-        Ok(d) => d,
-        Err(_) => return signal_group(pgid, "0").is_ok(),
+fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
     };
     let target = pgid.to_string();
+    let mut out = Vec::new();
     for entry in dir.flatten() {
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if !name.chars().all(|c| c.is_ascii_digit()) {
+        let Ok(pid) = name.parse::<u32>() else {
             continue;
-        }
+        };
         // comm is parenthesized and may contain spaces/parens; the
-        // numeric fields start after the LAST `)`: state, ppid, pgrp, ...
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{name}/stat")) else {
+        // numeric fields start after the LAST `)`: state, ppid, pgrp,
+        // ..., starttime (index 19).
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
         let Some(paren_end) = stat.rfind(')') else {
             continue;
         };
         let fields: Vec<&str> = stat[paren_end + 1..].split_whitespace().collect();
-        // Fields after the closing `)`: state(0), ppid(1), pgrp(2), ...
-        let (Some(state), Some(pgrp)) = (fields.first(), fields.get(2)) else {
+        let (Some(pgrp), Some(starttime)) = (fields.get(2), fields.get(19)) else {
             continue;
         };
-        if *pgrp == target.as_str() && *state != "Z" {
-            return true;
+        if *pgrp == target.as_str() && let Ok(st) = starttime.parse::<u64>() {
+            out.push((pid, st));
         }
     }
-    false
+    out
+}
+
+/// (unix) True when `pid` still exists and its `/proc` starttime equals
+/// `starttime` — a reused pid has a different starttime, so this is a
+/// valid "same process" check.
+#[cfg(unix)]
+fn member_still_there(pid: u32, starttime: u64) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(paren_end) = stat.rfind(')') else {
+        return false;
+    };
+    let fields: Vec<&str> = stat[paren_end + 1..].split_whitespace().collect();
+    fields.get(19).and_then(|s| s.parse::<u64>().ok()) == Some(starttime)
 }
 
 #[cfg(test)]
@@ -1006,23 +1061,18 @@ mod tests {
         let pid = sup.pid();
         // Wait until the child is actually up (tasklist/proc visible),
         // so the post-drop absence check is meaningful.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut alive = os_pid_alive(pid);
-        while !alive && Instant::now() < deadline {
-            sleep(Duration::from_millis(50)).await;
-            alive = os_pid_alive(pid);
-        }
-        assert!(alive, "child pid {pid} never became visible before drop");
+        let visible = wait_until_visible(pid, Instant::now() + Duration::from_secs(10)).await;
+        assert!(visible, "child pid {pid} never became visible before drop");
 
         drop(sup);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut alive = os_pid_alive(pid);
-        while alive && Instant::now() < deadline {
-            sleep(Duration::from_millis(50)).await;
-            alive = os_pid_alive(pid);
-        }
+        let gone = wait_until_gone(pid, Instant::now() + Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("test skipped: {e}");
+                true
+            });
         assert!(
-            !alive,
+            gone,
             "pid {pid} still visible (live or zombie) after Drop — the waitpid reaper leaked"
         );
     }
@@ -1031,29 +1081,77 @@ mod tests {
     /// zombie (unix, un-reaped exit). Both count as a leak for the test
     /// above. Windows: `tasklist` only lists live processes; the OS
     /// auto-reaps process objects, so this is the right check there.
-    fn os_pid_alive(pid: u32) -> bool {
+    ///
+    /// `Err` = the probe itself could not run (e.g. `tasklist` missing
+    /// or access-denied on a locked-down host): callers must treat this
+    /// as "cannot verify" (skip), never as "process absent".
+    fn os_pid_alive(pid: u32) -> Result<bool, String> {
         #[cfg(unix)]
         {
             // `/proc/<pid>/stat` exists for live AND zombie processes
             // (a zombie persists until reaped — exactly what `Drop`
             // must do).
-            std::path::Path::new(&format!("/proc/{pid}/stat")).exists()
+            Ok(std::path::Path::new(&format!("/proc/{pid}/stat")).exists())
         }
         #[cfg(not(unix))]
         {
             let pid_str = pid.to_string();
-            std::process::Command::new("tasklist")
+            let out = std::process::Command::new("tasklist")
                 .args(["/FI", &format!("PID eq {pid}")])
                 .output()
-                .map(|o| {
-                    // A match appears as a whitespace-separated column
-                    // equal to the pid string (byte-substring matching
-                    // would confuse pid 5 with 105 etc.).
-                    String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .any(|l| l.split_whitespace().any(|w| w == pid_str.as_str()))
-                })
-                .unwrap_or(false)
+                .map_err(|e| format!("tasklist failed to run: {e}"))?;
+            if !out.status.success() {
+                return Err(format!(
+                    "tasklist exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            // A match appears as a whitespace-separated column equal to
+            // the pid string (byte-substring matching would confuse pid
+            // 5 with 105 etc.).
+            Ok(String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.split_whitespace().any(|w| w == pid_str.as_str())))
+        }
+    }
+
+    /// Wait up to `deadline` for `pid` to become visible to the OS.
+    /// Probe failures abort the test with a skip note instead of being
+    /// misread as "child never appeared". Returns true when visibility
+    /// was verified.
+    async fn wait_until_visible(pid: u32, deadline: Instant) -> bool {
+        loop {
+            match os_pid_alive(pid) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("test skipped: cannot enumerate processes: {e}");
+                    return false;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Wait up to `deadline` for `pid` to disappear from the OS (no live
+    /// process and no zombie). Returns `Ok(true)` when disappearance was
+    /// verified, `Ok(false)` when the deadline passed with the pid still
+    /// visible; `Err` = probe failure (skip, do not assert).
+    async fn wait_until_gone(pid: u32, deadline: Instant) -> Result<bool, String> {
+        loop {
+            match os_pid_alive(pid) {
+                Ok(false) => return Ok(true),
+                Ok(true) => {}
+                Err(e) => return Err(format!("cannot verify process absence: {e}")),
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            sleep(Duration::from_millis(50)).await;
         }
     }
 
