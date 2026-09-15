@@ -4,8 +4,8 @@
 
 | # | Job | 状态 | 说明 / codex review 结论 |
 |---|-----|------|--------------------------|
-| 1 | Workspace/CI/tooling | implementing | Cargo workspace + React/Vite + rustfmt/clippy/CI + .gitignore |
-| S1 | M0 风险 spike + fixtures + ADR | pending | SSE 透明转发/中断取消、子进程 process group/TERM/KILL、端口竞态；ninfer `--help` fixture；llama.cpp 最低版本 ADR |
+| 1 | Workspace/CI/tooling | passed/committed | 分支 job/1-workspace-ci-tooling @ 19ec93a（main 受环境 hook 保护，合入待人工）。codex review 两轮通过（P2: 端口配置严格校验、tracing subscriber、workspace 元数据继承、代理端口一致）。注意：本机 npm 走 npmmirror（user-level），lockfile 已改回 npmjs |
+| S1 | M0 风险 spike + fixtures + ADR | in-progress | ✅ Spike A (SSE 透明转发/中断取消，crates/spike，5 tests，ADR-0004，codex 两轮通过)；⏳ Spike B 子进程 TERM/KILL、Spike C 端口竞态、ADR-0001/0002/0003、fixtures/ |
 | 2 | Domain types + error catalog | pending | Model/Runtime/Instance/Operation/LoadConfig + 错误码（docs/api.md） |
 | 3 | SQLite migrations/repositories | pending | WAL、事务、测试 fixture |
 | 4 | Secure model scanner | pending | `.gguf`/`.ninfer` 扫描、key 冲突、mtime 增量、删除标记、路径逃逸防护 |

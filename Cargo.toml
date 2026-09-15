@@ -8,6 +8,7 @@ members = [
     "crates/runtime-ninfer",
     "crates/api-types",
     "crates/persistence",
+    "crates/spike",
 ]
 
 [workspace.package]
