@@ -23,9 +23,12 @@
 //! ```
 //!
 //! Notes on the encoding choices (documented, and asserted in tests):
-//! - `failed` and `crashed` are both resumable via an explicit load
-//!   (`-> queued`), so a load can never be stuck in a permanent terminal
-//!   state (`docs/development-plan.md` §5: no permanent `loading`).
+//! - Only `crashed` re-queues on an explicit load
+//!   (`crashed --explicit load--> queued`). `failed` is a settled terminal
+//!   with **no** re-queue edge: a later load starts a fresh instance
+//!   (`docs/architecture.md` §5). `loading` is never a dead-end — it resolves
+//!   to `ready`/`failed`/`crashed`/`unloading` — which is what
+//!   `docs/development-plan.md` §5 "不出现永久 `loading`" means.
 //! - A load that never reaches `ready` ends in `failed`; an unexpected exit of
 //!   a serving (`ready`) process ends in `crashed`. A spawned-but-not-ready
 //!   process may also be torn down via `unloading`.
@@ -52,7 +55,8 @@ impl InstanceState {
             S::Ready => &[S::Draining, S::Crashed],
             S::Draining => &[S::Unloading, S::Ready, S::Crashed],
             S::Unloading => &[S::Unloaded, S::Crashed],
-            S::Unloaded | S::Failed | S::Crashed => &[S::Queued],
+            S::Unloaded | S::Crashed => &[S::Queued],
+            S::Failed => &[],
         }
     }
 
@@ -278,16 +282,20 @@ mod tests {
         }
     }
 
+    /// `crashed` re-queues on an explicit load; `failed` is a settled terminal
+    /// with no re-queue edge (a later load starts a fresh instance) —
+    /// `docs/architecture.md` §5.
     #[test]
-    fn failed_and_crashed_resume_via_explicit_load() {
-        assert_eq!(
-            transition_instance(S::Failed, S::Queued).expect("failed->queued"),
-            S::Queued
-        );
+    fn crashed_resumes_via_explicit_load_but_failed_is_terminal() {
         assert_eq!(
             transition_instance(S::Crashed, S::Queued).expect("crashed->queued"),
             S::Queued
         );
+        assert!(!S::Failed.can_transition_to(S::Queued));
+        assert!(matches!(
+            transition_instance(S::Failed, S::Queued),
+            Err(e) if e.code == ErrorCode::InvalidStateTransition
+        ));
     }
 
     #[test]
@@ -319,6 +327,8 @@ mod tests {
         // settled states cannot re-enter an active state directly.
         assert!(!S::Unloaded.can_transition_to(S::Ready));
         assert!(!S::Failed.can_transition_to(S::Ready));
+        // `failed` has no re-queue edge (only `crashed` re-queues on load).
+        assert!(!S::Failed.can_transition_to(S::Queued));
     }
 
     #[test]
@@ -346,7 +356,7 @@ mod tests {
             (&S::Ready, &[S::Draining, S::Crashed]),
             (&S::Draining, &[S::Unloading, S::Ready, S::Crashed]),
             (&S::Unloading, &[S::Unloaded, S::Crashed]),
-            (&S::Failed, &[S::Queued]),
+            (&S::Failed, &[]),
             (&S::Crashed, &[S::Queued]),
         ];
         for (source, targets) in expected {

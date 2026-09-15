@@ -12,6 +12,8 @@ rust-version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# RFC 3339 UTC timestamps (docs/api.md §1), serialized as an RFC 3339 string.
+chrono = { workspace = true }
 
 [lints]
 workspace = true

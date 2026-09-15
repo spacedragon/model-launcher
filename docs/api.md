@@ -51,6 +51,45 @@ OpenAI 路径返回 OpenAI 风格：
 
 常用状态码：400 配置/请求无效，401 未认证，403 权限不足，404 不存在或模型未加载，409 状态冲突/资源不足，413 body 过大，422 runtime 不支持字段，429 请求过多，502 upstream 协议错误，503 模型不可用，504 upstream 超时。
 
+### 2.2.1 错误码目录
+
+上表的两个示例（`model_not_loaded`、`gpu_memory_insufficient`）与下列完整目录共同构成错误码的唯一权威来源；`model-serving-domain` 的 `ErrorCode` 目录必须逐条实现本表（`code` = 机器 token，`title` = 默认标题/消息，`OpenAI type` = `/v1/*` 网关 `error.type`，`Problem type` = 原生管理 API 的 `type` URN 类别 `urn:model-serving:error:<Problem type>`）。
+
+`OpenAI type` 归类规则：`401`→`authentication_error`，`403`→`permission_error`，请求形态类 `400/404/413/422/431`→`invalid_request_error`，其余客户端可见失败 `409/429/501/502/503/504`→`api_error`，本进程内部错误 `500`→`server_error`。
+
+| code | title | HTTP | OpenAI type | Problem type | 来源 |
+|------|-------|------|-------------|--------------|------|
+| `unauthorized` | Authentication required | 401 | `authentication_error` | `unauthorized` | §2.3 认证 |
+| `forbidden` | Insufficient permissions | 403 | `permission_error` | `forbidden` | §2.3 认证 |
+| `invalid_request` | Request is invalid | 400 | `invalid_request_error` | `invalid-request` | 状态码 400 |
+| `unsupported_field` | Field not supported by runtime | 422 | `invalid_request_error` | `unsupported-field` | 状态码 422 / §3 字段包装 |
+| `unsupported_capability` | Capability not supported | 422 | `invalid_request_error` | `unsupported-capability` | §3 embeddings capability gate |
+| `body_too_large` | Request body too large | 413 | `invalid_request_error` | `body-too-large` | 状态码 413 |
+| `header_too_large` | Request headers too large | 431 | `invalid_request_error` | `header-too-large` | 网关防护 |
+| `rate_limited` | Too many requests | 429 | `api_error` | `rate-limited` | 状态码 429 |
+| `model_not_found` | Model not found | 404 | `invalid_request_error` | `model-not-found` | §3 路由 |
+| `model_not_loaded` | Model is not loaded | 404 | `invalid_request_error` | `model-not-loaded` | §2.2 示例 / §3 路由 |
+| `model_not_ready` | Model is not ready | 503 | `api_error` | `model-not-ready` | §3 路由 |
+| `upstream_unavailable` | Upstream is unavailable | 503 | `api_error` | `upstream-unavailable` | §3 路由（runtime crash） |
+| `gpu_memory_insufficient` | Insufficient GPU memory | 409 | `api_error` | `resource-exhausted` | §2.2 示例 / 架构 §6 |
+| `gpu_oom_likely` | Out of GPU memory (likely) | 409 | `api_error` | `resource-exhausted` | 架构 §6 `FailureClass` |
+| `resource_exhausted` | Resource exhausted | 409 | `api_error` | `resource-exhausted` | 状态码 409（资源不足） |
+| `eviction_conflict` | Eviction conflict | 409 | `api_error` | `eviction-conflict` | 架构 §6 驱逐冲突 |
+| `port_conflict` | Port conflict | 409 | `api_error` | `port-conflict` | 架构 §5 端口预留 |
+| `invalid_model` | Model artifact is invalid | 400 | `invalid_request_error` | `invalid-model` | 架构 §6 `FailureClass` |
+| `startup_timeout` | Instance failed to start in time | 504 | `api_error` | `startup-timeout` | 架构 §5 启动 deadline |
+| `process_crash` | Inference process crashed | 503 | `api_error` | `process-crash` | 架构 §8 |
+| `upstream_protocol_error` | Upstream protocol error | 502 | `api_error` | `upstream-protocol-error` | 状态码 502 |
+| `upstream_timeout` | Upstream timed out | 504 | `api_error` | `upstream-timeout` | 状态码 504 |
+| `upstream_error` | Upstream returned an error | 502 | `api_error` | `upstream-error` | 网关 |
+| `instance_not_found` | Instance not found | 404 | `invalid_request_error` | `instance-not-found` | §4 未知 instance |
+| `invalid_state_transition` | Invalid state transition | 409 | `api_error` | `invalid-state-transition` | 架构 §5/§9 |
+| `endpoint_not_found` | Endpoint not found | 404 | `invalid_request_error` | `endpoint-not-found` | §2（未实现 endpoint 返回 404） |
+| `not_implemented` | Not implemented | 501 | `api_error` | `not-implemented` | 已存在但本构建未实现的操作 |
+| `internal` | Internal error | 500 | `server_error` | `internal` | 兜底 |
+
+注：未实现的 LM Studio *endpoint* 返回 404 `endpoint_not_found`；已存在但本构建未实现的 *操作* 返回 501 `not_implemented`，两者区分保留。`gpu_memory_insufficient`/`gpu_oom_likely`/`resource_exhausted` 三者共享 `resource-exhausted` 这一 Problem Details 类别，但 `code` 各自保留精确 token。
+
 ### 2.3 认证
 
 - 管理：`Authorization: Bearer <management-token>` 或 UI 的安全会话 cookie。

@@ -33,8 +33,16 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "si
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# RFC 3339 UTC timestamps (docs/api.md §1): `chrono::DateTime<Utc>`, serialized as
+# an RFC 3339 string. Pure Rust (no system lib) on both Windows and WSL.
+chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# SQLite (docs/architecture.md §2). `default-features = false` keeps only the
+# tokio runtime + the SQLite backend; SQLite is statically bundled via
+# `libsqlite3-sys` (below) so builds need no system libsqlite3 on Windows/WSL.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

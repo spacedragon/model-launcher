@@ -624,6 +624,267 @@ mod tests {
         assert_eq!(ErrorCode::UpstreamProtocolError.openai_type(), "api_error");
     }
 
+    /// The authoritative error catalog (`docs/api.md` §2.2.1), stated
+    /// independently of [`ErrorCode::meta`]: one row per code with all five
+    /// wire attributes. Asserting `meta()` reproduces this table exactly — and
+    /// that the table covers every code once — locks the catalog against the
+    /// spec, so the `OpenAI` and Problem Details mappers cannot drift from it.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "One exhaustive table per code locking docs/api.md §2.2.1; splitting it would obscure the catalog"
+    )]
+    fn error_catalog_matches_api_spec() {
+        // (variant, code_str, title, status, openai_type, problem_type)
+        let spec: &[(ErrorCode, &str, &str, u16, &str, &str)] = &[
+            (
+                ErrorCode::Unauthorized,
+                "unauthorized",
+                "Authentication required",
+                401,
+                "authentication_error",
+                "unauthorized",
+            ),
+            (
+                ErrorCode::Forbidden,
+                "forbidden",
+                "Insufficient permissions",
+                403,
+                "permission_error",
+                "forbidden",
+            ),
+            (
+                ErrorCode::InvalidRequest,
+                "invalid_request",
+                "Request is invalid",
+                400,
+                "invalid_request_error",
+                "invalid-request",
+            ),
+            (
+                ErrorCode::UnsupportedField,
+                "unsupported_field",
+                "Field not supported by runtime",
+                422,
+                "invalid_request_error",
+                "unsupported-field",
+            ),
+            (
+                ErrorCode::UnsupportedCapability,
+                "unsupported_capability",
+                "Capability not supported",
+                422,
+                "invalid_request_error",
+                "unsupported-capability",
+            ),
+            (
+                ErrorCode::BodyTooLarge,
+                "body_too_large",
+                "Request body too large",
+                413,
+                "invalid_request_error",
+                "body-too-large",
+            ),
+            (
+                ErrorCode::HeaderTooLarge,
+                "header_too_large",
+                "Request headers too large",
+                431,
+                "invalid_request_error",
+                "header-too-large",
+            ),
+            (
+                ErrorCode::RateLimited,
+                "rate_limited",
+                "Too many requests",
+                429,
+                "api_error",
+                "rate-limited",
+            ),
+            (
+                ErrorCode::ModelNotFound,
+                "model_not_found",
+                "Model not found",
+                404,
+                "invalid_request_error",
+                "model-not-found",
+            ),
+            (
+                ErrorCode::ModelNotLoaded,
+                "model_not_loaded",
+                "Model is not loaded",
+                404,
+                "invalid_request_error",
+                "model-not-loaded",
+            ),
+            (
+                ErrorCode::ModelNotReady,
+                "model_not_ready",
+                "Model is not ready",
+                503,
+                "api_error",
+                "model-not-ready",
+            ),
+            (
+                ErrorCode::UpstreamUnavailable,
+                "upstream_unavailable",
+                "Upstream is unavailable",
+                503,
+                "api_error",
+                "upstream-unavailable",
+            ),
+            (
+                ErrorCode::GpuMemoryInsufficient,
+                "gpu_memory_insufficient",
+                "Insufficient GPU memory",
+                409,
+                "api_error",
+                "resource-exhausted",
+            ),
+            (
+                ErrorCode::GpuOomLikely,
+                "gpu_oom_likely",
+                "Out of GPU memory (likely)",
+                409,
+                "api_error",
+                "resource-exhausted",
+            ),
+            (
+                ErrorCode::ResourceExhausted,
+                "resource_exhausted",
+                "Resource exhausted",
+                409,
+                "api_error",
+                "resource-exhausted",
+            ),
+            (
+                ErrorCode::EvictionConflict,
+                "eviction_conflict",
+                "Eviction conflict",
+                409,
+                "api_error",
+                "eviction-conflict",
+            ),
+            (
+                ErrorCode::PortConflict,
+                "port_conflict",
+                "Port conflict",
+                409,
+                "api_error",
+                "port-conflict",
+            ),
+            (
+                ErrorCode::InvalidModel,
+                "invalid_model",
+                "Model artifact is invalid",
+                400,
+                "invalid_request_error",
+                "invalid-model",
+            ),
+            (
+                ErrorCode::StartupTimeout,
+                "startup_timeout",
+                "Instance failed to start in time",
+                504,
+                "api_error",
+                "startup-timeout",
+            ),
+            (
+                ErrorCode::ProcessCrash,
+                "process_crash",
+                "Inference process crashed",
+                503,
+                "api_error",
+                "process-crash",
+            ),
+            (
+                ErrorCode::UpstreamProtocolError,
+                "upstream_protocol_error",
+                "Upstream protocol error",
+                502,
+                "api_error",
+                "upstream-protocol-error",
+            ),
+            (
+                ErrorCode::UpstreamTimeout,
+                "upstream_timeout",
+                "Upstream timed out",
+                504,
+                "api_error",
+                "upstream-timeout",
+            ),
+            (
+                ErrorCode::UpstreamError,
+                "upstream_error",
+                "Upstream returned an error",
+                502,
+                "api_error",
+                "upstream-error",
+            ),
+            (
+                ErrorCode::InstanceNotFound,
+                "instance_not_found",
+                "Instance not found",
+                404,
+                "invalid_request_error",
+                "instance-not-found",
+            ),
+            (
+                ErrorCode::InvalidStateTransition,
+                "invalid_state_transition",
+                "Invalid state transition",
+                409,
+                "api_error",
+                "invalid-state-transition",
+            ),
+            (
+                ErrorCode::EndpointNotFound,
+                "endpoint_not_found",
+                "Endpoint not found",
+                404,
+                "invalid_request_error",
+                "endpoint-not-found",
+            ),
+            (
+                ErrorCode::NotImplemented,
+                "not_implemented",
+                "Not implemented",
+                501,
+                "api_error",
+                "not-implemented",
+            ),
+            (
+                ErrorCode::Internal,
+                "internal",
+                "Internal error",
+                500,
+                "server_error",
+                "internal",
+            ),
+        ];
+
+        // The spec lists every code exactly once (none missing, none extra).
+        let spec_variants: Vec<ErrorCode> = spec.iter().map(|row| row.0).collect();
+        assert_eq!(spec_variants.len(), all_codes().len());
+        let mut all_sorted = all_codes();
+        let mut spec_sorted = spec_variants;
+        all_sorted.sort_by_key(|c| c.code_str());
+        spec_sorted.sort_by_key(|c| c.code_str());
+        assert_eq!(
+            all_sorted, spec_sorted,
+            "spec table must cover every ErrorCode exactly once"
+        );
+
+        // Every attribute of `meta()` matches the spec row for that code.
+        for (code, code_str, title, status, openai_type, problem_type) in spec {
+            assert_eq!(code.code_str(), *code_str, "{code:?} code_str");
+            assert_eq!(code.title(), *title, "{code:?} title");
+            assert_eq!(code.default_status(), *status, "{code:?} status");
+            assert_eq!(code.openai_type(), *openai_type, "{code:?} openai_type");
+            assert_eq!(code.problem_type(), *problem_type, "{code:?} problem_type");
+        }
+    }
+
     #[test]
     fn resource_codes_share_one_problem_type_urn() {
         let urn = ErrorCode::GpuMemoryInsufficient.urn();
