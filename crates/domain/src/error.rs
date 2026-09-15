@@ -102,11 +102,19 @@ impl ErrorCode {
     /// The single source of truth for a code's wire attributes:
     /// `(code_str, title, default_status, openai_type, problem_type)`.
     ///
-    /// `problem_type` is the semantic category of the native-management
-    /// Problem Details `type` URN (`urn:model-serving:error:{problem_type}`),
-    /// deliberately separate from the machine `code_str` (`docs/api.md` §2.2:
-    /// `gpu_memory_insufficient` reports `type: "...:resource-exhausted"` while
-    /// `code: "gpu_memory_insufficient"`).
+    /// `openai_type` follows `OpenAI`'s convention by status class
+    /// (`docs/api.md` §2.2): `401` → `authentication_error`,
+    /// `403` → `permission_error`, `500` → `server_error` (our fault),
+    /// request-shape problems (`400`/`404`/`413`/`422`/`431`) →
+    /// `invalid_request_error`, and every other client-visible failure
+    /// (`409`/`429`/`502`/`503`/`504`, `501`) → `api_error`.
+    ///
+    /// `problem_type` is the kebab-case of `code_str`, the only documented
+    /// exception being the GPU/resource group (`gpu_memory_insufficient` /
+    /// `gpu_oom_likely` / `resource_exhausted`), which share the
+    /// `resource-exhausted` category: `docs/api.md` §2.2 shows
+    /// `gpu_memory_insufficient` reporting `type: "...:resource-exhausted"`
+    /// while `code: "gpu_memory_insufficient"`.
     #[allow(
         clippy::too_many_lines,
         reason = "One exhaustive match over every ErrorCode (docs/api.md §2.2); decomposing it would hide the wire source of truth."
@@ -153,7 +161,7 @@ impl ErrorCode {
                 "Request body too large",
                 413,
                 "invalid_request_error",
-                "payload-too-large",
+                "body-too-large",
             ),
             Self::HeaderTooLarge => (
                 "header_too_large",
@@ -166,7 +174,7 @@ impl ErrorCode {
                 "rate_limited",
                 "Too many requests",
                 429,
-                "invalid_request_error",
+                "api_error",
                 "rate-limited",
             ),
             Self::ModelNotFound => (
@@ -188,13 +196,13 @@ impl ErrorCode {
                 "Model is not ready",
                 503,
                 "api_error",
-                "model-unavailable",
+                "model-not-ready",
             ),
             Self::UpstreamUnavailable => (
                 "upstream_unavailable",
                 "Upstream is unavailable",
                 503,
-                "server_error",
+                "api_error",
                 "upstream-unavailable",
             ),
             Self::GpuMemoryInsufficient => (
@@ -222,22 +230,22 @@ impl ErrorCode {
                 "eviction_conflict",
                 "Eviction conflict",
                 409,
-                "permission_error",
-                "state-conflict",
+                "api_error",
+                "eviction-conflict",
             ),
             Self::PortConflict => (
                 "port_conflict",
                 "Port conflict",
                 409,
                 "api_error",
-                "state-conflict",
+                "port-conflict",
             ),
             Self::InvalidModel => (
                 "invalid_model",
                 "Model artifact is invalid",
                 400,
                 "invalid_request_error",
-                "invalid-request",
+                "invalid-model",
             ),
             Self::StartupTimeout => (
                 "startup_timeout",
@@ -250,7 +258,7 @@ impl ErrorCode {
                 "process_crash",
                 "Inference process crashed",
                 503,
-                "server_error",
+                "api_error",
                 "process-crash",
             ),
             Self::UpstreamProtocolError => (
@@ -286,13 +294,13 @@ impl ErrorCode {
                 "Invalid state transition",
                 409,
                 "api_error",
-                "state-conflict",
+                "invalid-state-transition",
             ),
             Self::EndpointNotFound => (
                 "endpoint_not_found",
                 "Endpoint not found",
                 404,
-                "api_error",
+                "invalid_request_error",
                 "endpoint-not-found",
             ),
             Self::NotImplemented => (
@@ -364,7 +372,7 @@ impl ErrorCode {
                 message: message.to_string(),
                 r#type: self.openai_type().to_string(),
                 param: param.map(str::to_string),
-                code: Some(self.code_str().to_string()),
+                code: self.code_str().to_string(),
             },
         }
     }
@@ -419,6 +427,16 @@ impl DomainError {
     pub fn to_problem_details(&self, request_id: Option<&str>) -> ProblemDetails {
         self.code.to_problem_details(&self.message, request_id)
     }
+
+    /// The default HTTP status for this error's code.
+    ///
+    /// The API layer sets the response status from this; the per-request
+    /// correlation `request_id` is not part of the error (it is assigned by
+    /// the HTTP layer and passed to [`Self::to_problem_details`]).
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.code.default_status()
+    }
 }
 
 impl From<ErrorCode> for DomainError {
@@ -444,8 +462,7 @@ pub struct OpenAiError {
     r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     param: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<String>,
+    code: String,
 }
 
 /// RFC 9457 Problem Details body for the native management API:
@@ -575,6 +592,56 @@ mod tests {
             code.urn(),
             format!("urn:model-serving:error:{}", code.code_str())
         );
+    }
+
+    #[test]
+    fn openai_type_follows_status_convention() {
+        // Our-internal-fault.
+        assert_eq!(ErrorCode::Internal.openai_type(), "server_error");
+        // Request-shape problems (400/404/422/413/431) and auth (401/403).
+        assert_eq!(
+            ErrorCode::InvalidRequest.openai_type(),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            ErrorCode::ModelNotLoaded.openai_type(),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            ErrorCode::EndpointNotFound.openai_type(),
+            "invalid_request_error"
+        );
+        assert_eq!(
+            ErrorCode::Unauthorized.openai_type(),
+            "authentication_error"
+        );
+        assert_eq!(ErrorCode::Forbidden.openai_type(), "permission_error");
+        // Other client-visible failures (409/429/502/503/504, 501) -> api_error.
+        assert_eq!(ErrorCode::EvictionConflict.openai_type(), "api_error");
+        assert_eq!(ErrorCode::RateLimited.openai_type(), "api_error");
+        assert_eq!(ErrorCode::ProcessCrash.openai_type(), "api_error");
+        assert_eq!(ErrorCode::UpstreamUnavailable.openai_type(), "api_error");
+        assert_eq!(ErrorCode::UpstreamProtocolError.openai_type(), "api_error");
+    }
+
+    #[test]
+    fn resource_codes_share_one_problem_type_urn() {
+        let urn = ErrorCode::GpuMemoryInsufficient.urn();
+        assert_eq!(urn, "urn:model-serving:error:resource-exhausted");
+        for code in [
+            ErrorCode::GpuMemoryInsufficient,
+            ErrorCode::GpuOomLikely,
+            ErrorCode::ResourceExhausted,
+        ] {
+            assert_eq!(code.urn(), urn, "{code:?} should share resource-exhausted");
+        }
+    }
+
+    #[test]
+    fn domain_error_status_matches_code_default() {
+        let err = DomainError::with_message(ErrorCode::ProcessCrash, "child exited 137");
+        assert_eq!(err.status(), 503);
+        assert_eq!(err.status(), err.code.default_status());
     }
 
     #[test]
