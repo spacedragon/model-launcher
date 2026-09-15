@@ -203,23 +203,31 @@ impl ChildSupervisor {
         if self.exited {
             return Ok(false);
         }
-        // While the child is alive the PGID is provably ours: keep the
-        // ownership snapshot fresh for post-exit cleanup.
-        #[cfg(unix)]
-        self.refresh_ownership();
-        match self.child.try_wait()? {
+        let alive = match self.child.try_wait()? {
             Some(_) => {
                 self.exited = true;
-                Ok(false)
+                false
             }
-            None => Ok(true),
+            None => true,
+        };
+        // Liveness FIRST, refresh second: only a positively confirmed-alive
+        // child may update the ownership snapshot. Refreshing before the
+        // liveness probe could record unrelated processes under a PGID
+        // that our (already exited) leader's number was freed and reused.
+        #[cfg(unix)]
+        if alive {
+            self.refresh_ownership();
         }
+        Ok(alive)
     }
 
-    /// (unix) Refresh `group_members` with a fresh /proc scan. Only
-    /// meaningful while the child is still alive — after that the PGID
-    /// may already be free and reused, and scanning would record
-    /// unrelated processes as "ours", so this is a no-op once `exited`.
+    /// (unix) Refresh `group_members` with a fresh /proc scan. MUST only
+    /// be called immediately after a positive liveness check of the
+    /// child — before probing liveness the `exited` flag is stale, and
+    /// if the leader exited in the meantime (PGID freed and possibly
+    /// reused), the scan would record unrelated processes as "ours".
+    /// (The internal `exited` guard is a second line of defense, not
+    /// the correct one.)
     ///
     /// The refresh interval bounds a liveness gap: a descendant spawned
     /// in the window between the last refresh and the leader's exit is
@@ -516,11 +524,10 @@ impl ChildSupervisor {
         }
         let deadline = Instant::now() + grace;
         loop {
-            // While the child is alive the PGID is provably ours: keep
-            // the ownership snapshot fresh so the post-exit decisions
-            // below know which pids are verifiably ours.
-            #[cfg(unix)]
-            self.refresh_ownership();
+            // Liveness FIRST: an exit discovered by `reap` ends the grace
+            // phase without another snapshot refresh — the child is gone,
+            // and refreshing after an unobserved exit could record
+            // unrelated processes under a reused PGID.
             if self.reap()? {
                 #[cfg(unix)]
                 {
@@ -563,6 +570,11 @@ impl ChildSupervisor {
             if Instant::now() >= deadline {
                 break;
             }
+            // Child confirmed alive this iteration ⇒ the PGID is
+            // provably ours: refresh the ownership snapshot for the
+            // post-exit decisions.
+            #[cfg(unix)]
+            self.refresh_ownership();
             // Keep draining BOTH pipes while waiting: a child that flushes
             // a large log on TERM must not wedge in `write()` (see
             // `pump_streams_once`).
@@ -591,8 +603,6 @@ impl ChildSupervisor {
         }
         let hard = Instant::now() + POST_KILL_HARD_TIMEOUT;
         loop {
-            #[cfg(unix)]
-            self.refresh_ownership();
             if self.reap()? {
                 #[cfg(unix)]
                 let survivors = self.group_is_ours();
@@ -631,6 +641,12 @@ impl ChildSupervisor {
                     r?;
                 }
                 _ = sleep(POLL) => {}
+            }
+            // Child still alive after the KILL (rare) ⇒ PGID provably
+            // ours; refresh so the next `group_is_ours` check is current.
+            #[cfg(unix)]
+            if !self.exited {
+                self.refresh_ownership();
             }
         }
     }
