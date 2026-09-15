@@ -238,17 +238,20 @@ impl ChildSupervisor {
 
     /// (unix) True when at least one member from the `group_members`
     /// snapshot (all verified as group members while the child was
-    /// alive) still exists with the same starttime. Such a member holds
-    /// the PGID number, so the number cannot have been freed and reused
-    /// — signaling `-pgid` can only reach our own (or their) group.
-    /// An empty snapshot (child never observed alive, or `/proc`
-    /// unavailable) always returns false: no ownership evidence, no
-    /// signal.
+    /// alive) still exists with the same starttime AND is still in this
+    /// process group. Such a member holds the PGID number, so the
+    /// number cannot have been freed and reused — signaling `-pgid` can
+    /// only reach our own (or their) group. A member that left the
+    /// group via `setpgid`/`setsid` no longer holds the PGID and is
+    /// excluded by the pgrp check; an empty snapshot (child never
+    /// observed alive, or `/proc` unavailable) always returns false:
+    /// no ownership evidence, no signal.
     #[cfg(unix)]
     fn group_is_ours(&self) -> bool {
+        let pgid = self.pgid;
         self.group_members
             .iter()
-            .any(|(pid, st)| member_still_there(*pid, *st))
+            .any(|(pid, st)| member_still_there(*pid, *st, pgid))
     }
 
     /// Read stdout for up to `budget`, continuously. This is the whole
@@ -846,11 +849,13 @@ fn scan_group_members(pgid: u32) -> Vec<(u32, u64)> {
     out
 }
 
-/// (unix) True when `pid` still exists and its `/proc` starttime equals
-/// `starttime` — a reused pid has a different starttime, so this is a
-/// valid "same process" check.
+/// (unix) True when `pid` still exists, its `/proc` starttime equals
+/// `starttime`, AND its current pgrp is still `pgid` — a reused pid has
+/// a different starttime, and a member that left the group via
+/// `setpgid`/`setsid` has a different pgrp (it no longer holds the
+/// PGID number, so it must not be used to authorize a group signal).
 #[cfg(unix)]
-fn member_still_there(pid: u32, starttime: u64) -> bool {
+fn member_still_there(pid: u32, starttime: u64, pgid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
@@ -858,7 +863,9 @@ fn member_still_there(pid: u32, starttime: u64) -> bool {
         return false;
     };
     let fields: Vec<&str> = stat[paren_end + 1..].split_whitespace().collect();
-    fields.get(19).and_then(|s| s.parse::<u64>().ok()) == Some(starttime)
+    let same_start = fields.get(19).and_then(|s| s.parse::<u64>().ok()) == Some(starttime);
+    let same_pgrp = fields.get(2).copied() == Some(&pgid.to_string());
+    same_start && same_pgrp
 }
 
 #[cfg(test)]
