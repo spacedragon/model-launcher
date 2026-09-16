@@ -13,6 +13,19 @@ rust-version.workspace = true
 name = "probe_helper"
 path = "src/bin/probe_helper.rs"
 
+[[bin]]
+# Test-support executable used by `tests/supervisor.rs` to exercise the
+# `ManagedProcess` supervisor against controllable child behaviour modes on
+# every platform.
+name = "supervisor_helper"
+path = "src/bin/supervisor_helper.rs"
+
+[target.'cfg(unix)'.dependencies]
+# Direct `libc::kill(-pgid, sig)` and fixture signal setup for the process-group
+# supervision contract (ADR-0002): no shelling out to coreutils `kill`, and no
+# extra dependency on Windows.
+libc = "0.2"
+
 [dependencies]
 model-serving-domain = { workspace = true }
 # `time` is required for the probe deadline; the workspace already enables
