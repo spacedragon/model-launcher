@@ -1,26 +1,43 @@
-[
-  {
-    "endpoint": "GET /health",
-    "label": "llama.cpp /health (readiness, 占位样例 — WSL 现场采集后覆盖)",
-    "runtime": "llamacpp",
-    "body": "{\"status\":\"ok\"}\n"
+{
+  "schema_version": 1,
+  "fixture": "runtime-health-and-models",
+  "provenance": {
+    "kind": "synthetic-pinned",
+    "captured_live": false,
+    "note": "The development host has no llama.cpp or NInfer installation, so these HTTP bodies were never captured live. They are synthesized from the documented OpenAI-compatible surface at the engine versions pinned in manifest.json; treat them as replaceable pinned fixtures, not field captures."
   },
-  {
-    "endpoint": "GET /v1/models",
-    "label": "llama.cpp /v1/models (identity 校验, 占位样例)",
-    "runtime": "llamacpp",
-    "body": "{\"data\":[{\"id\":\"qwen2.5-7b-instruct-q4_k_m\",\"object\":\"model\",\"owned_by\":\"llama.cpp\",\"root\":\"/mnt/d/models/qwen2.5-7b-instruct-q4_k_m.gguf\"}],\"object\":\"list\"}"
+  "engine_versions": {
+    "llamacpp": "b5555",
+    "ninfer": "0.9.2"
   },
-  {
-    "endpoint": "GET /health",
-    "label": "NInfer /health (readiness, 占位样例 — 现场采集后覆盖)",
-    "runtime": "ninfer",
-    "body": "{\"status\":\"ok\"}\n"
-  },
-  {
-    "endpoint": "GET /v1/models",
-    "label": "NInfer /v1/models (identity 校验, 占位样例)",
-    "runtime": "ninfer",
-    "body": "{\"data\":[{\"id\":\"qwen-2.5-7b-instruct\",\"object\":\"model\",\"owned_by\":\"ninfer\"}],\"object\":\"list\"}"
-  }
-]
+  "cases": [
+    {
+      "runtime": "llamacpp",
+      "kind": "health",
+      "endpoint": "GET /health",
+      "provenance": "synthetic-pinned",
+      "body": "{\"status\":\"ok\"}\n"
+    },
+    {
+      "runtime": "llamacpp",
+      "kind": "models",
+      "endpoint": "GET /v1/models",
+      "provenance": "synthetic-pinned",
+      "body": "{\"data\":[{\"id\":\"qwen2.5-7b-instruct-q4_k_m\",\"object\":\"model\",\"owned_by\":\"llama.cpp\",\"root\":\"/mnt/d/models/qwen2.5-7b-instruct-q4_k_m.gguf\"}],\"object\":\"list\"}"
+    },
+    {
+      "runtime": "ninfer",
+      "kind": "health",
+      "endpoint": "GET /health",
+      "provenance": "synthetic-pinned",
+      "body": "{\"status\":\"ok\"}\n"
+    },
+    {
+      "runtime": "ninfer",
+      "kind": "models",
+      "endpoint": "GET /v1/models",
+      "provenance": "synthetic-pinned",
+      "body": "{\"data\":[{\"id\":\"qwen-2.5-7b-instruct\",\"object\":\"model\",\"owned_by\":\"ninfer\"}],\"object\":\"list\"}"
+    }
+  ]
+}
