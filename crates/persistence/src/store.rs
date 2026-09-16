@@ -41,25 +41,30 @@ fn secure_db_file(path: &Path) -> Result<()> {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
+                // The file was just proven absent above; the open only ever
+                // creates a fresh empty file, so truncation is a no-op but
+                // stated explicitly (clippy wants the truncate behaviour
+                // spelled out when `create` is set).
+                .truncate(true)
                 .mode(0o600)
                 .open(path)
                 .map_err(|e| {
                     DomainError::with_message(
                         ErrorCode::Internal,
-                        format!("create database file {path:?}: {e}"),
+                        format!("create database file {}: {e}", path.display()),
                     )
                 })?;
             std::fs::metadata(path).map_err(|e| {
                 DomainError::with_message(
                     ErrorCode::Internal,
-                    format!("stat database file {path:?}: {e}"),
+                    format!("stat database file {}: {e}", path.display()),
                 )
             })?
         }
         Err(e) => {
             return Err(DomainError::with_message(
                 ErrorCode::Internal,
-                format!("stat database file {path:?}: {e}"),
+                format!("stat database file {}: {e}", path.display()),
             ));
         }
     };
@@ -68,7 +73,10 @@ fn secure_db_file(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
             DomainError::with_message(
                 ErrorCode::Internal,
-                format!("set database file {path:?} permissions to 0600: {e}"),
+                format!(
+                    "set database file {} permissions to 0600: {e}",
+                    path.display()
+                ),
             )
         })?;
     }
