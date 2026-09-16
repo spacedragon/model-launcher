@@ -964,6 +964,7 @@ dependencies = [
 name = "model-serving-runtime"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "model-serving-domain",
  "serde_json",
  "tempfile",
