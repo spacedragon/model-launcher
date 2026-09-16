@@ -9,8 +9,20 @@ rust-version.workspace = true
 
 [dependencies]
 model-serving-domain = { workspace = true }
+chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
+# Only used by the `test-support` feature (test fixture helpers for other crates).
+tempfile = { workspace = true, optional = true }
+
+[features]
+# Expose `test_support` (temp-dir SQLite fixture) to dependent crates.
+test-support = ["dep:tempfile"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

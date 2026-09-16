@@ -41,8 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # SQLite (docs/architecture.md §2). `default-features = false` keeps only the
 # tokio runtime + the SQLite backend; SQLite is statically bundled via
 # `libsqlite3-sys` (below) so builds need no system libsqlite3 on Windows/WSL.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive", "chrono"] }
 libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+tempfile = "3"
 
 [workspace.lints.rust]
 unsafe_code = "warn"
