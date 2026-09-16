@@ -30,14 +30,14 @@ pub(crate) const STATE_FENCE_CONSTRAINTS: [&str; 3] = [
 
 /// Current UTC time for `updated_at` / `created_at` / audit rows.
 #[must_use]
-pub(crate) fn now() -> DateTime<Utc> {
+pub fn now() -> DateTime<Utc> {
     Utc::now()
 }
 
 /// Render a timestamp to its RFC 3339 UTC TEXT column value (millisecond
 /// precision, `Z` suffix — valid RFC 3339).
 #[must_use]
-pub(crate) fn ts_string(value: DateTime<Utc>) -> String {
+pub fn ts_string(value: DateTime<Utc>) -> String {
     value.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn from_json<T: serde::de::DeserializeOwned>(raw: &str, field: &str) 
 /// string, no surrounding quotes). All state/kind/class enums serialize to
 /// plain JSON strings, so this cannot fail.
 #[must_use]
-pub(crate) fn wire_token<T: serde::Serialize>(value: &T) -> String {
+pub fn wire_token<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value)
         .map(|s| s.trim_matches('"').to_string())
         .unwrap_or_default()
@@ -135,7 +135,7 @@ pub(crate) fn from_i64<T: TryFrom<i64> + std::fmt::Display>(value: i64, field: &
 
 /// Translate a `sqlx::Error` into the domain error catalog (see module docs).
 #[must_use]
-pub(crate) fn storage_error(err: &sqlx::Error, context: &str) -> DomainError {
+pub fn storage_error(err: &sqlx::Error, context: &str) -> DomainError {
     match err {
         sqlx::Error::RowNotFound => {
             DomainError::with_message(ErrorCode::Internal, format!("{context}: row not found"))

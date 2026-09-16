@@ -1,0 +1,26 @@
+[package]
+name = "model-serving-scanner"
+edition = "2024"
+description = "Secure recursive model artifact discovery (GGUF / NInfer) and index reconciliation"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+model-serving-persistence = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+model-serving-persistence = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

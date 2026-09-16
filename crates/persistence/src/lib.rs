@@ -50,6 +50,12 @@ mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+// The row <-> domain mapping helpers (RFC 3339 timestamps, wire tokens, the
+// `sqlx` -> domain error translation) are part of the crate's public contract:
+// a repository living outside this crate (e.g. the scanner's reconciliation
+// statements) must not hand-roll either.
+pub use mapping::{now, storage_error, ts_string, wire_token};
+
 pub use repos::{
     AuditEvent, AuditKind, AuditRepo, InstanceQuery, InstancesRepo, ModelRoot, ModelRootsRepo,
     ModelsRepo, OperationQuery, OperationsRepo, RuntimeRepo, RuntimeWithProbe, Setting,
