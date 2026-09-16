@@ -38,22 +38,26 @@ fn secure_db_file(path: &Path) -> Result<()> {
     let meta = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::OpenOptions::new()
+            // Atomic create (`O_EXCL`): never truncate, so a file that
+            // appears concurrently (another process creating or restoring
+            // the database between the stat above and this open) can never
+            // be destroyed. Losing the create race just means the file now
+            // exists and falls through to the re-stat below.
+            match std::fs::OpenOptions::new()
                 .write(true)
-                .create(true)
-                // The file was just proven absent above; the open only ever
-                // creates a fresh empty file, so truncation is a no-op but
-                // stated explicitly (clippy wants the truncate behaviour
-                // spelled out when `create` is set).
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .open(path)
-                .map_err(|e| {
-                    DomainError::with_message(
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    return Err(DomainError::with_message(
                         ErrorCode::Internal,
                         format!("create database file {}: {e}", path.display()),
-                    )
-                })?;
+                    ));
+                }
+            }
             std::fs::metadata(path).map_err(|e| {
                 DomainError::with_message(
                     ErrorCode::Internal,
