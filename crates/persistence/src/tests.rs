@@ -1244,11 +1244,14 @@ async fn same_state_writes_are_idempotent_data_updates() {
     );
 }
 
-// P1 (codex round 3): a state-only compare-and-set has an ABA hole because
-// the instance machine has legal cycles (ready -> draining -> ready). The
-// guard therefore also pins the `updated_at` revision: a writer that
-// validated a stale (state, updated_at) pair must affect 0 rows even when
-// the state has cycled back to the same token.
+// P1 (codex rounds 3+4): a state-only compare-and-set has an ABA hole
+// because the instance machine has legal cycles (ready -> draining ->
+// ready). The guard therefore also pins the monotonic `revision` counter
+// (bumped as `revision = revision + 1` on every guarded write, so a cycled
+// row can never present a stale writer with the same (state, revision)
+// pair): a writer that validated a stale pair must affect 0 rows even when
+// the state has cycled back to the same token, while a CAS pinned at the
+// current revision still applies (positive control).
 #[tokio::test]
 async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
     let fixture = Fixture::new().await.expect("fixture");
@@ -1256,8 +1259,8 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
     let pool = store.pool();
 
     seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
-    let stale_revised: String =
-        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
+    let stale_revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
             .fetch_one(pool)
             .await
             .expect("read the seeded revision");
@@ -1274,26 +1277,43 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
     // stale, so the double guard must reject it (0 rows affected).
     let rejected = sqlx::query(
         "UPDATE instances SET active_requests = 99 \
-         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
+         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
     )
-    .bind(&stale_revised)
+    .bind(stale_revision)
     .execute(pool)
     .await
     .expect("stale guarded update runs");
     assert_eq!(
         rejected.rows_affected(),
         0,
-        "the state+updated_at guard must reject the ABA write"
+        "the state+revision guard must reject the ABA write"
+    );
+
+    // Positive control: a CAS pinned at the CURRENT revision still applies.
+    let fresh_revision: i64 =
+        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+            .fetch_one(pool)
+            .await
+            .expect("read the current revision");
+    let applied = sqlx::query(
+        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+    )
+    .bind(fresh_revision)
+    .execute(pool)
+    .await
+    .expect("fresh guarded update runs");
+    assert_eq!(
+        applied.rows_affected(),
+        1,
+        "a CAS on the current revision must apply"
     );
     let after = InstancesRepo::get(pool, "i-aba")
         .await
         .expect("get")
         .expect("row");
     assert_eq!(after.state(), InstanceState::Ready);
-    assert_ne!(
-        after.active_requests, 99,
-        "the stale write must not have landed"
-    );
+    assert_eq!(after.active_requests, 99, "only the fresh write may land");
 }
 
 // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to

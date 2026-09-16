@@ -185,12 +185,12 @@ impl SqliteStore {
             // cycle could have moved the row and back. Validate the move
             // through the frozen domain state machine (never a raw write)
             // against this fresh state, then guard the update on BOTH the
-            // state and the `updated_at` revision so a same-state ABA
+            // state and the monotonic `revision` counter so a same-state ABA
             // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
             // so the two-query repository guard cannot run in a transaction;
             // sequential re-borrows of the transaction do the same job).
             let current =
-                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
+                sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
                     .bind(found.instance_id())
                     .fetch_optional(&mut *tx)
                     .await
@@ -210,10 +210,10 @@ impl SqliteStore {
                     format!("read instance {} state: {e}", found.instance_id()),
                 )
             })?;
-            let revised = current.try_get::<String, _>(1).map_err(|e| {
+            let revised = current.try_get::<i64, _>(1).map_err(|e| {
                 DomainError::with_message(
                     ErrorCode::Internal,
-                    format!("read instance {} updated_at: {e}", found.instance_id()),
+                    format!("read instance {} revision: {e}", found.instance_id()),
                 )
             })?;
             let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
@@ -227,14 +227,14 @@ impl SqliteStore {
                 )
             })?;
             let result = sqlx::query(
-                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
-                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
+                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
+                 WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
             )
             .bind(found.instance_id())
             .bind(wire_token(&InstanceState::Crashed))
             .bind(ts_string(at))
             .bind(wire_token(&current_state))
-            .bind(&revised)
+            .bind(revised)
             .execute(&mut *tx)
             .await
             .map_err(|e| storage_error(&e, "write instance state"))?;
@@ -254,7 +254,11 @@ impl SqliteStore {
                     Some("instance".to_owned()),
                     Some(found.instance_id().to_string()),
                     None,
-                    serde_json::json!({ "previous_state": found.state() }),
+                    // The fresh in-transaction state, not the older pool-scan
+                    // value: if the row moved between scan and transaction,
+                    // this is the state the recovery actually transitioned
+                    // from.
+                    serde_json::json!({ "previous_state": current_state }),
                     at,
                 ),
             )

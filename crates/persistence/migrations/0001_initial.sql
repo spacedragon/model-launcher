@@ -107,7 +107,8 @@ CREATE TABLE instances (
     health          TEXT,
     failure         TEXT,
     created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
+    updated_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_instances_model ON instances (model_id);
 CREATE INDEX idx_instances_runtime ON instances (runtime_id);
@@ -129,6 +130,7 @@ CREATE TABLE operations (
     model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
+    revision     INTEGER NOT NULL DEFAULT 0,
     finished_at  TEXT,
     error        TEXT,
     result       TEXT
