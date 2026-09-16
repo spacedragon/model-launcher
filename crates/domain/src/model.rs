@@ -265,6 +265,35 @@ impl LoadConfig {
     }
 }
 
+/// The VRAM switching (eviction) strategy used when a load needs more video
+/// memory than is free (`docs/architecture.md` §6; wire tokens in
+/// `docs/api.md` §4/§5). Active requests are a hard protection condition for
+/// every strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictionPolicy {
+    /// Fail the load immediately instead of evicting anything (`deny`).
+    Deny,
+    /// Evict idle instances oldest-first by `last_used_at` (`auto_evict_idle`,
+    /// the default).
+    #[default]
+    AutoEvictIdle,
+    /// Unload only the caller-specified replacement instances — the most
+    /// predictable strategy; the permitted IDs travel with the load request,
+    /// not with a stored config.
+    ReplaceInstances,
+}
+
+/// The instance IDs a caller explicitly permits to unload when
+/// [`EvictionPolicy::ReplaceInstances`] is in effect
+/// (`docs/architecture.md` §6). Travelled per load request; an empty list
+/// means no instance may be replaced.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictionTargets {
+    /// The permitted replacement instance IDs.
+    pub instance_ids: Vec<String>,
+}
+
 /// A GPU/exit failure signature
 /// (`RuntimeAdapter::classify_exit`, `docs/architecture.md` §6).
 ///
@@ -602,6 +631,33 @@ mod tests {
         DateTime::parse_from_rfc3339(s)
             .expect("valid RFC 3339 in test fixture")
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn eviction_policy_uses_architecture_wire_tokens_and_default() {
+        assert_eq!(
+            serde_json::to_value(EvictionPolicy::Deny).expect("serialize"),
+            "deny"
+        );
+        assert_eq!(
+            serde_json::to_value(EvictionPolicy::AutoEvictIdle).expect("serialize"),
+            "auto_evict_idle"
+        );
+        assert_eq!(
+            serde_json::to_value(EvictionPolicy::ReplaceInstances).expect("serialize"),
+            "replace_instances"
+        );
+        assert_eq!(EvictionPolicy::default(), EvictionPolicy::AutoEvictIdle);
+        let parsed: EvictionPolicy = serde_json::from_str("\"replace_instances\"").expect("parse");
+        assert_eq!(parsed, EvictionPolicy::ReplaceInstances);
+
+        let targets = EvictionTargets {
+            instance_ids: vec!["inst_a".into(), "inst_b".into()],
+        };
+        let back: EvictionTargets =
+            serde_json::from_value(serde_json::to_value(targets).expect("serialize"))
+                .expect("parse");
+        assert_eq!(back.instance_ids, vec!["inst_a", "inst_b"]);
     }
 
     /// Assert `value` survives a JSON serialize→deserialize round-trip.

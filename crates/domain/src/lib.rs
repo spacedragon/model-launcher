@@ -10,7 +10,8 @@
 //! - [`model`]: core objects — [`model::Model`], [`model::Runtime`],
 //!   [`model::Instance`], [`model::Operation`] and [`model::LoadConfig`] — plus
 //!   their enums (`ArtifactKind`, `RuntimeKind`, `InstanceState`,
-//!   `OperationState`, `FailureClass`, `KvCapacity`, engine configs).
+//!   `OperationState`, `FailureClass`, `KvCapacity`, `EvictionPolicy`,
+//!   `EvictionTargets`, engine configs).
 //! - [`error`]: the stable [`error::ErrorCode`] catalog and the shared
 //!   [`error::DomainError`], with pure mappers to the two wire shapes —
 //!   OpenAI-style (`/v1/*`) and Problem Details (`/admin/v1/*`).
@@ -19,8 +20,8 @@
 //!
 //! # Conventions
 //!
-//! - IDs are opaque stable strings; timestamps are RFC 3339 UTC strings so the
-//!   crate avoids a date dependency.
+//! - IDs are opaque stable strings; timestamps are `chrono::DateTime<Utc>` and
+//!   serialize as RFC 3339 UTC strings (`docs/api.md` §1).
 //! - Serde wire casing follows `docs/api.md`: `snake_case` enums, camelCase
 //!   fields (e.g. `contextLength` in the native API is *not* used — the native
 //!   and LM Studio shapes are kept in their own DTOs in `api-types`; here the
