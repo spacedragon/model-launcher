@@ -7,8 +7,22 @@ version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+# Test-support executable used by `tests/probe.rs` to exercise the probe
+# pipeline against a real, controllable child process on every platform.
+name = "probe_helper"
+path = "src/bin/probe_helper.rs"
+
 [dependencies]
 model-serving-domain = { workspace = true }
+# `time` is required for the probe deadline; the workspace already enables
+# `process` / `io-util` / `macros` / `rt-multi-thread`.
+tokio = { workspace = true, features = ["time", "sync"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

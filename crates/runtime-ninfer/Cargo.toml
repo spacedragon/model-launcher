@@ -11,5 +11,9 @@ rust-version.workspace = true
 model-serving-domain = { workspace = true }
 model-serving-runtime = { workspace = true }
 
+[dev-dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true }
+
 [lints]
 workspace = true

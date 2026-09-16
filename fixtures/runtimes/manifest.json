@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "collection_status": "pending-field-capture",
+  "collection_note": "The development host has no llama.cpp or NInfer installation; no live `--version`/`--help`/HTTP capture has happened. These files are deliberately pinned fixtures synthesized from public upstream help output and the ADR-0003 candidate baseline. Replace them with byte-exact field captures and update this manifest plus ADR-0003 when a WSL host is available.",
+  "engines": {
+    "llamacpp": {
+      "executable": "llama-server",
+      "fixture_version": "b5555",
+      "min_supported_build": 5555,
+      "version_file": "llama-server-version.txt",
+      "help_file": "llama-server-help.txt",
+      "provenance": "synthetic-pinned",
+      "source": "upstream llama.cpp llama-server --help shape at the b5555 candidate baseline"
+    },
+    "ninfer": {
+      "executable": "ninfer-serve",
+      "fixture_version": "0.9.2",
+      "min_supported_version": "0.9.0",
+      "version_file": "ninfer-serve-version.txt",
+      "help_file": "ninfer-serve-help.txt",
+      "provenance": "synthetic-pinned",
+      "source": "checked-in ninfer-serve usage text; version value pinned for the adapter fixture"
+    }
+  },
+  "health_and_models": {
+    "file": "health-and-models.json",
+    "schema_version": 1,
+    "provenance": "synthetic-pinned",
+    "collection_status": "synthetic-pinned",
+    "note": "Schema-versioned pinned fixture. Bodies are synthesized from the documented OpenAI-compatible surface at the engine versions pinned above; they are not field captures. Its engine_versions must match this manifest's fixture_version for each runtime."
+  }
+}

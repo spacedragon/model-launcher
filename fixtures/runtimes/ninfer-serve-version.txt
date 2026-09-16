@@ -1,0 +1,2 @@
+ninfer-serve 0.9.2
+build: fixture-pinned

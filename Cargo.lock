@@ -965,22 +965,30 @@ name = "model-serving-runtime"
 version = "0.1.0"
 dependencies = [
  "model-serving-domain",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
 name = "model-serving-runtime-llamacpp"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "model-serving-domain",
  "model-serving-runtime",
+ "tokio",
 ]
 
 [[package]]
 name = "model-serving-runtime-ninfer"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "model-serving-domain",
  "model-serving-runtime",
+ "tokio",
 ]
 
 [[package]]
