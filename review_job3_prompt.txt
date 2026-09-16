@@ -1,0 +1,41 @@
+Read the file D:/Workspace/model-serving/review_job3.md in full. It is your review task specification. Execute it exactly: run the git diff it names, read every file it lists in full, verify against the authoritative docs it names, then write your verdict as your final message.
+
+===== BEGIN review_job3.md =====
+# Codex review — Job 3: SQLite migrations/repositories
+
+Review the `model-serving-persistence` crate on branch `job/3-persistence` (repo root: D:/Workspace/model-serving).
+
+## Scope
+The complete Job 3 diff. Run:
+
+    git diff job/2-domain..HEAD
+
+and read every resulting file IN FULL:
+- crates/persistence/Cargo.toml
+- crates/persistence/migrations/0001_initial.sql
+- crates/persistence/src/{lib,store,mapping,repos,test_support,tests}.rs
+- the workspace Cargo.toml and Cargo.lock changes (deps only)
+
+Base is `job/2-domain` @ 1bf1705 (the approved domain crate). HEAD is `job/3-persistence` @ 1d43030.
+
+## Authoritative references (read these, verify against them)
+- docs/development-plan.md — M1 acceptance: "建立 migration 与 repository；SQLite WAL、事务和测试数据库 fixture"; §4 测试策略: "临时 SQLite 验证 transaction 和 migration"; completion: "重启后索引一致".
+- docs/architecture.md — §3 domain objects (Model/Runtime/Instance/Operation/LoadConfig field sets), §8 process recovery (daemon startup marks non-terminal instances crashed/recovery_required), §9 consistency (SQLite transaction commits operation + instance desired state + audit event together; in-memory registry is routing truth, SQLite is recovery+audit, NOT on the inference hot path).
+- docs/api.md — wire tokens: states and error codes are lowercase snake_case strings; DateTime is RFC 3339 UTC (§1).
+- docs/security-and-deployment.md — any database-file-permission guidance.
+- crates/domain/src/{model,error,state_machine}.rs — the FROZEN domain type + 24-code error catalog (persistence must reuse these, must not invent new error codes).
+
+## What to verify (file:line for every finding)
+1. **Schema correctness**: each table (settings, runtimes, model_roots, models, instances, operations, audit_events) has the fields the domain type + architecture §3/§8/§9 require. CHECK fences enumerate EXACTLY the wire tokens (instance state = 8 tokens per the domain state machine; operation state = 5; runtime kind, artifact kind, operation kind). DateTime columns are RFC 3339 TEXT; JSON columns are TEXT. Foreign keys point at the right PKs with the right ON DELETE/UPDATE. Is there anything §8 recovery or §9 single-transaction multi-table write needs that the schema lacks?
+2. **Connection/PRAGMA**: WAL + foreign_keys=ON + busy_timeout are enforced per connection (not just once). Confirm they cannot be silently lost on a new pooled connection. Confirm WAL is set via connect options (journal_mode cannot change inside a transaction).
+3. **Migrations**: append-only strategy (only 0001, idempotent — re-running is a no-op). No destructive ALTER. Migration actually builds the schema the repos read.
+4. **Repositories**: every multi-table consistency write goes through an explicit transaction (commit all-or-rollback none). Domain<->row mapping round-trips; a corrupted/undecodable row surfaces a domain error (never panics). State transitions validated against the domain state machine (or DB CHECK) so an out-of-state token is rejected. Recovery query returns exactly non-terminal instances/operations. Audit append is monotonic (autoincrement id usable as Last-Event-ID).
+5. **Error mapping**: storage failures map onto the FROZEN domain ErrorCode catalog with semantically-correct choices (CHECK fence -> InvalidStateTransition, constraint -> InvalidRequest, decode/corrupt -> Internal). No new error codes invented. Confirm the mapping is actually exercised by a test.
+6. **Freeze respected**: crates/domain is UNTOUCHED in this diff. No new crate dependencies beyond sqlx (sqlite/migrate/chrono features) + tempfile. No Windows-only APIs; code is Linux/WSL2-portable (std::path only, no hardcoded separators).
+7. **Tests (must be deterministic, no network, pass on both Windows+Linux)**: PRAGMA enforced per connection; WAL persists across reopen; migrate idempotent; FK enforced (orphans rejected); §8 recovery query (only non-terminal, marks crashed, one audit event per instance, terminal untouched); §9 three-table single-transaction write (commit visible / rollback zero residue); CHECK fence rejects out-of-state token; corrupt JSON -> Internal not panic. Count the tests; flag any assertion that is vacuous (true by construction) or any that would be flaky/order-dependent.
+8. **Hygiene**: cargo fmt-clean, cargo clippy --all-targets -- -D warnings clean (0 warnings), no .unwrap() in non-test code paths. Module doc in lib.rs states the crate's responsibility boundary (recovery+audit, off hot path), PRAGMA policy, and migration policy.
+
+## Output format
+List findings as P1 (blocker / spec violation), P2 (should fix before approve), P3 (nit) — each with file:line and a concrete fix. If none, reply exactly:
+
+    APPROVED — no findings===== END review_job3.md =====

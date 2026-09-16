@@ -1,0 +1,21 @@
+Round 3 review, job 3 (persistence crate) of model-serving. Round-2 verdict was NEEDS-FIXES with two items; both are now addressed in commit be6164c on branch job/3-persistence.
+
+REPO: \wsl.localhost\Ubuntu\home\space\code\model-serving (branch job/3-persistence, commit be6164c).
+Paths: crates/persistence/src/{repos,mapping,store,tests}.rs, migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Item 1 (your new P1 in round 2): InstancesRepo::upsert rejected same-state updates because it always ran transition_instance(current, current) and the frozen machine has no self-loops.
+Fix (be6164c): validate_state (repos.rs) now skips the transition check when current == to — a same-state write is an idempotent DATA update (pid/health/progress while the lifecycle state is unchanged), not a transition. The guarded UPDATE still guards on state = current and still checks rows_affected. This applies uniformly to upsert / write_state / advance. New regression test: tests.rs same_state_writes_are_idempotent_data_updates (same-state upsert persists new pid/active_requests with state unchanged; same-state write_state accepted).
+Verify: is this semantically sound against docs/architecture.md (state machine, §8/§9)? Any hole (e.g. could a same-state write smuggle an illegal data change, or break first-seen insert path)?
+
+Item 2 (your round-2 note that P1-1 was PARTIAL because "E: Copy excludes &mut SqliteConnection, and pool validation/update are not in one transaction"):
+Our position: (a) the guarded UPDATE is a compare-and-set — repos.rs require_state_write errors when rows_affected == 0, so a row that moved between the SELECT and the UPDATE is rejected even without a transaction (SQLite gives no row locks to a deferred reader anyway; a transaction would not close this race, only the CAS does); (b) on a transaction connection (job 5's atomic writes) the caller performs the single guarded UPDATE inline using the transaction's own read — same pattern already used in store.rs recover_non_terminal_instances; the E: Copy bound is what makes the two-statement helper usable from a pool. Please re-check the code (repos.rs validate_state/require_state_write, store.rs recovery) and confirm or refute that the two-step pool write is race-safe as written.
+
+Also: any NEW P1/P2 introduced by be6164c.
+Gates already green: fmt --check, clippy -D warnings 0, cargo test --workspace (Windows, all pass), WSL cargo test -p model-serving-persistence 24 passed.
+
+Output:
+- VERDICT: APPROVE / NEEDS-FIXES
+- Item 1: verdict + one line of evidence (file:line)
+- Item 2: AGREE (race-safe as designed) or DISAGREE (explain the concrete race)
+- NEW ISSUES: list or "none"
+Keep it short and precise.

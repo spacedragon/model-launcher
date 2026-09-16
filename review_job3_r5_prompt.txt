@@ -1,0 +1,18 @@
+Round 5 (final) review, job 3 (persistence crate) of model-serving. Your round-4 concern was that the `updated_at`-based CAS revision is not provably monotonic (wall-clock granularity / clock adjustments), so you asked for a monotonic counter. That is now fixed; review the FINAL state at HEAD (branch job/3-persistence, commits 7a3cfa1 and 9209113 on top of the round-4-reviewed 5c90603).
+
+What changed since your round-4 review:
+
+1. Monotonic revision counter (7a3cfa1). The schema uses a `revision INTEGER NOT NULL` column on both `instances` and `operations` (migrations/0001_initial.sql): 0 on create, and every guarded state write issues `revision = revision + 1` in the UPDATE itself (never a client-computed value), so it is strictly increasing by construction and two writes can never present the same (state, revision) pair.
+   - `validate_state` (crates/persistence/src/repos.rs, near top of file) now `SELECT state, revision FROM <table> WHERE <key> = ?1`, validates `transition(current, to)` only when `current != to` (same-state writes remain legal idempotent data updates — your round-3 item 1, confirmed SOUND), and returns `Option<(S, i64)>` (None = first-seen row, insert path with no prior state).
+   - Every guarded write is `UPDATE ... WHERE <key> = ? AND state = ? AND revision = ?` with both columns from the same SELECT, followed by `require_state_write(rows_affected, subject)` which surfaces 0 rows as `InvalidStateTransition` (raced/ABA). Applies to: instances `upsert`, instances `write_state`, operations `advance`, and restart recovery in crates/persistence/src/store.rs (`recover_non_terminal_instances` re-reads (state, revision) INSIDE its transaction, validates via the frozen domain `transition_instance`, guards the UPDATE on both, records the audit event with the in-transaction previous state).
+   - `write_state` returns `Result<()>` (same-state = applied data update; raced = error) and `advance` returns `Result<bool>` (false = operation row absent).
+   - ABA regression test `stale_same_state_write_is_rejected_by_the_revision_guard` (crates/persistence/src/tests.rs): seeds a ready instance, captures its `revision`, drives a legal ready->draining->ready cycle via `InstancesRepo::write_state` (revision becomes 2), proves a raw CAS `... AND state='ready' AND revision=<stale>` affects 0 rows, then a POSITIVE control CAS pinned at the fresh revision affects 1 row.
+
+2. WSL-toolchain clippy fixes (9209113): `secure_db_file` (store.rs) now spells `.truncate(true)` explicitly on the create-open (no-op: the file was just proven NotFound in the same branch; documented in a comment) and prints paths via `Display` in four error messages.
+
+Gates green on BOTH toolchains: cargo fmt --check; cargo clippy --workspace --all-targets -- -D warnings (Windows cargo 1.98 and WSL Ubuntu rustup); cargo test --workspace (Windows) and full WSL cargo test --workspace — all ok, persistence tests include the ABA test.
+
+REPO: D:\Workspace\model-serving (Windows checkout of branch job/3-persistence; identical content to \wsl.localhost\Ubuntu\home\space\code\model-serving). Paths: crates/persistence/src/{repos,store,mapping,tests}.rs, crates/persistence/migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Please: (1) confirm the monotonic-revision CAS closes the ABA hole on EVERY state-write path (upsert first-seen + guarded update, write_state, advance, restart recovery), or name the concrete remaining race; (2) check the ABA test proves what it claims (and the positive control is real); (3) any P1/P2 introduced by 7a3cfa1 or 9209113.
+Output: VERDICT: APPROVE / NEEDS-FIXES, then short per-point findings with file:line evidence.

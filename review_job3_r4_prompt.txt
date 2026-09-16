@@ -1,0 +1,13 @@
+Round 4 (final) review, job 3 (persistence crate) of model-serving. Your round-3 verdict was NEEDS-FIXES on exactly one point: the state-only CAS in the instance state guards has an ABA race (a legal ready -> draining -> ready cycle leaves `state` unchanged, so a stale `UPDATE ... WHERE state='ready'` can overwrite newer data).
+
+That is fixed in commit 5c90603 on branch job/3-persistence:
+- validate_state (crates/persistence/src/repos.rs) now selects (state, updated_at) and returns both; same-state writes remain legal no-op data updates (round-3 item 1, which you confirmed SOUND).
+- Every guarded state write now guards on BOTH columns: instances upsert (`WHERE instance_id = ? AND state = ? AND updated_at = ?`), instances write_state, operations advance. operations gained an `updated_at TEXT NOT NULL` revision column (migration 0001_initial.sql; set on create, bumped on advance).
+- Restart recovery (crates/persistence/src/store.rs recover_non_terminal_instances) re-reads (state, updated_at) INSIDE its transaction (the pool scan predates it), validates via the frozen transition_instance, and guards the UPDATE on state + updated_at.
+- New regression test stale_same_state_write_is_rejected_by_the_revision_guard: seeds a ready instance, captures its updated_at, drives a legal ready->draining->ready cycle, then proves a raw state+stale-revision CAS affects 0 rows.
+Gates green: fmt --check, clippy -D warnings 0, cargo test --workspace (Windows), WSL cargo test -p model-serving-persistence 25 passed.
+
+REPO: \wsl.localhost\Ubuntu\home\space\code\model-serving (branch job/3-persistence, commit 5c90603). Paths: crates/persistence/src/{repos,store,mapping,tests}.rs, migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Please: (1) confirm the ABA fix is complete for every state-write path (including restart recovery and the first-seen insert path), or name the concrete remaining race; (2) check the new test actually proves what it claims; (3) any NEW P1/P2 in 5c90603.
+Output: VERDICT: APPROVE / NEEDS-FIXES, then short per-point findings with file:line evidence.

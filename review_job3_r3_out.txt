@@ -1,0 +1,1879 @@
+OpenAI Codex v0.151.0
+--------
+workdir: D:\Workspace\model-serving
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a0a8e5-38d9-7582-bd20-bcc4a86f7219
+--------
+user
+Round 3 review, job 3 (persistence crate) of model-serving. Round-2 verdict was NEEDS-FIXES with two items; both are now addressed in commit be6164c on branch job/3-persistence.
+
+REPO: \wsl.localhost\Ubuntu\home\space\code\model-serving (branch job/3-persistence, commit be6164c).
+Paths: crates/persistence/src/{repos,mapping,store,tests}.rs, migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Item 1 (your new P1 in round 2): InstancesRepo::upsert rejected same-state updates because it always ran transition_instance(current, current) and the frozen machine has no self-loops.
+Fix (be6164c): validate_state (repos.rs) now skips the transition check when current == to — a same-state write is an idempotent DATA update (pid/health/progress while the lifecycle state is unchanged), not a transition. The guarded UPDATE still guards on state = current and still checks rows_affected. This applies uniformly to upsert / write_state / advance. New regression test: tests.rs same_state_writes_are_idempotent_data_updates (same-state upsert persists new pid/active_requests with state unchanged; same-state write_state accepted).
+Verify: is this semantically sound against docs/architecture.md (state machine, §8/§9)? Any hole (e.g. could a same-state write smuggle an illegal data change, or break first-seen insert path)?
+
+Item 2 (your round-2 note that P1-1 was PARTIAL because "E: Copy excludes &mut SqliteConnection, and pool validation/update are not in one transaction"):
+Our position: (a) the guarded UPDATE is a compare-and-set — repos.rs require_state_write errors when rows_affected == 0, so a row that moved between the SELECT and the UPDATE is rejected even without a transaction (SQLite gives no row locks to a deferred reader anyway; a transaction would not close this race, only the CAS does); (b) on a transaction connection (job 5's atomic writes) the caller performs the single guarded UPDATE inline using the transaction's own read — same pattern already used in store.rs recover_non_terminal_instances; the E: Copy bound is what makes the two-statement helper usable from a pool. Please re-check the code (repos.rs validate_state/require_state_write, store.rs recovery) and confirm or refute that the two-step pool write is race-safe as written.
+
+Also: any NEW P1/P2 introduced by be6164c.
+Gates already green: fmt --check, clippy -D warnings 0, cargo test --workspace (Windows, all pass), WSL cargo test -p model-serving-persistence 24 passed.
+
+Output:
+- VERDICT: APPROVE / NEEDS-FIXES
+- Item 1: verdict + one line of evidence (file:line)
+- Item 2: AGREE (race-safe as designed) or DISAGREE (explain the concrete race)
+- NEW ISSUES: list or "none"
+Keep it short and precise.
+
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+I’ll inspect the exact commit and architecture sections, then trace the pool and transaction write paths for concrete races.
+hook: PreToolUse
+2026-09-16T06:26:39.189629Z ERROR codex_core::tools::router: error=exec_command failed for `"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git status --short; git branch --show-current; git rev-parse HEAD; git show --stat --oneline --decorate be6164c; rg -n "validate_state|require_state_write|recover_non_terminal_instances|same_state_writes_are_idempotent_data_updates|state machine|State machine|§8|## 8|## 9" crates/persistence/src docs/architecture.md'`: CreateProcess { message: "Rejected(\"Failed to create unified exec process: 目录名称无效。 (os error 267)\")" }
+hook: PreToolUse Completed
+codex
+The Windows shell can’t use the WSL UNC path as its process directory, so I’m rerunning the read-only inspection through WSL at the stated repository path.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "wsl.exe -d Ubuntu --cd /home/space/code/model-serving bash -lc 'git status --short && git branch --show-current && git rev-parse HEAD && git show --stat --oneline --decorate be6164c && rg -n \"validate_state|require_state_write|recover_non_terminal_instances|same_state_writes_are_idempotent_data_updates|state machine|State machine|## 8|## 9\" crates/persistence/src docs/architecture.md'" in D:\Workspace\model-serving
+ exited 1 in 122ms:
+<3>WSL (465480 - Relay) ERROR: CreateProcessCommon:810: chdir(/home/space/code/model-serving) failed 2
+/bin/bash: -c: line 2: syntax error: unexpected end of file
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'wsl.exe -d Ubuntu -- pwd; wsl.exe -d Ubuntu -- ls -la /home/space/code; wsl.exe -d Ubuntu -- find /home/space -maxdepth 3 -type d -name model-serving -print' in D:\Workspace\model-serving
+ exited 1 in 310ms:
+/mnt/d/Workspace/model-serving
+ls: cannot access '/home/space/code': No such file or directory
+find: ‘/home/space’: No such file or directory
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "git status --short; git branch --show-current; git rev-parse HEAD; git show --stat --oneline --decorate be6164c; rg -n 'validate_state|require_state_write|recover_non_terminal_instances|same_state_writes_are_idempotent_data_updates|state machine|State machine|## 8|## 9' crates/persistence/src docs/architecture.md" in D:\Workspace\model-serving
+ succeeded in 123ms:
+ M docs/jobs.md
+?? fixlist_job3.md
+?? review_job3.md
+?? review_job3_out.txt
+?? review_job3_prompt.txt
+?? review_job3_r2_out.txt
+?? review_job3_r2_prompt.txt
+?? review_job3_r3_out.txt
+?? review_job3_r3_prompt.txt
+job/3-persistence
+be6164c4344a8ce4efec07d917ac874d275f951f
+be6164c (HEAD -> job/3-persistence) fix(persistence): accept same-state writes as idempotent data updates
+ crates/persistence/src/repos.rs | 34 ++++++++++++++++++++---------
+ crates/persistence/src/tests.rs | 47 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 71 insertions(+), 10 deletions(-)
+docs/architecture.md:187:## 8. 进程恢复和退出
+docs/architecture.md:195:## 9. 一致性和并发控制
+crates/persistence/src\lib.rs:16://!   (`recover_non_terminal_instances`).
+crates/persistence/src\lib.rs:45://! domain state machines can never be stored even by out-of-band writes.
+crates/persistence/src\store.rs:159:    /// through the domain state machine (every non-terminal state legally
+crates/persistence/src\store.rs:172:    /// `crashed` (defensive: schema fence and state machine agree on the
+crates/persistence/src\store.rs:174:    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+crates/persistence/src\store.rs:182:            // Validate the move through the frozen domain state machine (never
+crates/persistence/src\repos.rs:55:/// frozen domain state machine.
+crates/persistence/src\repos.rs:80:async fn validate_state<'c, E, S>(
+crates/persistence/src\repos.rs:112:/// means the update raced the state machine.
+crates/persistence/src\repos.rs:114:fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+crates/persistence/src\repos.rs:797:    /// the row's current state is validated through the domain state machine
+crates/persistence/src\repos.rs:809:    /// `validate_state`).
+crates/persistence/src\repos.rs:815:        let expected = validate_state(
+crates/persistence/src\repos.rs:905:                require_state_write(
+crates/persistence/src\repos.rs:919:    /// lifecycle state machine, which fences the *actual* `state` column).
+crates/persistence/src\repos.rs:947:    /// against the row's persisted state through the domain state machine
+crates/persistence/src\repos.rs:969:        let expected = validate_state(
+crates/persistence/src\repos.rs:993:            require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+crates/persistence/src\repos.rs:1074:    /// state machine (`InstanceState::is_terminal`) so the two can never
+crates/persistence/src\repos.rs:1145:/// domain state machine so the §8 recovery query and `is_terminal` can never
+crates/persistence/src\repos.rs:1168:/// validated path in the domain state machine (every state in the vocabulary
+crates/persistence/src\repos.rs:1170:/// the state machine.
+crates/persistence/src\repos.rs:1281:    /// the row's persisted state through the domain operation state machine,
+crates/persistence/src\repos.rs:1294:        let expected = validate_state(
+crates/persistence/src\repos.rs:1332:                require_state_write(
+crates/persistence/src\tests.rs:700:    // state machine, so the row must traverse the same path the domain object
+crates/persistence/src\tests.rs:905:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:913:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:1110:// state machine. An illegal transition must be rejected with
+crates/persistence/src\tests.rs:1205:async fn same_state_writes_are_idempotent_data_updates() {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$files = @('"'docs/architecture.md','crates/persistence/src/repos.rs','crates/persistence/src/store.rs','crates/persistence/src/tests.rs','migrations/0001_initial.sql','crates/domain/src/state_machine.rs','crates/domain/src/error.rs'); foreach ("'$f in $files) { Write-Output "FILE $f"; if ($f -eq '"'docs/architecture.md') { "'$a=Get-Content $f; for($i=145;$i -le [Math]::Min(230,$a.Count);$i++){ '"'{0,5} {1}' -f "'$i,$a[$i-1] } } elseif ($f -eq '"'crates/persistence/src/repos.rs') { "'$a=Get-Content $f; foreach($range in @(@(1,135),@(760,1020),@(1260,1350))){for($i=$range[0];$i -le $range[1];$i++){ '"'{0,5} {1}' -f "'$i,$a[$i-1] }} } elseif ($f -eq '"'crates/persistence/src/store.rs') { "'$a=Get-Content $f; for($i=135;$i -le 230;$i++){ '"'{0,5} {1}' -f "'$i,$a[$i-1] } } elseif ($f -eq '"'crates/persistence/src/tests.rs') { "'$a=Get-Content $f; for($i=1175;$i -le 1275;$i++){ '"'{0,5} {1}' -f "'$i,$a[$i-1] } } else { rg -n '"'instance|state|CHECK|transition' "'$f } }' in D:\Workspace\model-serving
+ succeeded in 234ms:
+FILE docs/architecture.md
+FILE crates/persistence/src/repos.rs
+    1 //! The repositories: `models`, `model_roots`, `runtimes`, `instances`,
+    2 //! `operations`, `audit` events and `settings`.
+    3 //!
+    4 //! Every function takes an explicit `sqlx::Executor` 鈥?pass
+    5 //! `store.pool()` for single-statement work or `&mut *tx` from
+    6 //! [`crate::SqliteStore::transaction`] for a multi-table consistency write
+    7 //! (`docs/architecture.md` 搂9).
+    8 //!
+    9 //! Row <-> domain mapping and validation live here, not in the frozen
+   10 //! `model-serving-domain` crate: rows decode into domain types (`Model`,
+   11 //! `Runtime`, `Instance`, `Operation`) and any decode failure surfaces as the
+   12 //! domain `Internal` error code. State columns are additionally fenced by the
+   13 //! schema's named `CHECK` constraints, so a token outside the state-machine
+   14 //! vocabulary can never be stored even by out-of-band SQL.
+   15 //!
+   16 //! `ModelRoot` and `AuditKind` / `AuditEvent` are persistence-level types:
+   17 //! the domain crate (frozen for this job) has no home for them; model roots
+   18 //! and the audit log are storage concerns of the control plane.
+   19 
+   20 use chrono::{DateTime, Utc};
+   21 use model_serving_domain::error::{DomainError, ErrorCode, Result};
+   22 use model_serving_domain::model::{
+   23     Capabilities, Instance, InstanceFailure, InstanceHealth, InstanceState, LoadConfig, Model,
+   24     Operation, OperationError, OperationKind, OperationState, Runtime, RuntimeKind,
+   25 };
+   26 use model_serving_domain::state_machine::{transition_instance, transition_operation};
+   27 use serde::{Deserialize, Serialize};
+   28 use sqlx::QueryBuilder;
+   29 use sqlx::Sqlite;
+   30 
+   31 use crate::mapping::{
+   32     as_i64, from_i64, from_json, now, parse_ts, parse_wire, storage_error, to_json, ts_string,
+   33     wire_token,
+   34 };
+   35 
+   36 /// The active `instances` list filters, in bind order. Kept as a `Vec` so the
+   37 /// `WHERE` / `AND` separators are derived from the enumeration index rather
+   38 /// than a mutable flag (which leaves a dead assignment when a trailing filter
+   39 /// is absent).
+   40 #[derive(Clone)]
+   41 enum InstanceFilter {
+   42     ModelId(String),
+   43     State(InstanceState),
+   44 }
+   45 
+   46 /// The active `operations` list filters, in bind order (see `InstanceFilter`).
+   47 #[derive(Clone)]
+   48 enum OperationFilter {
+   49     State(OperationState),
+   50     InstanceId(String),
+   51     ModelId(String),
+   52 }
+   53 
+   54 /// Read a row's persisted state and validate a transition to `to` against the
+   55 /// frozen domain state machine.
+   56 ///
+   57 /// The schema's named `CHECK` fences only prove a token is *in the
+   58 /// vocabulary*; this guard is what proves a write is a *legal* move
+   59 /// (`docs/architecture.md` 搂8). It selects the row's `state` and, when the row
+   60 /// exists and the target differs, runs `transition` (the domain machine) on
+   61 /// `(current, to)`. A write whose target equals the persisted state is an
+   62 /// idempotent *data* update (e.g. pid/health/progress while the lifecycle
+   63 /// state is unchanged), not a transition: the frozen machine defines no
+   64 /// self-loops, so same-state writes are accepted without consulting it.
+   65 /// `ErrorCode::InvalidStateTransition` is returned when the domain machine
+   66 /// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
+   67 /// as `Internal`.
+   68 ///
+   69 /// Returns the **current** state when the row exists, or `None` for a
+   70 /// first-seen row (no prior state, so a legal initial state may be written and
+   71 /// no transition check applies). Callers then issue a write guarded on the
+   72 /// returned state (`UPDATE ... WHERE <state_col> = <returned>`) and must check
+   73 /// `rows_affected`: the guarded update is a compare-and-set, so a row that
+   74 /// moved concurrently affects 0 rows and the write is rejected, even though
+   75 /// the SELECT and the UPDATE are separate statements (a transaction is not
+   76 /// required for the guard to be safe). Callers pass a re-usable executor (a
+   77 /// pool handle, `Copy`); on a transaction connection a non-`Copy` executor
+   78 /// cannot be used twice, so the caller performs the single guarded `UPDATE`
+   79 /// inline (the transaction's own read supplies `expected`).
+   80 async fn validate_state<'c, E, S>(
+   81     exec: E,
+   82     table: &str,
+   83     key_col: &str,
+   84     key: &str,
+   85     to: S,
+   86     transition: fn(S, S) -> Result<S>,
+   87 ) -> Result<Option<S>>
+   88 where
+   89     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+   90     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+   91 {
+   92     let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
+   93     let current: Option<String> = sqlx::query_scalar(&sql)
+   94         .bind(key)
+   95         .fetch_optional(exec)
+   96         .await
+   97         .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
+   98     match current {
+   99         None => Ok(None),
+  100         Some(raw) => {
+  101             let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+  102             if current != to {
+  103                 transition(current, to)?;
+  104             }
+  105             Ok(Some(current))
+  106         }
+  107     }
+  108 }
+  109 
+  110 /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+  111 /// guard validated the state, so a row that vanished or moved in the interim
+  112 /// means the update raced the state machine.
+  113 #[track_caller]
+  114 fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+  115     if rows_affected == 0 {
+  116         return Err(DomainError::with_message(
+  117             ErrorCode::InvalidStateTransition,
+  118             format!("{subject} changed state before the update applied"),
+  119         ));
+  120     }
+  121     Ok(())
+  122 }
+  123 
+  124 /// A controlled scan directory (`docs/api.md` 搂5 model-roots).
+  125 ///
+  126 /// Persistence-level type 鈥?the frozen domain crate has no model-root type.
+  127 /// `last_scan_at` / `last_scan_result` hold the most recent scanner outcome
+  128 /// (written by the scan job, M1 job 4).
+  129 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+  130 pub struct ModelRoot {
+  131     /// Stable root id.
+  132     pub id: String,
+  133     /// Absolute directory path scanned for artifacts.
+  134     pub path: String,
+  135     /// Whether the scanner includes this root.
+  760             enabled: row.enabled,
+  761             version_text: row.version_text,
+  762             capabilities: from_json::<Capabilities>(&row.capabilities, "capabilities")?,
+  763             fixed_args: from_json::<Vec<String>>(&row.fixed_args, "fixed_args")?,
+  764         },
+  765         last_probe_ok: row.last_probe_ok,
+  766         last_probed_at: match row.last_probed_at {
+  767             Some(raw) => Some(parse_ts(&raw, "last_probed_at")?),
+  768             None => None,
+  769         },
+  770     })
+  771 }
+  772 
+  773 /// Instance rows.
+  774 ///
+  775 /// `instances.model_id` stores the model's stable `id` (the `models.id`
+  776 /// UUID); `desired_state` is the state an in-flight operation drives the
+  777 /// instance toward, written in the same transaction as the operation
+  778 /// (`docs/architecture.md` 搂9).
+  779 #[derive(Debug)]
+  780 pub struct InstancesRepo;
+  781 
+  782 impl InstancesRepo {
+  783     /// Insert or update an instance row. On insert `desired_state` starts at
+  784     /// the instance's current state; on conflict the stored `desired_state`
+  785     /// is preserved (drive it explicitly via [`Self::set_desired_state`]).
+  786     ///
+  787     /// # Errors
+  788     ///
+  789     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+  790     /// `InvalidStateTransition` if the stored state tokens escape the state
+  791     /// fences (defensive), `Internal` otherwise.
+  792     /// Insert or update an instance row. On insert `desired_state` starts at
+  793     /// the instance's current state; on update the stored `desired_state` is
+  794     /// preserved (drive it explicitly via [`Self::set_desired_state`]).
+  795     ///
+  796     /// The write is guarded against the persisted state: on an existing row
+  797     /// the row's current state is validated through the domain state machine
+  798     /// before the (guarded) update, so an illegal move such as `failed -> ready`
+  799     /// is rejected and the row left unchanged (`docs/architecture.md` 搂8).
+  800     ///
+  801     /// # Errors
+  802     ///
+  803     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+  804     /// `InvalidStateTransition` for an illegal state transition or a row that
+  805     /// raced the guard, `Internal` otherwise. A same-state upsert is an
+  806     /// idempotent *data* update (pid/health/progress while the lifecycle state
+  807     /// is unchanged) and is always legal: the frozen machine defines no
+  808     /// self-loops, so same-state writes skip the transition check (see
+  809     /// `validate_state`).
+  810     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
+  811     where
+  812         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  813     {
+  814         let to = instance.state();
+  815         let expected = validate_state(
+  816             exec,
+  817             "instances",
+  818             "instance_id",
+  819             &instance.instance_id,
+  820             to,
+  821             transition_instance,
+  822         )
+  823         .await?;
+  824         let to_token = wire_token(&to);
+  825         let load_config = to_json(&instance.load_config, "load_config")?;
+  826         let device_ids = to_json(&instance.device_ids, "device_ids")?;
+  827         let health = instance
+  828             .health
+  829             .as_ref()
+  830             .map(|h| to_json(h, "health"))
+  831             .transpose()?;
+  832         let failure = instance
+  833             .failure
+  834             .as_ref()
+  835             .map(|f| to_json(f, "failure"))
+  836             .transpose()?;
+  837         let at = now();
+  838         let at_str = ts_string(at);
+  839         let pid = instance.pid.map(u64::from).map(as_i64);
+  840         let port = instance.port.map(i32::from);
+  841         let started_at = instance.started_at.map(ts_string);
+  842         let last_used_at = instance.last_used_at.map(ts_string);
+  843         let active_requests = i64::from(instance.active_requests);
+  844 
+  845         match expected {
+  846             None => {
+  847                 // First-seen row: insert with `desired_state` = state.
+  848                 sqlx::query(
+  849                     "INSERT INTO instances (
+  850                         instance_id, model_id, runtime_id, load_config,
+  851                         state, desired_state, pid, port, device_ids,
+  852                         started_at, last_used_at, active_requests, health, failure,
+  853                         created_at, updated_at
+  854                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  855                 )
+  856                 .bind(&instance.instance_id)
+  857                 .bind(&instance.model_id)
+  858                 .bind(&instance.runtime_id)
+  859                 .bind(&load_config)
+  860                 .bind(&to_token)
+  861                 .bind(&to_token)
+  862                 .bind(pid)
+  863                 .bind(port)
+  864                 .bind(&device_ids)
+  865                 .bind(started_at)
+  866                 .bind(last_used_at)
+  867                 .bind(active_requests)
+  868                 .bind(health)
+  869                 .bind(failure)
+  870                 .bind(&at_str)
+  871                 .bind(&at_str)
+  872                 .execute(exec)
+  873                 .await
+  874                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  875             }
+  876             Some(expected_state) => {
+  877                 // Existing row: guarded update (`desired_state` preserved).
+  878                 let expected_token = wire_token(&expected_state);
+  879                 let result = sqlx::query(
+  880                     "UPDATE instances SET
+  881                          model_id = ?, runtime_id = ?, load_config = ?,
+  882                          state = ?, pid = ?, port = ?, device_ids = ?,
+  883                          started_at = ?, last_used_at = ?, active_requests = ?,
+  884                          health = ?, failure = ?, updated_at = ?
+  885                      WHERE instance_id = ? AND state = ?",
+  886                 )
+  887                 .bind(&instance.model_id)
+  888                 .bind(&instance.runtime_id)
+  889                 .bind(&load_config)
+  890                 .bind(&to_token)
+  891                 .bind(pid)
+  892                 .bind(port)
+  893                 .bind(&device_ids)
+  894                 .bind(started_at)
+  895                 .bind(last_used_at)
+  896                 .bind(active_requests)
+  897                 .bind(health)
+  898                 .bind(failure)
+  899                 .bind(&at_str)
+  900                 .bind(&instance.instance_id)
+  901                 .bind(&expected_token)
+  902                 .execute(exec)
+  903                 .await
+  904                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  905                 require_state_write(
+  906                     result.rows_affected(),
+  907                     &format!("instance {}", instance.instance_id),
+  908                 )?;
+  909             }
+  910         }
+  911         Ok(())
+  912     }
+  913 
+  914     /// Drive an instance's `desired_state` (written together with the
+  915     /// triggering operation + audit event in one transaction 鈥?    /// `docs/architecture.md` 搂9). `desired_state` is the target an in-flight
+  916     /// operation drives the instance toward, so it is fenced only by the
+  917     /// schema's `instance_desired_state_valid` vocabulary `CHECK` (not by the
+  918     /// lifecycle state machine, which fences the *actual* `state` column).
+  919     ///
+  920     /// # Errors
+  921     ///
+  922     /// `InvalidStateTransition` for a token outside the state vocabulary,
+  923     /// `Internal` otherwise.
+  924     pub async fn set_desired_state<'c, E>(
+  925         exec: E,
+  926         instance_id: &str,
+  927         desired: InstanceState,
+  928     ) -> Result<()>
+  929     where
+  930         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  931     {
+  932         sqlx::query(
+  933             "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+  934         )
+  935         .bind(instance_id)
+  936         .bind(wire_token(&desired))
+  937         .bind(ts_string(now()))
+  938         .execute(exec)
+  939         .await
+  940         .map_err(|e| storage_error(&e, "set instance desired state"))?;
+  941         Ok(())
+  942     }
+  943 
+  944     /// Write an instance's actual lifecycle state (plus an optional
+  945     /// structured failure and the `updated_at` stamp). The move is validated
+  946     /// against the row's persisted state through the domain state machine
+  947     /// (e.g. `Instance::with_state` encodes the same rules); the update is
+  948     /// guarded on the persisted state, so a concurrent change is rejected.
+  949     ///
+  950     /// # Errors
+  951     ///
+  952     /// `InvalidStateTransition` for an illegal move from the persisted state,
+  953     /// `Internal` otherwise.
+  954     pub async fn write_state<'c, E>(
+  955         exec: E,
+  956         instance_id: &str,
+  957         state: InstanceState,
+  958         failure: &Option<InstanceFailure>,
+  959         updated_at: DateTime<Utc>,
+  960     ) -> Result<()>
+  961     where
+  962         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  963     {
+  964         let failure_json = failure
+  965             .as_ref()
+  966             .map(|f| to_json(f, "failure"))
+  967             .transpose()?;
+  968         let expected = validate_state(
+  969             exec,
+  970             "instances",
+  971             "instance_id",
+  972             instance_id,
+  973             state,
+  974             transition_instance,
+  975         )
+  976         .await?;
+  977         let state_token = wire_token(&state);
+  978         if let Some(expected_state) = expected {
+  979             let expected_token = wire_token(&expected_state);
+  980             let result = sqlx::query(
+  981                 "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+  982                  WHERE instance_id = ?1 AND state = ?5",
+  983             )
+  984             .bind(instance_id)
+  985             .bind(&state_token)
+  986             .bind(&failure_json)
+  987             .bind(ts_string(updated_at))
+  988             .bind(&expected_token)
+  989             .execute(exec)
+  990             .await
+  991             .map_err(|e| storage_error(&e, "write instance state"))?;
+  992             require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+  993         }
+  994         Ok(())
+  995     }
+  996 
+  997     /// Fetch one instance by `instance_id`.
+  998     ///
+  999     /// # Errors
+ 1000     ///
+ 1001     /// `Internal` on a corrupt row, `InvalidStateTransition` if a stored
+ 1002     /// state token escaped the fences (should be impossible).
+ 1003     pub async fn get<'c, E>(exec: E, instance_id: &str) -> Result<Option<Instance>>
+ 1004     where
+ 1005         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+ 1006     {
+ 1007         let row: Option<InstanceRow> = sqlx::query_as(
+ 1008             "SELECT instance_id, model_id, runtime_id, load_config, state, \
+ 1009                  pid, port, device_ids, started_at, last_used_at, active_requests, \
+ 1010                  health, failure FROM instances WHERE instance_id = ?1",
+ 1011         )
+ 1012         .bind(instance_id)
+ 1013         .fetch_optional(exec)
+ 1014         .await
+ 1015         .map_err(|e| storage_error(&e, "get instance"))?;
+ 1016         row.map(instance_from_row).transpose()
+ 1017     }
+ 1018 
+ 1019     /// List instances filtered by [`InstanceQuery`] (model `id` and/or
+ 1020     /// actual state), ordered by `instance_id`. Every user-controllable
+ 1260              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+ 1261         )
+ 1262         .bind(&operation.operation_id)
+ 1263         .bind(wire_token(&operation.kind))
+ 1264         .bind(wire_token(&operation.state()))
+ 1265         .bind(&operation.instance_id)
+ 1266         .bind(&operation.model_id)
+ 1267         .bind(ts_string(created))
+ 1268         .bind(operation.finished_at.map(ts_string))
+ 1269         .bind(error_json)
+ 1270         .bind(result_json)
+ 1271         .execute(exec)
+ 1272         .await
+ 1273         .map_err(|e| storage_error(&e, "create operation"))?;
+ 1274         Ok(())
+ 1275     }
+ 1276 
+ 1277     /// Persist a state advance of an existing operation (terminal or not):
+ 1278     /// `state`, `finished_at`, the structured `error` and `result` are
+ 1279     /// rewritten from the passed domain value. The move is validated against
+ 1280     /// the row's persisted state through the domain operation state machine,
+ 1281     /// and the update is guarded on that state (`docs/architecture.md` 搂8).
+ 1282     /// Returns `false` when no such operation exists.
+ 1283     ///
+ 1284     /// # Errors
+ 1285     ///
+ 1286     /// `InvalidStateTransition` for an illegal move from the persisted state
+ 1287     /// (or a row that raced the guard), `Internal` otherwise.
+ 1288     pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+ 1289     where
+ 1290         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+ 1291     {
+ 1292         let to = operation.state();
+ 1293         let expected = validate_state(
+ 1294             exec,
+ 1295             "operations",
+ 1296             "operation_id",
+ 1297             &operation.operation_id,
+ 1298             to,
+ 1299             transition_operation,
+ 1300         )
+ 1301         .await?;
+ 1302         let to_token = wire_token(&to);
+ 1303         let error_json = operation
+ 1304             .error
+ 1305             .as_ref()
+ 1306             .map(|e| to_json(e, "error"))
+ 1307             .transpose()?;
+ 1308         let result_json = operation
+ 1309             .result
+ 1310             .as_ref()
+ 1311             .map(|r| to_json(r, "result"))
+ 1312             .transpose()?;
+ 1313         let finished_at = operation.finished_at.map(ts_string);
+ 1314         match expected {
+ 1315             None => Ok(false),
+ 1316             Some(expected_state) => {
+ 1317                 let expected_token = wire_token(&expected_state);
+ 1318                 let result = sqlx::query(
+ 1319                     "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
+ 1320                      WHERE operation_id = ?1 AND state = ?6",
+ 1321                 )
+ 1322                 .bind(&operation.operation_id)
+ 1323                 .bind(&to_token)
+ 1324                 .bind(finished_at)
+ 1325                 .bind(error_json)
+ 1326                 .bind(result_json)
+ 1327                 .bind(&expected_token)
+ 1328                 .execute(exec)
+ 1329                 .await
+ 1330                 .map_err(|e| storage_error(&e, "advance operation"))?;
+ 1331                 require_state_write(
+ 1332                     result.rows_affected(),
+ 1333                     &format!("operation {}", operation.operation_id),
+ 1334                 )?;
+ 1335                 Ok(true)
+ 1336             }
+ 1337         }
+ 1338     }
+ 1339 
+ 1340     /// Fetch one operation by `operation_id`.
+ 1341     ///
+ 1342     /// # Errors
+ 1343     ///
+ 1344     /// `Internal` on a corrupt row (e.g. malformed stored `error` / `result`
+ 1345     /// JSON).
+ 1346     pub async fn get<'c, E>(exec: E, operation_id: &str) -> Result<Option<Operation>>
+ 1347     where
+ 1348         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+ 1349     {
+ 1350         let row: Option<OperationRow> = sqlx::query_as(
+FILE crates/persistence/src/store.rs
+  135     #[must_use]
+  136     pub fn pool(&self) -> &SqlitePool {
+  137         &self.pool
+  138     }
+  139 
+  140     /// Begin an explicit transaction for a multi-table consistency write
+  141     /// (`docs/architecture.md` 搂9). Run repository calls with `&mut *tx` as
+  142     /// the executor; the caller commits or rolls back.
+  143     ///
+  144     /// # Errors
+  145     ///
+  146     /// The domain `Internal` error code if the transaction cannot be
+  147     /// started.
+  148     pub async fn transaction(&self) -> Result<SqliteTransaction<'static>> {
+  149         self.pool
+  150             .begin()
+  151             .await
+  152             .map_err(|e| storage_error(&e, "begin transaction"))
+  153     }
+  154 
+  155     /// Docs/architecture.md 搂8: on daemon start, mark every **non-terminal**
+  156     /// instance (`queued` / `loading` / `ready` / `draining` / `unloading`)
+  157     /// as `crashed` 鈥?a process was expected to be running but the daemon
+  158     /// restarted, so those records are orphaned. Each move is validated
+  159     /// through the domain state machine (every non-terminal state legally
+  160     /// reaches `crashed`) and audit-logged, and the whole recovery commits
+  161     /// in one transaction. Settled records (`unloaded` / `failed` /
+  162     /// `crashed`) are left untouched, and a second call finds nothing to do.
+  163     ///
+  164     /// Returns the instances as they were found (with their pre-recovery
+  165     /// state), in recovery order. Non-terminal **operations** are exposed
+  166     /// via `crate::repos::OperationsRepo::non_terminal` for the supervisor
+  167     /// (job 6) rather than settled here.
+  168     ///
+  169     /// # Errors
+  170     ///
+  171     /// `InvalidStateTransition` if a stored state cannot legally reach
+  172     /// `crashed` (defensive: schema fence and state machine agree on the
+  173     /// vocabulary), or `Internal` on storage failure.
+  174     pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+  175         let stale = InstancesRepo::non_terminal(self.pool()).await?;
+  176         if stale.is_empty() {
+  177             return Ok(Vec::new());
+  178         }
+  179         let at = now();
+  180         let mut tx = self.transaction().await?;
+  181         for found in &stale {
+  182             // Validate the move through the frozen domain state machine (never
+  183             // a raw write). The expected `from` is the state just read, so the
+  184             // guarded update below needs no re-SELECT on the transaction
+  185             // connection (`&mut SqliteConnection` is not `Copy`, so the
+  186             // two-query repository guard cannot run in a transaction).
+  187             transition_instance(found.state(), InstanceState::Crashed).map_err(|_| {
+  188                 DomainError::with_message(
+  189                     ErrorCode::InvalidStateTransition,
+  190                     format!(
+  191                         "instance {} in {:?} cannot legally reach crashed",
+  192                         found.instance_id(),
+  193                         found.state()
+  194                     ),
+  195                 )
+  196             })?;
+  197             let result = sqlx::query(
+  198                 "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+  199                  WHERE instance_id = ?1 AND state = ?4",
+  200             )
+  201             .bind(found.instance_id())
+  202             .bind(wire_token(&InstanceState::Crashed))
+  203             .bind(ts_string(at))
+  204             .bind(wire_token(&found.state()))
+  205             .execute(&mut *tx)
+  206             .await
+  207             .map_err(|e| storage_error(&e, "write instance state"))?;
+  208             if result.rows_affected() == 0 {
+  209                 return Err(DomainError::with_message(
+  210                     ErrorCode::InvalidStateTransition,
+  211                     format!(
+  212                         "instance {} changed state before recovery applied",
+  213                         found.instance_id()
+  214                     ),
+  215                 ));
+  216             }
+  217             AuditRepo::append(
+  218                 &mut *tx,
+  219                 &AuditEvent::new(
+  220                     AuditKind::InstanceRecovered,
+  221                     Some("instance".to_owned()),
+  222                     Some(found.instance_id().to_string()),
+  223                     None,
+  224                     serde_json::json!({ "previous_state": found.state() }),
+  225                     at,
+  226                 ),
+  227             )
+  228             .await?;
+  229         }
+  230         tx.commit()
+FILE crates/persistence/src/tests.rs
+ 1175         OperationsRepo::advance(pool, &succeeded)
+ 1176             .await
+ 1177             .expect("advance to succeeded")
+ 1178     );
+ 1179     // illegal: succeeded (terminal) -> running
+ 1180     let mut queued_again = Operation::new("op-illegal", OperationKind::Load);
+ 1181     queued_again.instance_id = Some("i-op".into());
+ 1182     let back_to_running = queued_again
+ 1183         .with_state(OperationState::Running)
+ 1184         .expect("derive a running-state operation");
+ 1185     let err = OperationsRepo::advance(pool, &back_to_running)
+ 1186         .await
+ 1187         .expect_err("succeeded -> running must be rejected");
+ 1188     assert_code(&err, ErrorCode::InvalidStateTransition);
+ 1189     assert_eq!(
+ 1190         OperationsRepo::get(pool, "op-illegal")
+ 1191             .await
+ 1192             .expect("get")
+ 1193             .expect("row")
+ 1194             .state(),
+ 1195         OperationState::Succeeded,
+ 1196         "the operation must remain in its terminal state"
+ 1197     );
+ 1198 }
+ 1199 
+ 1200 // P1 (codex round 2): a same-state upsert is an idempotent data update, not a
+ 1201 // transition. The frozen machine has no self-loops, so keeping the persisted
+ 1202 // state while changing data (pid, active_requests, ...) must be accepted and
+ 1203 // persisted; write_state of the same state is likewise a legal no-op move.
+ 1204 #[tokio::test]
+ 1205 async fn same_state_writes_are_idempotent_data_updates() {
+ 1206     let fixture = Fixture::new().await.expect("fixture");
+ 1207     let store = &fixture.store;
+ 1208     let pool = store.pool();
+ 1209 
+ 1210     seed(store, "m-ss", "i-ss", InstanceState::Ready).await;
+ 1211     let found = InstancesRepo::get(pool, "i-ss")
+ 1212         .await
+ 1213         .expect("get")
+ 1214         .expect("row");
+ 1215     let mut updated = found.clone();
+ 1216     updated.pid = Some(4242);
+ 1217     updated.active_requests = 3;
+ 1218     InstancesRepo::upsert(pool, &updated)
+ 1219         .await
+ 1220         .expect("same-state upsert (Ready -> Ready with new data) must be accepted");
+ 1221     let after = InstancesRepo::get(pool, "i-ss")
+ 1222         .await
+ 1223         .expect("get")
+ 1224         .expect("row");
+ 1225     assert_eq!(after.state(), InstanceState::Ready, "state is unchanged");
+ 1226     assert_eq!(after.pid, Some(4242), "the new pid is persisted");
+ 1227     assert_eq!(
+ 1228         after.active_requests, 3,
+ 1229         "the new active_requests is persisted"
+ 1230     );
+ 1231 
+ 1232     // write_state of the same state is a legal no-op move (e.g. recording a
+ 1233     // refreshed failure while already in the same state).
+ 1234     InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
+ 1235         .await
+ 1236         .expect("same-state write_state must be accepted");
+ 1237     assert_eq!(
+ 1238         InstancesRepo::get(pool, "i-ss")
+ 1239             .await
+ 1240             .expect("get")
+ 1241             .expect("row")
+ 1242             .state(),
+ 1243         InstanceState::Ready
+ 1244     );
+ 1245 }
+ 1246 
+ 1247 // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+ 1248 // InvalidRequest, not InvalidStateTransition (state fences only) and not
+ 1249 // Internal. The state fence names are the only ones that map to
+ 1250 // InvalidStateTransition.
+ 1251 #[tokio::test]
+ 1252 async fn non_state_check_violation_maps_to_invalid_request() {
+ 1253     let fixture = Fixture::new().await.expect("fixture");
+ 1254     let store = &fixture.store;
+ 1255     seed(store, "m-port", "i-port", InstanceState::Ready).await;
+ 1256     let pool = store.pool();
+ 1257     let err = sqlx::query("UPDATE instances SET port = ?2 WHERE instance_id = ?1")
+ 1258         .bind("i-port")
+ 1259         .bind(99_999_i64)
+ 1260         .execute(pool)
+ 1261         .await
+ 1262         .expect_err("out-of-range port must violate the CHECK");
+ 1263     assert_code(
+ 1264         &crate::mapping::storage_error(&err, "write port"),
+ 1265         ErrorCode::InvalidRequest,
+ 1266     );
+ 1267 }
+ 1268 
+ 1269 // P1-3: every user-controllable list filter value is bound as a literal. A
+ 1270 // filter ID containing SQL metacharacters must not break the query and must
+ 1271 // not match anything; a well-formed ID still matches its row.
+ 1272 #[tokio::test]
+ 1273 async fn list_filters_treat_injection_ids_as_literals() {
+ 1274     let fixture = Fixture::new().await.expect("fixture");
+ 1275     let store = &fixture.store;
+FILE migrations/0001_initial.sql
+rg: migrations/0001_initial.sql: IO error for operation on migrations/0001_initial.sql: 系统找不到指定的路径。 (os error 3)
+FILE crates/domain/src/state_machine.rs
+1://! Pure state machines: the instance load-state machine and the operation
+2://! state machine (`docs/architecture.md` §3, §5).
+4://! Both are expressed as explicit target-state transition tables so every legal
+6://! `can_transition` / `transition` are pure functions — no I/O, no mutation of
+7://! the caller's state — so they are trivially unit-testable and can be reused
+10://! ## Instance state machine (`docs/architecture.md` §5)
+21://! any running state --unexpected exit--> crashed
+28://!   with **no** re-queue edge: a later load starts a fresh instance
+36://! - Any running state (`loading`/`ready`/`draining`) may reach `crashed` on an
+39://! - On daemon restart, recovery marks *every non-terminal* state
+42://!   §8). The table therefore lets every non-terminal state reach `crashed` so
+43://!   recovery uses the validated path, not a raw state write.
+49:    /// Target states reachable from `self` in a single step.
+50:    const fn transitions(self) -> &'static [InstanceState] {
+65:    pub fn can_transition_to(self, target: InstanceState) -> bool {
+66:        self.transitions().contains(&target)
+69:    /// Whether the instance lifecycle is settled (no in-flight process).
+72:    /// records whose state is *not* terminal — a process was expected to be
+76:    /// transition": `unloaded` can be re-queued, so every state has an
+84:    /// The states that can legally follow a `ready` instance (drain / crash).
+87:        InstanceState::Ready.transitions()
+92:    /// Target states reachable from `self` in a single step.
+93:    const fn transitions(self) -> &'static [OperationState] {
+104:    pub fn can_transition_to(self, target: OperationState) -> bool {
+105:        self.transitions().contains(&target)
+108:    /// Whether `self` is a terminal operation state.
+111:        self.transitions().is_empty()
+115:/// Attempt to move an instance from `from` to `to`.
+119:/// does not mutate anything; the caller applies the returned state.
+124:/// `from` in the instance transition table.
+125:pub fn transition_instance(from: InstanceState, to: InstanceState) -> Result<InstanceState> {
+126:    if from.can_transition_to(to) {
+131:            format!("instance cannot move from {from:?} to {to:?}"),
+144:/// `from` in the operation transition table.
+145:pub fn transition_operation(from: OperationState, to: OperationState) -> Result<OperationState> {
+146:    if from.can_transition_to(to) {
+161:    /// Every state, for exhaustive matrix testing.
+177:    fn instance_happy_path_load_and_unload() {
+180:            transition_instance(S::Unloaded, S::Queued).expect("unloaded->queued"),
+184:            transition_instance(S::Queued, S::Loading).expect("queued->loading"),
+188:            transition_instance(S::Loading, S::Ready).expect("loading->ready"),
+193:            transition_instance(S::Ready, S::Draining).expect("ready->draining"),
+197:            transition_instance(S::Draining, S::Unloading).expect("draining->unloading"),
+201:            transition_instance(S::Unloading, S::Unloaded).expect("unloading->unloaded"),
+209:            transition_instance(S::Draining, S::Ready).expect("draining->ready"),
+217:            transition_instance(S::Queued, S::Failed).expect("queued->failed"),
+221:            transition_instance(S::Loading, S::Failed).expect("loading->failed"),
+225:            transition_instance(S::Loading, S::Crashed).expect("loading->crashed"),
+229:            transition_instance(S::Loading, S::Unloading).expect("loading->unloading"),
+237:            transition_instance(S::Ready, S::Crashed).expect("ready->crashed"),
+242:    /// A draining instance is still a live process serving existing requests,
+248:            transition_instance(S::Draining, S::Crashed).expect("draining->crashed"),
+257:    fn instance_terminality_marks_settled_states_only() {
+269:    /// state must reach `crashed` through the validated transition, so the
+270:    /// supervisor marks an interrupted instance crashed without bypassing the
+271:    /// state machine. Settled states need no recovery.
+273:    fn every_nonterminal_state_can_crash() {
+274:        for state in [S::Queued, S::Loading, S::Ready, S::Draining, S::Unloading] {
+276:                state.can_transition_to(S::Crashed),
+277:                "non-terminal {state:?} must reach crashed for recovery"
+280:        for state in [S::Unloaded, S::Failed, S::Crashed] {
+281:            assert!(state.is_terminal(), "settled {state:?} needs no recovery");
+286:    /// with no re-queue edge (a later load starts a fresh instance) —
+291:            transition_instance(S::Crashed, S::Queued).expect("crashed->queued"),
+294:        assert!(!S::Failed.can_transition_to(S::Queued));
+296:            transition_instance(S::Failed, S::Queued),
+304:            transition_instance(S::Queued, S::Unloaded).expect("queued->unloaded"),
+310:    fn instance_illegal_transitions_are_rejected() {
+313:            transition_instance(S::Unloaded, S::Ready),
+316:        assert!(!S::Unloaded.can_transition_to(S::Ready));
+317:        assert!(!S::Unloaded.can_transition_to(S::Loading));
+320:        assert!(!S::Ready.can_transition_to(S::Unloaded));
+322:        assert!(!S::Ready.can_transition_to(S::Loading));
+325:        assert!(!S::Ready.can_transition_to(S::Ready));
+327:        // settled states cannot re-enter an active state directly.
+328:        assert!(!S::Unloaded.can_transition_to(S::Ready));
+329:        assert!(!S::Failed.can_transition_to(S::Ready));
+331:        assert!(!S::Failed.can_transition_to(S::Queued));
+335:    fn transition_error_reports_code_and_message() {
+336:        let err = transition_instance(S::Unloaded, S::Ready).expect_err("must fail");
+342:    /// Exhaustive: the transition matrix matches the documented table exactly.
+345:    fn instance_transition_matrix_is_exact() {
+366:                    source.can_transition_to(candidate),
+377:            transition_operation(O::Queued, O::Running).expect("queued->running"),
+381:            transition_operation(O::Running, O::Succeeded).expect("running->succeeded"),
+394:            transition_operation(O::Queued, O::Cancelled).expect("queued->cancelled"),
+398:            transition_operation(O::Running, O::Cancelled).expect("running->cancelled"),
+402:            transition_operation(O::Running, O::Failed).expect("running->failed"),
+408:    fn operation_illegal_transitions_are_rejected() {
+409:        // Terminal states have no successors.
+410:        assert!(!O::Succeeded.can_transition_to(O::Running));
+411:        assert!(!O::Failed.can_transition_to(O::Running));
+412:        assert!(!O::Cancelled.can_transition_to(O::Running));
+414:        assert!(!O::Queued.can_transition_to(O::Succeeded));
+415:        assert!(!O::Queued.can_transition_to(O::Failed));
+417:        assert!(!O::Running.can_transition_to(O::Running));
+419:            transition_operation(O::Succeeded, O::Queued),
+425:    fn operation_transition_matrix_is_exact() {
+437:                    source.can_transition_to(candidate),
+FILE crates/domain/src/error.rs
+45:    /// instance (422).
+56:    /// Model exists but has no loaded instance (404).
+76:    /// The instance did not become healthy before its start deadline (504).
+87:    /// No such instance (including already-unloaded historical ones) (404).
+89:    /// A requested state change is not legal for the current state (409).
+286:                "instance_not_found",
+290:                "instance-not-found",
+293:                "invalid_state_transition",
+294:                "Invalid state transition",
+297:                "invalid-state-transition",
+627:    /// The authoritative error catalog (`docs/api.md` §2.2.1), stated
+826:                "instance_not_found",
+830:                "instance-not-found",
+834:                "invalid_state_transition",
+835:                "Invalid state transition",
+838:                "invalid-state-transition",
+952:            .to_problem_details("No idle instance can be evicted safely", Some("req-1"));
+960:                "detail": "No idle instance can be evicted safely",
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$a=Get-Content -Encoding UTF8 docs/architecture.md; 145..220 | ForEach-Object { if($_ -le $a.Count){ '"'{0,5} {1}' -f "'$_,$a[$_-1] } }; Write-Output '"'--- DIFF ---'; git diff be6164c"'^ be6164c -- crates/persistence/src/repos.rs crates/persistence/src/tests.rs; Write-Output '"'--- INSTANCE DOMAIN ---'; rg -n 'pub struct Instance|impl Instance|with_state|active_requests|pid|failure|health' crates/domain/src; Write-Output '--- MIGRATION ---'; rg -n 'CREATE TABLE instances|instances|CHECK|FOREIGN KEY' crates/persistence/migrations/0001_initial.sql" in D:\Workspace\model-serving
+ succeeded in 197ms:
+  145                                   |
+  146                                   v
+  147                                 ready   (drain 被取消/超时策略回退)
+  148 
+  149 任意运行态 --unexpected exit--> crashed
+  150 crashed --explicit load---------> queued
+  151 ```
+  152 
+  153 加载事务：
+  154 
+  155 1. 在 per-model lock 下验证 model/runtime/config。
+  156 2. 为 operation 和 instance 生成 ID，选择空闲 loopback port。
+  157 3. 做资源预检。若明显不足且策略允许，选择 idle LRU victims，依次 drain/unload。
+  158 4. 以独立 process group 启动子进程，同时采集有界 stdout/stderr ring buffer。
+  159 5. 等待 health endpoint，采用启动 deadline；同时监控子进程退出。
+  160 6. health 成功后读取 `/v1/models` 校验标识，再原子发布为 `ready`。
+  161 7. 若疑似 OOM，且尚未进行过驱逐重试，则驱逐 idle victims 后只重试一次。
+  162 8. 失败时终止残留进程、释放端口 reservation、记录结构化失败原因。
+  163 
+  164 避免“端口先检查后被占用”的竞态：daemon 应持有 listener reservation，或让子进程在受控端口范围内失败重选；具体方式在实现 spike 中确定，因为现有引擎不能继承监听 socket。
+  165 
+  166 ## 6. 显存切换策略
+  167 
+  168 - `deny`：资源不足立即失败。
+  169 - `auto_evict_idle`：默认；按 `last_used_at` 从旧到新驱逐 idle 实例。
+  170 - `replace_instances`：调用者显式给出可卸载的 instance IDs，最可预测。
+  171 
+  172 active request 是硬保护条件。加载 operation 使用全局 resource lock 串行化，避免两个并发 load 各自依据相同空闲显存做决定。MVP 假设单 GPU；数据模型保留 `device_ids`。
+  173 
+  174 失败识别不能只依赖 stderr 文案。建议记录：进程 exit code、stderr tail、启动前后 `nvidia-smi` snapshot、是否出现 health、deadline 阶段。只有 `FailureClass::GpuOomLikely` 才自动驱逐重试，其他错误直接失败。
+  175 
+  176 ## 7. 推理请求路径
+  177 
+  178 1. 认证、body size、并发限制。
+  179 2. 对需要路由的请求只解析 `model`，保留原始 JSON 字段。
+  180 3. 从内存 registry 获取 `ready` instance lease；lease 增加 `active_requests`。
+  181 4. 将请求发送到 loopback upstream。必要时将外部 bearer token 替换为 runtime 私有 token。
+  182 5. 普通响应透传状态、body 和允许的 headers；SSE 以流方式转发，不缓冲完整响应。
+  183 6. 完成、错误或客户端断开均释放 lease，并更新无正文 metrics。
+  184 
+  185 同一 model key 若未来存在多个实例，采用 least-active + round-robin tie-break。首版通常是一对一。
+  186 
+  187 ## 8. 进程恢复和退出
+  188 
+  189 - daemon 启动时将数据库中非终态实例标记为 `crashed/recovery_required`。
+  190 - 首版不 attach 到未知 PID，避免 PID reuse 和错误终止其他进程。
+  191 - daemon 正常退出时停止接收管理操作，drain inference，然后终止其监管的全部子进程。
+  192 - 可选的 `restore_on_start` 后续实现；首版服务重启后由用户重新 load。
+  193 - 子进程意外退出不会无限重启；记录 crash 并等待显式 load，防止 OOM crash loop。
+  194 
+  195 ## 9. 一致性和并发控制
+  196 
+  197 - per-model mutex：防止同一模型同时 load/unload。
+  198 - global resource mutex：串行 GPU placement/eviction/load commit。
+  199 - instance lease：保护有活动请求的实例不被自动驱逐。
+  200 - SQLite transaction：operation、instance desired state 和 audit event 同步提交。
+  201 - 内存 registry 是路由真相；SQLite 用于恢复和审计，不位于 inference 热路径。
+  202 
+--- DIFF ---
+diff --git a/crates/persistence/src/repos.rs b/crates/persistence/src/repos.rs
+index 3179443..7024079 100644
+--- a/crates/persistence/src/repos.rs
++++ b/crates/persistence/src/repos.rs
+@@ -57,18 +57,26 @@ enum OperationFilter {
+ /// The schema's named `CHECK` fences only prove a token is *in the
+ /// vocabulary*; this guard is what proves a write is a *legal* move
+ /// (`docs/architecture.md` §8). It selects the row's `state` and, when the row
+-/// exists, runs `transition` (the domain machine) on `(current, to)`. A
+-/// transition the domain machine rejects returns `DomainError` with
+-/// `ErrorCode::InvalidStateTransition`; an undecodable stored state is surfaced
++/// exists and the target differs, runs `transition` (the domain machine) on
++/// `(current, to)`. A write whose target equals the persisted state is an
++/// idempotent *data* update (e.g. pid/health/progress while the lifecycle
++/// state is unchanged), not a transition: the frozen machine defines no
++/// self-loops, so same-state writes are accepted without consulting it.
++/// `ErrorCode::InvalidStateTransition` is returned when the domain machine
++/// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
+ /// as `Internal`.
+ ///
+ /// Returns the **current** state when the row exists, or `None` for a
+ /// first-seen row (no prior state, so a legal initial state may be written and
+ /// no transition check applies). Callers then issue a write guarded on the
+-/// returned state (`UPDATE ... WHERE <state_col> = <returned>`). Because the
+-/// SELECT and the write must run on the same executor, callers pass a
+-/// re-usable executor (a pool handle, `Copy`); atomic multi-table guarded
+-/// writes are performed inline on a transaction connection.
++/// returned state (`UPDATE ... WHERE <state_col> = <returned>`) and must check
++/// `rows_affected`: the guarded update is a compare-and-set, so a row that
++/// moved concurrently affects 0 rows and the write is rejected, even though
++/// the SELECT and the UPDATE are separate statements (a transaction is not
++/// required for the guard to be safe). Callers pass a re-usable executor (a
++/// pool handle, `Copy`); on a transaction connection a non-`Copy` executor
++/// cannot be used twice, so the caller performs the single guarded `UPDATE`
++/// inline (the transaction's own read supplies `expected`).
+ async fn validate_state<'c, E, S>(
+     exec: E,
+     table: &str,
+@@ -79,7 +87,7 @@ async fn validate_state<'c, E, S>(
+ ) -> Result<Option<S>>
+ where
+     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+-    S: std::fmt::Debug + Copy + Send + serde::de::DeserializeOwned + 'c,
++    S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+ {
+     let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
+     let current: Option<String> = sqlx::query_scalar(&sql)
+@@ -91,7 +99,9 @@ where
+         None => Ok(None),
+         Some(raw) => {
+             let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+-            transition(current, to)?;
++            if current != to {
++                transition(current, to)?;
++            }
+             Ok(Some(current))
+         }
+     }
+@@ -792,7 +802,11 @@ impl InstancesRepo {
+     ///
+     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+     /// `InvalidStateTransition` for an illegal state transition or a row that
+-    /// raced the guard, `Internal` otherwise.
++    /// raced the guard, `Internal` otherwise. A same-state upsert is an
++    /// idempotent *data* update (pid/health/progress while the lifecycle state
++    /// is unchanged) and is always legal: the frozen machine defines no
++    /// self-loops, so same-state writes skip the transition check (see
++    /// `validate_state`).
+     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
+     where
+         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+diff --git a/crates/persistence/src/tests.rs b/crates/persistence/src/tests.rs
+index 599e5a2..7527791 100644
+--- a/crates/persistence/src/tests.rs
++++ b/crates/persistence/src/tests.rs
+@@ -1197,6 +1197,53 @@ async fn state_writes_reject_illegal_transitions_and_preserve_rows() {
+     );
+ }
+ 
++// P1 (codex round 2): a same-state upsert is an idempotent data update, not a
++// transition. The frozen machine has no self-loops, so keeping the persisted
++// state while changing data (pid, active_requests, ...) must be accepted and
++// persisted; write_state of the same state is likewise a legal no-op move.
++#[tokio::test]
++async fn same_state_writes_are_idempotent_data_updates() {
++    let fixture = Fixture::new().await.expect("fixture");
++    let store = &fixture.store;
++    let pool = store.pool();
++
++    seed(store, "m-ss", "i-ss", InstanceState::Ready).await;
++    let found = InstancesRepo::get(pool, "i-ss")
++        .await
++        .expect("get")
++        .expect("row");
++    let mut updated = found.clone();
++    updated.pid = Some(4242);
++    updated.active_requests = 3;
++    InstancesRepo::upsert(pool, &updated)
++        .await
++        .expect("same-state upsert (Ready -> Ready with new data) must be accepted");
++    let after = InstancesRepo::get(pool, "i-ss")
++        .await
++        .expect("get")
++        .expect("row");
++    assert_eq!(after.state(), InstanceState::Ready, "state is unchanged");
++    assert_eq!(after.pid, Some(4242), "the new pid is persisted");
++    assert_eq!(
++        after.active_requests, 3,
++        "the new active_requests is persisted"
++    );
++
++    // write_state of the same state is a legal no-op move (e.g. recording a
++    // refreshed failure while already in the same state).
++    InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
++        .await
++        .expect("same-state write_state must be accepted");
++    assert_eq!(
++        InstancesRepo::get(pool, "i-ss")
++            .await
++            .expect("get")
++            .expect("row")
++            .state(),
++        InstanceState::Ready
++    );
++}
++
+ // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+ // InvalidRequest, not InvalidStateTransition (state fences only) and not
+ // Internal. The state fence names are the only ones that map to
+--- INSTANCE DOMAIN ---
+crates/domain/src\state_machine.rs:48:impl InstanceState {
+crates/domain/src\state_machine.rs:215:    fn load_failures_reach_failed_or_crashed() {
+crates/domain/src\model.rs:15://! `with_state` helpers (which run the target through the state machines in
+crates/domain/src\model.rs:112:    /// The health endpoint path the adapter should poll (optional).
+crates/domain/src\model.rs:114:    pub health_endpoint: Option<String>,
+crates/domain/src\model.rs:297:/// A GPU/exit failure signature
+crates/domain/src\model.rs:307:    /// The instance did not become healthy before its start deadline.
+crates/domain/src\model.rs:333:    /// The child process is starting and being health-checked.
+crates/domain/src\model.rs:347:/// A point-in-time health probe result for an instance.
+crates/domain/src\model.rs:349:pub struct InstanceHealth {
+crates/domain/src\model.rs:350:    /// Whether the last probe was healthy.
+crates/domain/src\model.rs:363:pub struct InstanceFailure {
+crates/domain/src\model.rs:364:    /// The classified failure.
+crates/domain/src\model.rs:389:    /// [`Operation::with_state`]).
+crates/domain/src\model.rs:418:    /// moves only via [`Self::with_state`].
+crates/domain/src\model.rs:459:    pub fn with_state(self, to: OperationState) -> Result<Self> {
+crates/domain/src\model.rs:507:/// `pid` and `port` are only trustworthy once the process supervisor has
+crates/domain/src\model.rs:514:pub struct Instance {
+crates/domain/src\model.rs:524:    /// changed via [`Instance::with_state`]).
+crates/domain/src\model.rs:528:    pub pid: Option<u32>,
+crates/domain/src\model.rs:546:    pub active_requests: u32,
+crates/domain/src\model.rs:547:    /// Last health probe (optional).
+crates/domain/src\model.rs:549:    pub health: Option<InstanceHealth>,
+crates/domain/src\model.rs:550:    /// Structured failure, set in `failed`/`crashed` states (optional).
+crates/domain/src\model.rs:552:    pub failure: Option<InstanceFailure>,
+crates/domain/src\model.rs:555:impl Instance {
+crates/domain/src\model.rs:559:    /// (`pid`/`port`/`device_ids`/health/timestamps/`active_requests`/
+crates/domain/src\model.rs:560:    /// `failure`) default and are set by the supervisor. The lifecycle `state`
+crates/domain/src\model.rs:561:    /// is private and moves only via [`Self::with_state`].
+crates/domain/src\model.rs:575:            pid: None,
+crates/domain/src\model.rs:580:            active_requests: 0,
+crates/domain/src\model.rs:581:            health: None,
+crates/domain/src\model.rs:582:            failure: None,
+crates/domain/src\model.rs:595:    pub fn has_active_requests(&self) -> bool {
+crates/domain/src\model.rs:596:        self.active_requests > 0
+crates/domain/src\model.rs:616:    pub fn with_state(self, to: InstanceState) -> Result<Self> {
+crates/domain/src\model.rs:846:    fn failure_class_serializes_snake_case() {
+crates/domain/src\model.rs:854:    fn instance_tracks_active_requests_and_confirmed_pid() {
+crates/domain/src\model.rs:869:            pid: Some(4242),
+crates/domain/src\model.rs:874:            active_requests: 2,
+crates/domain/src\model.rs:875:            health: Some(InstanceHealth {
+crates/domain/src\model.rs:880:            failure: None,
+crates/domain/src\model.rs:882:        assert!(inst.has_active_requests());
+crates/domain/src\model.rs:885:        assert_eq!(v["pid"], 4242);
+crates/domain/src\model.rs:887:        assert_eq!(v["active_requests"], 2);
+crates/domain/src\model.rs:904:                message: "no healthy upstream after 30s".into(),
+crates/domain/src\model.rs:981:            pid: Some(1234),
+crates/domain/src\model.rs:986:            active_requests: 3,
+crates/domain/src\model.rs:987:            health: Some(InstanceHealth {
+crates/domain/src\model.rs:992:            failure: None,
+crates/domain/src\model.rs:998:    fn instance_with_failure_round_trips() {
+crates/domain/src\model.rs:1015:            failure: Some(InstanceFailure {
+crates/domain/src\model.rs:1055:                health_endpoint: Some("/health".into()),
+crates/domain/src\model.rs:1069:            health_endpoint: None,
+crates/domain/src\error.rs:76:    /// The instance did not become healthy before its start deadline (504).
+crates/domain/src\error.rs:97:    /// An unexpected internal failure (500).
+crates/domain/src\error.rs:109:    /// `invalid_request_error`, and every other client-visible failure
+crates/domain/src\error.rs:619:        // Other client-visible failures (409/429/502/503/504, 501) -> api_error.
+--- MIGRATION ---
+11:--     token as TEXT and is fenced by a named CHECK constraint so a row outside
+30:    restart_required INTEGER NOT NULL DEFAULT 0 CHECK (restart_required IN (0, 1)),
+39:    kind           TEXT NOT NULL CHECK (kind IN ('llama_cpp', 'ninfer')),
+41:    enabled        INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+55:    enabled          INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+69:    artifact_kind       TEXT NOT NULL CHECK (artifact_kind IN ('gguf', 'ninfer')),
+70:    size_bytes          INTEGER NOT NULL CHECK (size_bytes >= 0),
+75:    deleted             INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+88:CREATE TABLE instances (
+95:        CHECK (state IN ('unloaded', 'queued', 'loading', 'ready',
+99:        CHECK (desired_state IN ('unloaded', 'queued', 'loading', 'ready',
+102:    port            INTEGER CHECK (port IS NULL OR (port BETWEEN 1 AND 65535)),
+106:    active_requests INTEGER NOT NULL DEFAULT 0 CHECK (active_requests >= 0),
+112:CREATE INDEX idx_instances_model ON instances (model_id);
+113:CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+115:CREATE INDEX idx_instances_state_nonterminal
+116:    ON instances (state)
+124:    kind         TEXT NOT NULL CHECK (kind IN ('load', 'unload', 'rescan')),
+127:        CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+128:    instance_id  TEXT REFERENCES instances (instance_id) ON DELETE SET NULL,
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$a=Get-Content -Encoding UTF8 crates/domain/src/model.rs; 500..635 | ForEach-Object { '"'{0,5} {1}' -f "'$_,$a[$_-1] }; Write-Output '"'--- transitions ---'; "'$b=Get-Content -Encoding UTF8 crates/domain/src/state_machine.rs; 45..155 | ForEach-Object { '"'{0,5} {1}' -f "'$_,$b[$_-1] }; Write-Output '"'--- migration instances ---'; "'$c=Get-Content -Encoding UTF8 crates/persistence/migrations/0001_initial.sql; 82..120 | ForEach-Object { '"'{0,5} {1}' -f "'$_,$c[$_-1] }; Write-Output '"'--- commit history ---'; git log --oneline --decorate -8" in D:\Workspace\model-serving
+ succeeded in 201ms:
+  500     /// Human-readable detail.
+  501     pub message: String,
+  502 }
+  503 
+  504 /// An evictable / placeable instance
+  505 /// (`docs/architecture.md` §3 "Instance", §6).
+  506 ///
+  507 /// `pid` and `port` are only trustworthy once the process supervisor has
+  508 /// confirmed them; they stay `None` until then (`docs/architecture.md` §3).
+  509 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+  510 #[allow(
+  511     clippy::struct_field_names,
+  512     reason = "`instance_id` is the documented wire field name (docs/api.md); the prefix is intentional, not noise."
+  513 )]
+  514 pub struct Instance {
+  515     /// Unique id for this load instance; also used by LM Studio unload.
+  516     pub instance_id: String,
+  517     /// The model loaded in this instance.
+  518     pub model_id: String,
+  519     /// The runtime used to load it.
+  520     pub runtime_id: String,
+  521     /// The resolved load configuration.
+  522     pub load_config: LoadConfig,
+  523     /// Current lifecycle state (private; read via [`Instance::state`],
+  524     /// changed via [`Instance::with_state`]).
+  525     state: InstanceState,
+  526     /// Child PID, set once the supervisor confirms it (optional).
+  527     #[serde(default, skip_serializing_if = "Option::is_none")]
+  528     pub pid: Option<u32>,
+  529     /// Loopback port, set once the supervisor confirms it (optional).
+  530     #[serde(default, skip_serializing_if = "Option::is_none")]
+  531     pub port: Option<u16>,
+  532     /// GPU device indices this instance occupies (empty = CPU / unassigned).
+  533     /// Reserved for multi-GPU placement & resource accounting
+  534     /// (`docs/architecture.md` §6: 数据模型保留 `device_ids`).
+  535     #[serde(default)]
+  536     pub device_ids: Vec<u32>,
+  537     /// When the instance started, RFC 3339 UTC (optional).
+  538     #[serde(default, skip_serializing_if = "Option::is_none")]
+  539     pub started_at: Option<DateTime<Utc>>,
+  540     /// Last time the instance served a request, RFC 3339 UTC (optional);
+  541     /// drives LRU idle eviction.
+  542     #[serde(default, skip_serializing_if = "Option::is_none")]
+  543     pub last_used_at: Option<DateTime<Utc>>,
+  544     /// Number of in-flight requests (hard eviction-protection signal).
+  545     #[serde(default)]
+  546     pub active_requests: u32,
+  547     /// Last health probe (optional).
+  548     #[serde(default, skip_serializing_if = "Option::is_none")]
+  549     pub health: Option<InstanceHealth>,
+  550     /// Structured failure, set in `failed`/`crashed` states (optional).
+  551     #[serde(default, skip_serializing_if = "Option::is_none")]
+  552     pub failure: Option<InstanceFailure>,
+  553 }
+  554 
+  555 impl Instance {
+  556     /// Create a fresh instance with no process, in the initial
+  557     /// [`InstanceState::Unloaded`] state. `model_id`/`runtime_id`/
+  558     /// `load_config` identify the load; the remaining runtime fields
+  559     /// (`pid`/`port`/`device_ids`/health/timestamps/`active_requests`/
+  560     /// `failure`) default and are set by the supervisor. The lifecycle `state`
+  561     /// is private and moves only via [`Self::with_state`].
+  562     #[must_use]
+  563     pub fn new(
+  564         instance_id: impl Into<String>,
+  565         model_id: impl Into<String>,
+  566         runtime_id: impl Into<String>,
+  567         load_config: LoadConfig,
+  568     ) -> Self {
+  569         Self {
+  570             instance_id: instance_id.into(),
+  571             model_id: model_id.into(),
+  572             runtime_id: runtime_id.into(),
+  573             load_config,
+  574             state: InstanceState::Unloaded,
+  575             pid: None,
+  576             port: None,
+  577             device_ids: Vec::new(),
+  578             started_at: None,
+  579             last_used_at: None,
+  580             active_requests: 0,
+  581             health: None,
+  582             failure: None,
+  583         }
+  584     }
+  585 
+  586     /// The current lifecycle state.
+  587     #[must_use]
+  588     pub fn state(&self) -> InstanceState {
+  589         self.state
+  590     }
+  591 
+  592     /// Whether the instance has in-flight requests (hard eviction protection,
+  593     /// `docs/architecture.md` §6).
+  594     #[must_use]
+  595     pub fn has_active_requests(&self) -> bool {
+  596         self.active_requests > 0
+  597     }
+  598 
+  599     /// The instance's id.
+  600     #[must_use]
+  601     pub fn instance_id(&self) -> &str {
+  602         &self.instance_id
+  603     }
+  604 
+  605     /// Apply a validated load-state transition and return the updated clone.
+  606     ///
+  607     /// This is the only way to move an instance between states: the target
+  608     /// runs through [`crate::state_machine::transition_instance`], so an
+  609     /// illegal move is rejected rather than stored (the `state` field is
+  610     /// private and cannot be assigned directly).
+  611     ///
+  612     /// # Errors
+  613     ///
+  614     /// [`ErrorCode::InvalidStateTransition`] when `to` is not reachable from
+  615     /// the current state.
+  616     pub fn with_state(self, to: InstanceState) -> Result<Self> {
+  617         let state = transition_instance(self.state, to)?;
+  618         let mut this = self;
+  619         this.state = state;
+  620         Ok(this)
+  621     }
+  622 }
+  623 
+  624 #[cfg(test)]
+  625 mod tests {
+  626     use super::*;
+  627     use serde_json::json;
+  628 
+  629     /// Parse an RFC 3339 literal into a `DateTime<Utc>` for test fixtures.
+  630     fn ts(s: &str) -> DateTime<Utc> {
+  631         DateTime::parse_from_rfc3339(s)
+  632             .expect("valid RFC 3339 in test fixture")
+  633             .with_timezone(&Utc)
+  634     }
+  635 
+--- transitions ---
+   45 use crate::error::{DomainError, ErrorCode, Result};
+   46 use crate::model::{InstanceState, OperationState};
+   47 
+   48 impl InstanceState {
+   49     /// Target states reachable from `self` in a single step.
+   50     const fn transitions(self) -> &'static [InstanceState] {
+   51         use InstanceState as S;
+   52         match self {
+   53             S::Queued => &[S::Loading, S::Unloaded, S::Failed, S::Crashed],
+   54             S::Loading => &[S::Ready, S::Failed, S::Unloading, S::Crashed],
+   55             S::Ready => &[S::Draining, S::Crashed],
+   56             S::Draining => &[S::Unloading, S::Ready, S::Crashed],
+   57             S::Unloading => &[S::Unloaded, S::Crashed],
+   58             S::Unloaded | S::Crashed => &[S::Queued],
+   59             S::Failed => &[],
+   60         }
+   61     }
+   62 
+   63     /// Whether moving from `self` to `target` is a legal single step.
+   64     #[must_use]
+   65     pub fn can_transition_to(self, target: InstanceState) -> bool {
+   66         self.transitions().contains(&target)
+   67     }
+   68 
+   69     /// Whether the instance lifecycle is settled (no in-flight process).
+   70     ///
+   71     /// This is the property `docs/architecture.md` §8 needs: on daemon start,
+   72     /// records whose state is *not* terminal — a process was expected to be
+   73     /// running (`queued`/`loading`/`ready`/`draining`/`unloading`) — are
+   74     /// marked `crashed`/recovery-required, while `unloaded`/`failed`/`crashed`
+   75     /// are already settled and left alone. It is deliberately NOT "no outgoing
+   76     /// transition": `unloaded` can be re-queued, so every state has an
+   77     /// outgoing edge and edge-based terminality is always false, which would
+   78     /// wrongly flag clean/historical records for recovery.
+   79     #[must_use]
+   80     pub const fn is_terminal(self) -> bool {
+   81         matches!(self, Self::Unloaded | Self::Failed | Self::Crashed)
+   82     }
+   83 
+   84     /// The states that can legally follow a `ready` instance (drain / crash).
+   85     #[must_use]
+   86     pub const fn ready_followers() -> &'static [InstanceState] {
+   87         InstanceState::Ready.transitions()
+   88     }
+   89 }
+   90 
+   91 impl OperationState {
+   92     /// Target states reachable from `self` in a single step.
+   93     const fn transitions(self) -> &'static [OperationState] {
+   94         use OperationState as S;
+   95         match self {
+   96             S::Queued => &[S::Running, S::Cancelled],
+   97             S::Running => &[S::Succeeded, S::Failed, S::Cancelled],
+   98             S::Succeeded | S::Failed | S::Cancelled => &[],
+   99         }
+  100     }
+  101 
+  102     /// Whether moving from `self` to `target` is a legal single step.
+  103     #[must_use]
+  104     pub fn can_transition_to(self, target: OperationState) -> bool {
+  105         self.transitions().contains(&target)
+  106     }
+  107 
+  108     /// Whether `self` is a terminal operation state.
+  109     #[must_use]
+  110     pub const fn is_terminal(self) -> bool {
+  111         self.transitions().is_empty()
+  112     }
+  113 }
+  114 
+  115 /// Attempt to move an instance from `from` to `to`.
+  116 ///
+  117 /// Returns the (unchanged) target on success, or a
+  118 /// [`ErrorCode::InvalidStateTransition`] error on an illegal move. Pure: it
+  119 /// does not mutate anything; the caller applies the returned state.
+  120 ///
+  121 /// # Errors
+  122 ///
+  123 /// [`ErrorCode::InvalidStateTransition`] when `to` is not reachable from
+  124 /// `from` in the instance transition table.
+  125 pub fn transition_instance(from: InstanceState, to: InstanceState) -> Result<InstanceState> {
+  126     if from.can_transition_to(to) {
+  127         Ok(to)
+  128     } else {
+  129         Err(DomainError::with_message(
+  130             ErrorCode::InvalidStateTransition,
+  131             format!("instance cannot move from {from:?} to {to:?}"),
+  132         ))
+  133     }
+  134 }
+  135 
+  136 /// Attempt to move an operation from `from` to `to`.
+  137 ///
+  138 /// Returns the target on success, or a [`ErrorCode::InvalidStateTransition`]
+  139 /// error on an illegal move.
+  140 ///
+  141 /// # Errors
+  142 ///
+  143 /// [`ErrorCode::InvalidStateTransition`] when `to` is not reachable from
+  144 /// `from` in the operation transition table.
+  145 pub fn transition_operation(from: OperationState, to: OperationState) -> Result<OperationState> {
+  146     if from.can_transition_to(to) {
+  147         Ok(to)
+  148     } else {
+  149         Err(DomainError::with_message(
+  150             ErrorCode::InvalidStateTransition,
+  151             format!("operation cannot move from {from:?} to {to:?}"),
+  152         ))
+  153     }
+  154 }
+  155 
+--- migration instances ---
+   82 
+   83 -- Instance records (docs/architecture.md §3 "Instance").
+   84 -- `state` is the actual lifecycle state; `desired_state` is the state an
+   85 -- in-flight operation drives the instance toward (docs/architecture.md §9:
+   86 -- "operation、instance desired state 和 audit event 同步提交").
+   87 -- `pid` / `port` are only trusted once the process supervisor confirms them.
+   88 CREATE TABLE instances (
+   89     instance_id     TEXT PRIMARY KEY,
+   90     model_id        TEXT NOT NULL REFERENCES models (id) ON DELETE CASCADE,
+   91     runtime_id      TEXT NOT NULL REFERENCES runtimes (id),
+   92     load_config     TEXT NOT NULL,
+   93     state           TEXT NOT NULL
+   94         CONSTRAINT instance_state_valid
+   95         CHECK (state IN ('unloaded', 'queued', 'loading', 'ready',
+   96                          'draining', 'unloading', 'failed', 'crashed')),
+   97     desired_state   TEXT NOT NULL
+   98         CONSTRAINT instance_desired_state_valid
+   99         CHECK (desired_state IN ('unloaded', 'queued', 'loading', 'ready',
+  100                                  'draining', 'unloading', 'failed', 'crashed')),
+  101     pid             INTEGER,
+  102     port            INTEGER CHECK (port IS NULL OR (port BETWEEN 1 AND 65535)),
+  103     device_ids      TEXT NOT NULL DEFAULT '[]',
+  104     started_at      TEXT,
+  105     last_used_at    TEXT,
+  106     active_requests INTEGER NOT NULL DEFAULT 0 CHECK (active_requests >= 0),
+  107     health          TEXT,
+  108     failure         TEXT,
+  109     created_at      TEXT NOT NULL,
+  110     updated_at      TEXT NOT NULL
+  111 );
+  112 CREATE INDEX idx_instances_model ON instances (model_id);
+  113 CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+  114 -- Partial index serving the docs/architecture.md §8 restart-recovery query.
+  115 CREATE INDEX idx_instances_state_nonterminal
+  116     ON instances (state)
+  117     WHERE state IN ('queued', 'loading', 'ready', 'draining', 'unloading');
+  118 
+  119 -- Load / unload / rescan operations (docs/architecture.md §3 "Operation").
+  120 -- `error` is the structured `OperationError` JSON; `result` the structured
+--- commit history ---
+be6164c (HEAD -> job/3-persistence) fix(persistence): accept same-state writes as idempotent data updates
+9e88c6b fix(persistence): close codex round-1 findings P1/P2
+1d43030 feat(persistence): sqlite migrations and repositories
+1bf1705 (job/2-domain) fix(domain): add EvictionPolicy/EvictionTargets per codex review
+748ee87 fix(domain): align error catalog, DateTime mtime, constructors
+b067890 fix(domain): align error types to api.md 2.2, add status()
+643ad56 fix(domain): allow crash recovery from queued/unloading states
+b3df653 feat(domain): device_ids, fixed_args, result, settled terminality
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n 'Operation|operation|操作|result|finished_at|progress|幂等|idempot' docs/architecture.md docs/api.md crates/persistence/src/repos.rs | Select-Object -First 250; "'$a=Get-Content -Encoding UTF8 docs/architecture.md; 35..115 | ForEach-Object { '"'{0,5} {1}' -f "'$_,$a[$_-1] }; $b=Get-Content -Encoding UTF8 crates/persistence/src/repos.rs; 1275..1340 | ForEach-Object { '"'{0,5} {1}' -f "'$_,$b[$_-1] }' in D:\Workspace\model-serving
+ succeeded in 159ms:
+docs/architecture.md:42:- `tracing`：结构化日志和 request/operation correlation id。
+docs/architecture.md:93:### Operation
+docs/architecture.md:95:load/unload/rescan 是可能耗时的 operation：`queued | running | succeeded | failed | cancelled`。内部管理 API 默认返回 `202 + operation_id`，Web UI 通过 SSE 订阅进展。LM Studio 兼容 load 为满足其同步响应约定，会等待 operation 结束或到达专用长超时。
+docs/architecture.md:156:2. 为 operation 和 instance 生成 ID，选择空闲 loopback port。
+docs/architecture.md:172:active request 是硬保护条件。加载 operation 使用全局 resource lock 串行化，避免两个并发 load 各自依据相同空闲显存做决定。MVP 假设单 GPU；数据模型保留 `device_ids`。
+docs/architecture.md:191:- daemon 正常退出时停止接收管理操作，drain inference，然后终止其监管的全部子进程。
+docs/architecture.md:200:- SQLite transaction：operation、instance desired state 和 audit event 同步提交。
+docs/api.md:22:接受合法的 `X-Request-Id`，否则生成 UUID；所有响应返回该 header。管理 operation 另有稳定 `operation_id`。
+docs/api.md:88:| `not_implemented` | Not implemented | 501 | `api_error` | `not-implemented` | 已存在但本构建未实现的操作 |
+docs/api.md:91:注：未实现的 LM Studio *endpoint* 返回 404 `endpoint_not_found`；已存在但本构建未实现的 *操作* 返回 501 `not_implemented`，两者区分保留。`gpu_memory_insufficient`/`gpu_oom_likely`/`resource_exhausted` 三者共享 `resource-exhausted` 这一 Problem Details 类别，但 `code` 各自保留精确 token。
+docs/api.md:196:- endpoint 按 LM Studio 的同步语义等待加载完成。达到 load API deadline 时返回 504，但后台 operation 继续；客户端可用原生 operation API 查询。
+docs/api.md:213:同一 model key 已经 ready 且 resolved config 相同则幂等返回现有实例；配置不同返回 409，要求先 unload。首版不通过这个 endpoint 创建同模型第二实例。
+docs/api.md:250:- `POST /admin/v1/model-roots/{id}/scan`：返回 202 operation。
+docs/api.md:288:  "operation_id": "op_...",
+docs/api.md:294:### Operations and events
+docs/api.md:296:- `GET /admin/v1/operations/{id}`：状态和结构化结果/错误。
+docs/api.md:297:- `GET /admin/v1/events`：SSE；事件包括 operation progress、instance state、scan result、log notice。
+crates/persistence/src/repos.rs:2://! `operations`, `audit` events and `settings`.
+crates/persistence/src/repos.rs:11://! `Runtime`, `Instance`, `Operation`) and any decode failure surfaces as the
+crates/persistence/src/repos.rs:24:    Operation, OperationError, OperationKind, OperationState, Runtime, RuntimeKind,
+crates/persistence/src/repos.rs:26:use model_serving_domain::state_machine::{transition_instance, transition_operation};
+crates/persistence/src/repos.rs:46:/// The active `operations` list filters, in bind order (see `InstanceFilter`).
+crates/persistence/src/repos.rs:48:enum OperationFilter {
+crates/persistence/src/repos.rs:49:    State(OperationState),
+crates/persistence/src/repos.rs:62:/// idempotent *data* update (e.g. pid/health/progress while the lifecycle
+crates/persistence/src/repos.rs:127:/// `last_scan_at` / `last_scan_result` hold the most recent scanner outcome
+crates/persistence/src/repos.rs:142:    pub last_scan_result: Option<serde_json::Value>,
+crates/persistence/src/repos.rs:187:    /// An instance's desired state was driven by an in-flight operation.
+crates/persistence/src/repos.rs:192:    /// An operation reached a terminal state.
+crates/persistence/src/repos.rs:193:    OperationFinished,
+crates/persistence/src/repos.rs:209:    /// The operation that caused the event (optional).
+crates/persistence/src/repos.rs:211:    pub operation_id: Option<String>,
+crates/persistence/src/repos.rs:226:        operation_id: Option<String>,
+crates/persistence/src/repos.rs:235:            operation_id,
+crates/persistence/src/repos.rs:260:/// Filter for [`OperationsRepo::list`].
+crates/persistence/src/repos.rs:262:pub struct OperationQuery {
+crates/persistence/src/repos.rs:263:    /// Restrict to one progress state.
+crates/persistence/src/repos.rs:264:    pub state: Option<OperationState>,
+crates/persistence/src/repos.rs:271:impl OperationQuery {
+crates/persistence/src/repos.rs:408:        let result =
+crates/persistence/src/repos.rs:416:        Ok(result.rows_affected() > 0)
+crates/persistence/src/repos.rs:463:        INSERT INTO model_roots (id, path, enabled, last_scan_at, last_scan_result, created_at)
+crates/persistence/src/repos.rs:469:            last_scan_result = excluded.last_scan_result
+crates/persistence/src/repos.rs:483:        let scan_result = match &root.last_scan_result {
+crates/persistence/src/repos.rs:484:            Some(v) => Some(to_json(v, "last_scan_result")?),
+crates/persistence/src/repos.rs:493:            .bind(scan_result)
+crates/persistence/src/repos.rs:511:            "SELECT id, path, enabled, last_scan_at, last_scan_result \
+crates/persistence/src/repos.rs:531:            "SELECT id, path, enabled, last_scan_at, last_scan_result \
+crates/persistence/src/repos.rs:551:            "SELECT id, path, enabled, last_scan_at, last_scan_result FROM model_roots ORDER BY id",
+crates/persistence/src/repos.rs:569:        let result = sqlx::query("DELETE FROM model_roots WHERE id = ?1")
+crates/persistence/src/repos.rs:574:        Ok(result.rows_affected() > 0)
+crates/persistence/src/repos.rs:584:    last_scan_result: Option<String>,
+crates/persistence/src/repos.rs:596:        last_scan_result: match row.last_scan_result {
+crates/persistence/src/repos.rs:597:            Some(raw) => Some(from_json::<serde_json::Value>(&raw, "last_scan_result")?),
+crates/persistence/src/repos.rs:612:    /// (M1 job 5) and a CRUD write must never clobber a probe result (and a
+crates/persistence/src/repos.rs:613:    /// probe write must never clobber a CRUD write). Probe results are
+crates/persistence/src/repos.rs:658:    /// probe result. A runtime that does not exist is a no-op.
+crates/persistence/src/repos.rs:732:        let result = sqlx::query("DELETE FROM runtimes WHERE id = ?1")
+crates/persistence/src/repos.rs:737:        Ok(result.rows_affected() > 0)
+crates/persistence/src/repos.rs:776:/// UUID); `desired_state` is the state an in-flight operation drives the
+crates/persistence/src/repos.rs:777:/// instance toward, written in the same transaction as the operation
+crates/persistence/src/repos.rs:806:    /// idempotent *data* update (pid/health/progress while the lifecycle state
+crates/persistence/src/repos.rs:879:                let result = sqlx::query(
+crates/persistence/src/repos.rs:906:                    result.rows_affected(),
+crates/persistence/src/repos.rs:915:    /// triggering operation + audit event in one transaction —
+crates/persistence/src/repos.rs:917:    /// operation drives the instance toward, so it is fenced only by the
+crates/persistence/src/repos.rs:981:            let result = sqlx::query(
+crates/persistence/src/repos.rs:993:            require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+crates/persistence/src/repos.rs:1075:    /// drift, and the result is served by the partial index
+crates/persistence/src/repos.rs:1225:/// Load / unload / rescan operation rows.
+crates/persistence/src/repos.rs:1227:/// `operations.model_id` stores the model's stable `id` (UUID); `error` is
+crates/persistence/src/repos.rs:1228:/// the structured [`OperationError`] JSON, `result` the structured result
+crates/persistence/src/repos.rs:1231:pub struct OperationsRepo;
+crates/persistence/src/repos.rs:1233:impl OperationsRepo {
+crates/persistence/src/repos.rs:1234:    /// Insert a new operation. `created_at` falls back to "now" when the
+crates/persistence/src/repos.rs:1242:    pub async fn create<'c, E>(exec: E, operation: &Operation) -> Result<()>
+crates/persistence/src/repos.rs:1246:        let created = operation.created_at.unwrap_or_else(now);
+crates/persistence/src/repos.rs:1247:        let error_json = operation
+crates/persistence/src/repos.rs:1252:        let result_json = operation
+crates/persistence/src/repos.rs:1253:            .result
+crates/persistence/src/repos.rs:1255:            .map(|r| to_json(r, "result"))
+crates/persistence/src/repos.rs:1258:            "INSERT INTO operations (
+crates/persistence/src/repos.rs:1259:                operation_id, kind, state, instance_id, model_id,
+crates/persistence/src/repos.rs:1260:                created_at, finished_at, error, result
+crates/persistence/src/repos.rs:1263:        .bind(&operation.operation_id)
+crates/persistence/src/repos.rs:1264:        .bind(wire_token(&operation.kind))
+crates/persistence/src/repos.rs:1265:        .bind(wire_token(&operation.state()))
+crates/persistence/src/repos.rs:1266:        .bind(&operation.instance_id)
+crates/persistence/src/repos.rs:1267:        .bind(&operation.model_id)
+crates/persistence/src/repos.rs:1269:        .bind(operation.finished_at.map(ts_string))
+crates/persistence/src/repos.rs:1271:        .bind(result_json)
+crates/persistence/src/repos.rs:1274:        .map_err(|e| storage_error(&e, "create operation"))?;
+crates/persistence/src/repos.rs:1278:    /// Persist a state advance of an existing operation (terminal or not):
+crates/persistence/src/repos.rs:1279:    /// `state`, `finished_at`, the structured `error` and `result` are
+crates/persistence/src/repos.rs:1281:    /// the row's persisted state through the domain operation state machine,
+crates/persistence/src/repos.rs:1283:    /// Returns `false` when no such operation exists.
+crates/persistence/src/repos.rs:1289:    pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+crates/persistence/src/repos.rs:1293:        let to = operation.state();
+crates/persistence/src/repos.rs:1296:            "operations",
+crates/persistence/src/repos.rs:1297:            "operation_id",
+crates/persistence/src/repos.rs:1298:            &operation.operation_id,
+crates/persistence/src/repos.rs:1300:            transition_operation,
+crates/persistence/src/repos.rs:1304:        let error_json = operation
+crates/persistence/src/repos.rs:1309:        let result_json = operation
+crates/persistence/src/repos.rs:1310:            .result
+crates/persistence/src/repos.rs:1312:            .map(|r| to_json(r, "result"))
+crates/persistence/src/repos.rs:1314:        let finished_at = operation.finished_at.map(ts_string);
+crates/persistence/src/repos.rs:1319:                let result = sqlx::query(
+crates/persistence/src/repos.rs:1320:                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
+crates/persistence/src/repos.rs:1321:                     WHERE operation_id = ?1 AND state = ?6",
+crates/persistence/src/repos.rs:1323:                .bind(&operation.operation_id)
+crates/persistence/src/repos.rs:1325:                .bind(finished_at)
+crates/persistence/src/repos.rs:1327:                .bind(result_json)
+crates/persistence/src/repos.rs:1331:                .map_err(|e| storage_error(&e, "advance operation"))?;
+crates/persistence/src/repos.rs:1333:                    result.rows_affected(),
+crates/persistence/src/repos.rs:1334:                    &format!("operation {}", operation.operation_id),
+crates/persistence/src/repos.rs:1341:    /// Fetch one operation by `operation_id`.
+crates/persistence/src/repos.rs:1345:    /// `Internal` on a corrupt row (e.g. malformed stored `error` / `result`
+crates/persistence/src/repos.rs:1347:    pub async fn get<'c, E>(exec: E, operation_id: &str) -> Result<Option<Operation>>
+crates/persistence/src/repos.rs:1351:        let row: Option<OperationRow> = sqlx::query_as(
+crates/persistence/src/repos.rs:1352:            "SELECT operation_id, kind, state, instance_id, model_id, \
+crates/persistence/src/repos.rs:1353:                 created_at, finished_at, error, result \
+crates/persistence/src/repos.rs:1354:             FROM operations WHERE operation_id = ?1",
+crates/persistence/src/repos.rs:1356:        .bind(operation_id)
+crates/persistence/src/repos.rs:1359:        .map_err(|e| storage_error(&e, "get operation"))?;
+crates/persistence/src/repos.rs:1360:        row.map(operation_from_row).transpose()
+crates/persistence/src/repos.rs:1363:    /// List operations filtered by [`OperationQuery`], ordered by
+crates/persistence/src/repos.rs:1364:    /// `created_at` then `operation_id`. Every filter value is bound as a
+crates/persistence/src/repos.rs:1370:    pub async fn list<'c, E>(exec: E, query: OperationQuery) -> Result<Vec<Operation>>
+crates/persistence/src/repos.rs:1375:            "SELECT operation_id, kind, state, instance_id, model_id, \
+crates/persistence/src/repos.rs:1376:             created_at, finished_at, error, result FROM operations",
+crates/persistence/src/repos.rs:1380:            filters.push(OperationFilter::State(state));
+crates/persistence/src/repos.rs:1383:            filters.push(OperationFilter::InstanceId(instance_id.clone()));
+crates/persistence/src/repos.rs:1386:            filters.push(OperationFilter::ModelId(model_id.clone()));
+crates/persistence/src/repos.rs:1396:                OperationFilter::State(state) => {
+crates/persistence/src/repos.rs:1400:                OperationFilter::InstanceId(id) => {
+crates/persistence/src/repos.rs:1404:                OperationFilter::ModelId(id) => {
+crates/persistence/src/repos.rs:1410:        builder.push(" ORDER BY created_at, operation_id");
+crates/persistence/src/repos.rs:1411:        let rows: Vec<OperationRow> = builder
+crates/persistence/src/repos.rs:1415:            .map_err(|e| storage_error(&e, "list operations"))?;
+crates/persistence/src/repos.rs:1416:        rows.into_iter().map(operation_from_row).collect()
+crates/persistence/src/repos.rs:1419:    /// Every operation in a non-terminal state (`queued` / `running`), for
+crates/persistence/src/repos.rs:1421:    /// derived from `OperationState::is_terminal` so the two cannot drift.
+crates/persistence/src/repos.rs:1426:    pub async fn non_terminal<'c, E>(exec: E) -> Result<Vec<Operation>>
+crates/persistence/src/repos.rs:1431:            OperationState::Queued,
+crates/persistence/src/repos.rs:1432:            OperationState::Running,
+crates/persistence/src/repos.rs:1433:            OperationState::Succeeded,
+crates/persistence/src/repos.rs:1434:            OperationState::Failed,
+crates/persistence/src/repos.rs:1435:            OperationState::Cancelled,
+crates/persistence/src/repos.rs:1444:            "SELECT operation_id, kind, state, instance_id, model_id, \
+crates/persistence/src/repos.rs:1445:             created_at, finished_at, error, result FROM operations \
+crates/persistence/src/repos.rs:1446:             WHERE state IN ({states}) ORDER BY created_at, operation_id"
+crates/persistence/src/repos.rs:1448:        let rows: Vec<OperationRow> = sqlx::query_as(&sql)
+crates/persistence/src/repos.rs:1451:            .map_err(|e| storage_error(&e, "query non-terminal operations"))?;
+crates/persistence/src/repos.rs:1452:        rows.into_iter().map(operation_from_row).collect()
+crates/persistence/src/repos.rs:1457:struct OperationRow {
+crates/persistence/src/repos.rs:1458:    operation_id: String,
+crates/persistence/src/repos.rs:1464:    finished_at: Option<String>,
+crates/persistence/src/repos.rs:1466:    result: Option<String>,
+crates/persistence/src/repos.rs:1469:/// Rebuild a domain `Operation` from a stored row (the state is reached from
+crates/persistence/src/repos.rs:1472:fn operation_from_row(row: OperationRow) -> Result<Operation> {
+crates/persistence/src/repos.rs:1473:    let kind = parse_wire::<OperationKind>(&row.kind, "kind")?;
+crates/persistence/src/repos.rs:1474:    let state = parse_wire::<OperationState>(&row.state, "state")?;
+crates/persistence/src/repos.rs:1475:    let mut operation = Operation::new(row.operation_id, kind);
+crates/persistence/src/repos.rs:1476:    for step in operation_reach_path(state) {
+crates/persistence/src/repos.rs:1477:        operation = operation.with_state(*step)?;
+crates/persistence/src/repos.rs:1479:    operation.instance_id = row.instance_id;
+crates/persistence/src/repos.rs:1480:    operation.model_id = row.model_id;
+crates/persistence/src/repos.rs:1481:    operation.created_at = Some(parse_ts(&row.created_at, "created_at")?);
+crates/persistence/src/repos.rs:1482:    operation.finished_at = match row.finished_at {
+crates/persistence/src/repos.rs:1483:        Some(raw) => Some(parse_ts(&raw, "finished_at")?),
+crates/persistence/src/repos.rs:1486:    operation.error = match row.error {
+crates/persistence/src/repos.rs:1487:        Some(raw) => Some(from_json::<OperationError>(&raw, "error")?),
+crates/persistence/src/repos.rs:1490:    operation.result = match row.result {
+crates/persistence/src/repos.rs:1491:        Some(raw) => Some(from_json::<serde_json::Value>(&raw, "result")?),
+crates/persistence/src/repos.rs:1494:    Ok(operation)
+crates/persistence/src/repos.rs:1499:const fn operation_reach_path(target: OperationState) -> &'static [OperationState] {
+crates/persistence/src/repos.rs:1500:    use OperationState as S;
+crates/persistence/src/repos.rs:1513:/// event is one of the three tables committed together with the operation
+crates/persistence/src/repos.rs:1530:             (kind, subject_type, subject_id, operation_id, payload, created_at) \
+crates/persistence/src/repos.rs:1536:        .bind(&event.operation_id)
+crates/persistence/src/repos.rs:1557:                "SELECT id, kind, subject_type, subject_id, operation_id, payload, created_at \
+crates/persistence/src/repos.rs:1561:                "SELECT id, kind, subject_type, subject_id, operation_id, payload, created_at \
+crates/persistence/src/repos.rs:1589:            "SELECT id, kind, subject_type, subject_id, operation_id, payload, created_at \
+crates/persistence/src/repos.rs:1610:    operation_id: Option<String>,
+crates/persistence/src/repos.rs:1621:        operation_id: row.operation_id,
+   35 ### Rust workspace
+   36 
+   37 - `axum`：HTTP 路由、中间件、WebSocket/SSE 周边能力。
+   38 - `tokio`：异步运行时、子进程、signal 和 I/O。
+   39 - `reqwest`/`hyper`：连接内部 inference server，支持 streaming body。
+   40 - `serde`/`serde_json`：公共协议和 runtime 配置。
+   41 - `sqlx` + SQLite：迁移、配置和事件持久化。
+   42 - `tracing`：结构化日志和 request/operation correlation id。
+   43 - `tower`：认证、请求限制、超时和 body limit。
+   44 - `utoipa` 或静态 OpenAPI：管理 API 文档；是否采用由实现 spike 决定。
+   45 
+   46 前端采用 React + TypeScript + Vite，建议使用 TanStack Query 管理 server state。组件库在 UI 实现阶段选择，不进入后端协议。
+   47 
+   48 ### 建议 workspace 结构
+   49 
+   50 ```text
+   51 crates/
+   52   server/             # binary、配置、路由装配、静态 UI
+   53   domain/             # 状态机、调度策略、领域错误
+   54   runtime/            # RuntimeAdapter trait、进程监管
+   55   runtime-llamacpp/   # llama.cpp 参数映射与 capability
+   56   runtime-ninfer/     # NInfer 参数映射与 capability
+   57   api-types/          # OpenAI/LM Studio/内部管理 DTO
+   58   persistence/        # SQLite repositories 与 migrations
+   59 web/                  # React/Vite
+   60 docs/
+   61 ```
+   62 
+   63 如果早期编译成本过高，可将这些边界先实现为一个 crate 内的模块，但依赖方向仍按此设计。
+   64 
+   65 ## 3. 核心领域对象
+   66 
+   67 ### Model
+   68 
+   69 - `id`：内部稳定 UUID。
+   70 - `key`：API 使用的唯一可读标识，扫描时生成，允许管理员覆盖。
+   71 - `path`：canonical absolute path。
+   72 - `artifact_kind`：`gguf | ninfer`。
+   73 - `size_bytes`、`mtime`、可选 metadata。
+   74 - `default_runtime_id`、`default_load_config`。
+   75 
+   76 模型身份不能只用文件名。若不同目录产生同名 key，追加短路径哈希；移动文件会被视为新 artifact，除非以后实现内容 fingerprint 迁移。
+   77 
+   78 ### Runtime
+   79 
+   80 - `id`、`kind`、`executable_path`。
+   81 - `enabled`、`version_text`、`capabilities`。
+   82 - runtime 固定参数模板；不允许存储任意 shell command。
+   83 
+   84 ### Instance
+   85 
+   86 - `instance_id`：一次加载实例的唯一标识，同时用于 LM Studio unload。
+   87 - `model_id`、`runtime_id`、resolved load config。
+   88 - `state`、`pid`、`port`、`started_at`、`last_used_at`。
+   89 - `active_requests`、`health`、`failure`。
+   90 
+   91 数据库保存实例记录和期望状态，但 PID/port 只有进程监管器确认后才可信。
+   92 
+   93 ### Operation
+   94 
+   95 load/unload/rescan 是可能耗时的 operation：`queued | running | succeeded | failed | cancelled`。内部管理 API 默认返回 `202 + operation_id`，Web UI 通过 SSE 订阅进展。LM Studio 兼容 load 为满足其同步响应约定，会等待 operation 结束或到达专用长超时。
+   96 
+   97 ## 4. Runtime adapter
+   98 
+   99 统一接口的概念形态：
+  100 
+  101 ```rust
+  102 trait RuntimeAdapter {
+  103     fn kind(&self) -> RuntimeKind;
+  104     async fn probe(&self, executable: &Path) -> Result<Capabilities>;
+  105     fn validate(&self, model: &Model, config: &LoadConfig) -> Result<()>;
+  106     fn command(&self, ctx: &LaunchContext) -> Result<CommandSpec>;
+  107     async fn health(&self, endpoint: &Url) -> Result<Health>;
+  108     fn classify_exit(&self, exit: ExitStatus, stderr_tail: &str) -> FailureClass;
+  109 }
+  110 ```
+  111 
+  112 `CommandSpec` 是 argv 数组和受控环境变量，不经过 shell。adapter 必须把“不支持的字段”区分为 error 或 ignored-with-warning，不能静默误配。
+  113 
+  114 ### llama.cpp adapter
+  115 
+ 1275         Ok(())
+ 1276     }
+ 1277 
+ 1278     /// Persist a state advance of an existing operation (terminal or not):
+ 1279     /// `state`, `finished_at`, the structured `error` and `result` are
+ 1280     /// rewritten from the passed domain value. The move is validated against
+ 1281     /// the row's persisted state through the domain operation state machine,
+ 1282     /// and the update is guarded on that state (`docs/architecture.md` §8).
+ 1283     /// Returns `false` when no such operation exists.
+ 1284     ///
+ 1285     /// # Errors
+ 1286     ///
+ 1287     /// `InvalidStateTransition` for an illegal move from the persisted state
+ 1288     /// (or a row that raced the guard), `Internal` otherwise.
+ 1289     pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+ 1290     where
+ 1291         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+ 1292     {
+ 1293         let to = operation.state();
+ 1294         let expected = validate_state(
+ 1295             exec,
+ 1296             "operations",
+ 1297             "operation_id",
+ 1298             &operation.operation_id,
+ 1299             to,
+ 1300             transition_operation,
+ 1301         )
+ 1302         .await?;
+ 1303         let to_token = wire_token(&to);
+ 1304         let error_json = operation
+ 1305             .error
+ 1306             .as_ref()
+ 1307             .map(|e| to_json(e, "error"))
+ 1308             .transpose()?;
+ 1309         let result_json = operation
+ 1310             .result
+ 1311             .as_ref()
+ 1312             .map(|r| to_json(r, "result"))
+ 1313             .transpose()?;
+ 1314         let finished_at = operation.finished_at.map(ts_string);
+ 1315         match expected {
+ 1316             None => Ok(false),
+ 1317             Some(expected_state) => {
+ 1318                 let expected_token = wire_token(&expected_state);
+ 1319                 let result = sqlx::query(
+ 1320                     "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
+ 1321                      WHERE operation_id = ?1 AND state = ?6",
+ 1322                 )
+ 1323                 .bind(&operation.operation_id)
+ 1324                 .bind(&to_token)
+ 1325                 .bind(finished_at)
+ 1326                 .bind(error_json)
+ 1327                 .bind(result_json)
+ 1328                 .bind(&expected_token)
+ 1329                 .execute(exec)
+ 1330                 .await
+ 1331                 .map_err(|e| storage_error(&e, "advance operation"))?;
+ 1332                 require_state_write(
+ 1333                     result.rows_affected(),
+ 1334                     &format!("operation {}", operation.operation_id),
+ 1335                 )?;
+ 1336                 Ok(true)
+ 1337             }
+ 1338         }
+ 1339     }
+ 1340 
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+VERDICT: NEEDS-FIXES
+
+Item 1: SOUND — same-state writes preserve lifecycle state while updating permitted instance data; first-seen insertion remains separate ([repos.rs](D:/Workspace/model-serving/crates/persistence/src/repos.rs:102)).
+
+Item 2: DISAGREE — state-only CAS has an ABA race: after validating `Ready`, another writer can legally move `Ready → Draining → Ready`; the stale `UPDATE ... WHERE state='ready'` then succeeds and may overwrite newer PID/health/request data ([repos.rs](D:/Workspace/model-serving/crates/persistence/src/repos.rs:879)). A version/revision guard or transaction-scoped read is needed to detect any intervening write.
+
+NEW ISSUES: none.
+hook: Stop
+hook: Stop Completed
+tokens used
+42,898
+VERDICT: NEEDS-FIXES
+
+Item 1: SOUND — same-state writes preserve lifecycle state while updating permitted instance data; first-seen insertion remains separate ([repos.rs](D:/Workspace/model-serving/crates/persistence/src/repos.rs:102)).
+
+Item 2: DISAGREE — state-only CAS has an ABA race: after validating `Ready`, another writer can legally move `Ready → Draining → Ready`; the stale `UPDATE ... WHERE state='ready'` then succeeds and may overwrite newer PID/health/request data ([repos.rs](D:/Workspace/model-serving/crates/persistence/src/repos.rs:879)). A version/revision guard or transaction-scoped read is needed to detect any intervening write.
+
+NEW ISSUES: none.

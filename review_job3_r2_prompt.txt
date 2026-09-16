@@ -1,0 +1,16 @@
+You are reviewing job 3 of the model-serving project: the persistence crate (SQLite via sqlx). Round 1 of your review produced 8 findings (5 P1 + 3 P2), listed in fixlist_job3.md (repo root). The implementer claims all 8 are fixed in commit 9e88c6b on branch job/3-persistence.
+
+REPO: \wsl.localhost\Ubuntu\home\space\code\model-serving (branch job/3-persistence, commit 9e88c6b).
+Relevant paths: crates/persistence/src/{store,mapping,repos,tests}.rs, crates/persistence/migrations/0001_initial.sql, and the frozen domain APIs in crates/domain/src/{state_machine,error}.rs (frozen — the persistence crate must call them, never modify them).
+
+Your round-2 task:
+1. For EACH of the 8 findings in fixlist_job3.md (P1-1..P1-5, P2-6..P2-8), verify the fix is actually present and correct in the committed code (not just claimed): read the implementation and the test that is supposed to prove it. For each, verdict: FIXED / PARTIAL / NOT-FIXED with file:line evidence.
+2. Check the fixes did not introduce new defects: e.g. the state-transition guard (expected-current-state UPDATE + frozen domain transition check) must still allow legal transitions including first-seen rows, must work for both &SqlitePool and transaction connections, and must not dead-lock or re-SELECT on &mut connections; the QueryBuilder list filters must still handle empty filters correctly; error mapping must not over-broaden InvalidStateTransition; the unix 0600 logic must be correct and cfg-gated; the WAL reopen test must actually prove persistence.
+3. Look for any NEW P1/P2 issues in the changed code.
+4. Environment notes: target runtime is WSL2/Linux; code must stay portable (unix-only parts behind #[cfg(unix)]). Quality gates already passed: cargo fmt --check clean, cargo clippy --all-targets -D warnings 0 warnings, cargo test --workspace green on Windows, cargo test -p model-serving-persistence green on WSL (23 passed).
+
+Output format:
+- VERDICT: APPROVE / NEEDS-FIXES
+- Per finding P1-1..P2-8: FIXED/PARTIAL/NOT-FIXED + one line of evidence
+- NEW ISSUES: list with P1/P2 severity and file:line, or "none"
+Keep it precise and short.

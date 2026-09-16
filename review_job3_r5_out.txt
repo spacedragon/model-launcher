@@ -1,0 +1,2518 @@
+Reading prompt from stdin...
+OpenAI Codex v0.151.0
+--------
+workdir: D:\Workspace\model-serving
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a0a901-e7a1-7341-b6d3-5d10331735c6
+--------
+user
+Round 5 (final) review, job 3 (persistence crate) of model-serving. Your round-4 concern was that the `updated_at`-based CAS revision is not provably monotonic (wall-clock granularity / clock adjustments), so you asked for a monotonic counter. That is now fixed; review the FINAL state at HEAD (branch job/3-persistence, commits 7a3cfa1 and 9209113 on top of the round-4-reviewed 5c90603).
+
+What changed since your round-4 review:
+
+1. Monotonic revision counter (7a3cfa1). The schema uses a `revision INTEGER NOT NULL` column on both `instances` and `operations` (migrations/0001_initial.sql): 0 on create, and every guarded state write issues `revision = revision + 1` in the UPDATE itself (never a client-computed value), so it is strictly increasing by construction and two writes can never present the same (state, revision) pair.
+   - `validate_state` (crates/persistence/src/repos.rs, near top of file) now `SELECT state, revision FROM <table> WHERE <key> = ?1`, validates `transition(current, to)` only when `current != to` (same-state writes remain legal idempotent data updates — your round-3 item 1, confirmed SOUND), and returns `Option<(S, i64)>` (None = first-seen row, insert path with no prior state).
+   - Every guarded write is `UPDATE ... WHERE <key> = ? AND state = ? AND revision = ?` with both columns from the same SELECT, followed by `require_state_write(rows_affected, subject)` which surfaces 0 rows as `InvalidStateTransition` (raced/ABA). Applies to: instances `upsert`, instances `write_state`, operations `advance`, and restart recovery in crates/persistence/src/store.rs (`recover_non_terminal_instances` re-reads (state, revision) INSIDE its transaction, validates via the frozen domain `transition_instance`, guards the UPDATE on both, records the audit event with the in-transaction previous state).
+   - `write_state` returns `Result<()>` (same-state = applied data update; raced = error) and `advance` returns `Result<bool>` (false = operation row absent).
+   - ABA regression test `stale_same_state_write_is_rejected_by_the_revision_guard` (crates/persistence/src/tests.rs): seeds a ready instance, captures its `revision`, drives a legal ready->draining->ready cycle via `InstancesRepo::write_state` (revision becomes 2), proves a raw CAS `... AND state='ready' AND revision=<stale>` affects 0 rows, then a POSITIVE control CAS pinned at the fresh revision affects 1 row.
+
+2. WSL-toolchain clippy fixes (9209113): `secure_db_file` (store.rs) now spells `.truncate(true)` explicitly on the create-open (no-op: the file was just proven NotFound in the same branch; documented in a comment) and prints paths via `Display` in four error messages.
+
+Gates green on BOTH toolchains: cargo fmt --check; cargo clippy --workspace --all-targets -- -D warnings (Windows cargo 1.98 and WSL Ubuntu rustup); cargo test --workspace (Windows) and full WSL cargo test --workspace — all ok, persistence tests include the ABA test.
+
+REPO: D:\Workspace\model-serving (Windows checkout of branch job/3-persistence; identical content to \wsl.localhost\Ubuntu\home\space\code\model-serving). Paths: crates/persistence/src/{repos,store,mapping,tests}.rs, crates/persistence/migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Please: (1) confirm the monotonic-revision CAS closes the ABA hole on EVERY state-write path (upsert first-seen + guarded update, write_state, advance, restart recovery), or name the concrete remaining race; (2) check the ABA test proves what it claims (and the positive control is real); (3) any P1/P2 introduced by 7a3cfa1 or 9209113.
+Output: VERDICT: APPROVE / NEEDS-FIXES, then short per-point findings with file:line evidence.
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+I’ll inspect the two commits against the round-4 base, trace every state-write SQL path and transaction boundary, then validate the ABA regression test and run focused checks if needed.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git status --short --branch; git log --oneline --decorate -8; git diff --stat 5c90603..HEAD; git diff --check 5c90603..HEAD; rg -n "validate_state|require_state_write|revision|write_state|advance|recover_non_terminal_instances|INSERT INTO instances|UPDATE instances|INSERT INTO operations|UPDATE operations" crates/persistence/src crates/persistence/migrations/0001_initial.sql' in D:\Workspace\model-serving
+ succeeded in 278ms:
+## job/3-persistence
+?? fixlist_job3.md
+?? review_job3.md
+?? review_job3_out.txt
+?? review_job3_prompt.txt
+?? review_job3_r2_out.txt
+?? review_job3_r2_prompt.txt
+?? review_job3_r3_out.txt
+?? review_job3_r3_prompt.txt
+?? review_job3_r4_out.txt
+?? review_job3_r4_prompt.txt
+?? review_job3_r5_out.txt
+?? review_job3_r5_prompt.txt
+9209113 (HEAD -> job/3-persistence) fix(persistence): spell out db-file open truncate + Display paths (WSL clippy)
+7a3cfa1 fix(persistence): monotonic revision closes ABA hole
+5c90603 fix(persistence): close ABA hole in state guards via updated_at revision
+be6164c fix(persistence): accept same-state writes as idempotent data updates
+9e88c6b fix(persistence): close codex round-1 findings P1/P2
+1d43030 feat(persistence): sqlite migrations and repositories
+1bf1705 (job/2-domain) fix(domain): add EvictionPolicy/EvictionTargets per codex review
+748ee87 fix(domain): align error catalog, DateTime mtime, constructors
+ crates/persistence/migrations/0001_initial.sql |  4 +-
+ crates/persistence/src/repos.rs                | 57 ++++++++++++++------------
+ crates/persistence/src/store.rs                | 36 ++++++++++------
+ crates/persistence/src/tests.rs                | 48 +++++++++++++++-------
+ docs/jobs.md                                   |  2 +-
+ 5 files changed, 93 insertions(+), 54 deletions(-)
+crates/persistence/migrations/0001_initial.sql:111:    revision        INTEGER NOT NULL DEFAULT 0
+crates/persistence/migrations/0001_initial.sql:133:    revision     INTEGER NOT NULL DEFAULT 0,
+crates/persistence/src\lib.rs:16://!   (`recover_non_terminal_instances`).
+crates/persistence/src\repos.rs:70:/// Returns the **current** state plus its `updated_at` revision when the row
+crates/persistence/src\repos.rs:73:/// a write guarded on BOTH the returned state and revision
+crates/persistence/src\repos.rs:74:/// (`UPDATE ... WHERE <state_col> = <returned state> AND <revision_col> =
+crates/persistence/src\repos.rs:75:/// <returned revision>`) and must check `rows_affected`: the guarded update
+crates/persistence/src\repos.rs:76:/// is a compare-and-set that also bumps the row's monotonic `revision`
+crates/persistence/src\repos.rs:80:/// Guarding on `revision` as well as `state` closes the ABA hole: a
+crates/persistence/src\repos.rs:82:/// unchanged but bumps `revision` (a strictly increasing integer written as
+crates/persistence/src\repos.rs:83:/// `revision = revision + 1`, so two writes can never collide, unlike a
+crates/persistence/src\repos.rs:85:async fn validate_state<'c, E, S>(
+crates/persistence/src\repos.rs:97:    let sql = format!("SELECT state, revision FROM {table} WHERE {key_col} = ?1");
+crates/persistence/src\repos.rs:110:        DomainError::with_message(ErrorCode::Internal, format!("read {table}.revision: {e}"))
+crates/persistence/src\repos.rs:120:/// guard validated the state and the row revision, so a row that vanished or
+crates/persistence/src\repos.rs:124:fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+crates/persistence/src\repos.rs:819:    /// `validate_state`).
+crates/persistence/src\repos.rs:825:        let expected = validate_state(
+crates/persistence/src\repos.rs:859:                    "INSERT INTO instances (
+crates/persistence/src\repos.rs:886:            Some((expected_state, expected_revision)) => {
+crates/persistence/src\repos.rs:890:                    "UPDATE instances SET
+crates/persistence/src\repos.rs:895:                         revision = revision + 1
+crates/persistence/src\repos.rs:896:                     WHERE instance_id = ? AND state = ? AND revision = ?",
+crates/persistence/src\repos.rs:913:                .bind(expected_revision)
+crates/persistence/src\repos.rs:917:                require_state_write(
+crates/persistence/src\repos.rs:946:            "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+crates/persistence/src\repos.rs:967:    pub async fn write_state<'c, E>(
+crates/persistence/src\repos.rs:981:        let expected = validate_state(
+crates/persistence/src\repos.rs:991:        if let Some((expected_state, expected_revision)) = expected {
+crates/persistence/src\repos.rs:994:                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
+crates/persistence/src\repos.rs:995:                 revision = revision + 1 \
+crates/persistence/src\repos.rs:996:                 WHERE instance_id = ?1 AND state = ?5 AND revision = ?6",
+crates/persistence/src\repos.rs:1003:            .bind(expected_revision)
+crates/persistence/src\repos.rs:1007:            require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+crates/persistence/src\repos.rs:1272:            "INSERT INTO operations (
+crates/persistence/src\repos.rs:1293:    /// Persist a state advance of an existing operation (terminal or not):
+crates/persistence/src\repos.rs:1304:    pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+crates/persistence/src\repos.rs:1309:        let expected = validate_state(
+crates/persistence/src\repos.rs:1332:            Some((expected_state, expected_revision)) => {
+crates/persistence/src\repos.rs:1335:                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
+crates/persistence/src\repos.rs:1336:                     WHERE operation_id = ?1 AND state = ?7 AND revision = ?8",
+crates/persistence/src\repos.rs:1345:                .bind(expected_revision)
+crates/persistence/src\repos.rs:1348:                .map_err(|e| storage_error(&e, "advance operation"))?;
+crates/persistence/src\repos.rs:1349:                require_state_write(
+crates/persistence/src\store.rs:183:    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+crates/persistence/src\store.rs:196:            // state and the monotonic `revision` counter so a same-state ABA
+crates/persistence/src\store.rs:201:                sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
+crates/persistence/src\store.rs:224:                    format!("read instance {} revision: {e}", found.instance_id()),
+crates/persistence/src\store.rs:238:                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
+crates/persistence/src\store.rs:239:                 WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
+crates/persistence/src\tests.rs:591:    let err = sqlx::query("UPDATE instances SET state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:603:    let err = sqlx::query("UPDATE instances SET desired_state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:615:async fn write_state_with_failure_round_trips() {
+crates/persistence/src\tests.rs:626:    InstancesRepo::write_state(
+crates/persistence/src\tests.rs:647:        "write_state must not touch the stored desired state"
+crates/persistence/src\tests.rs:677:async fn operation_round_trip_and_terminal_advance() {
+crates/persistence/src\tests.rs:707:        OperationsRepo::advance(pool, &running)
+crates/persistence/src\tests.rs:709:            .expect("advance to running")
+crates/persistence/src\tests.rs:720:        OperationsRepo::advance(pool, &failed)
+crates/persistence/src\tests.rs:722:            .expect("advance to failed")
+crates/persistence/src\tests.rs:757:    let err = sqlx::query("UPDATE operations SET state = 'exploded' WHERE operation_id = ?1")
+crates/persistence/src\tests.rs:905:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:913:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:1063:    sqlx::query("UPDATE instances SET load_config = 'not json' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:1111:// InvalidStateTransition AND leave the row unchanged (write_state, upsert,
+crates/persistence/src\tests.rs:1112:// and operation advance are all covered).
+crates/persistence/src\tests.rs:1119:    // --- instances: write_state ---
+crates/persistence/src\tests.rs:1121:    InstancesRepo::write_state(pool, "i-ws", InstanceState::Draining, &None, ts(T2))
+crates/persistence/src\tests.rs:1124:    let err = InstancesRepo::write_state(pool, "i-ws", InstanceState::Queued, &None, ts(T2))
+crates/persistence/src\tests.rs:1154:    // --- operations: advance ---
+crates/persistence/src\tests.rs:1166:        OperationsRepo::advance(pool, &running)
+crates/persistence/src\tests.rs:1168:            .expect("advance to running")
+crates/persistence/src\tests.rs:1175:        OperationsRepo::advance(pool, &succeeded)
+crates/persistence/src\tests.rs:1177:            .expect("advance to succeeded")
+crates/persistence/src\tests.rs:1185:    let err = OperationsRepo::advance(pool, &back_to_running)
+crates/persistence/src\tests.rs:1203:// persisted; write_state of the same state is likewise a legal no-op move.
+crates/persistence/src\tests.rs:1232:    // write_state of the same state is a legal no-op move (e.g. recording a
+crates/persistence/src\tests.rs:1234:    InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
+crates/persistence/src\tests.rs:1236:        .expect("same-state write_state must be accepted");
+crates/persistence/src\tests.rs:1249:// ready). The guard therefore also pins the monotonic `revision` counter
+crates/persistence/src\tests.rs:1250:// (bumped as `revision = revision + 1` on every guarded write, so a cycled
+crates/persistence/src\tests.rs:1251:// row can never present a stale writer with the same (state, revision)
+crates/persistence/src\tests.rs:1254:// current revision still applies (positive control).
+crates/persistence/src\tests.rs:1256:async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+crates/persistence/src\tests.rs:1262:    let stale_revision: i64 =
+crates/persistence/src\tests.rs:1263:        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+crates/persistence/src\tests.rs:1266:            .expect("read the seeded revision");
+crates/persistence/src\tests.rs:1269:    InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
+crates/persistence/src\tests.rs:1272:    InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
+crates/persistence/src\tests.rs:1276:    // The stale writer's update: `state` matches (ready) but the revision is
+crates/persistence/src\tests.rs:1279:        "UPDATE instances SET active_requests = 99 \
+crates/persistence/src\tests.rs:1280:         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+crates/persistence/src\tests.rs:1282:    .bind(stale_revision)
+crates/persistence/src\tests.rs:1289:        "the state+revision guard must reject the ABA write"
+crates/persistence/src\tests.rs:1292:    // Positive control: a CAS pinned at the CURRENT revision still applies.
+crates/persistence/src\tests.rs:1293:    let fresh_revision: i64 =
+crates/persistence/src\tests.rs:1294:        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+crates/persistence/src\tests.rs:1297:            .expect("read the current revision");
+crates/persistence/src\tests.rs:1299:        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+crates/persistence/src\tests.rs:1300:         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+crates/persistence/src\tests.rs:1302:    .bind(fresh_revision)
+crates/persistence/src\tests.rs:1309:        "a CAS on the current revision must apply"
+crates/persistence/src\tests.rs:1329:    let err = sqlx::query("UPDATE instances SET port = ?2 WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:1423:    sqlx::query("UPDATE instances SET pid = ?2 WHERE instance_id = ?1")
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git diff --find-renames --find-copies 5c90603..HEAD -- crates/persistence/migrations/0001_initial.sql crates/persistence/src/repos.rs crates/persistence/src/store.rs crates/persistence/src/tests.rs; $p='"'crates/persistence/src/repos.rs'; "'$lines=Get-Content $p; foreach($range in @(@(60,135),@(800,930),@(955,1020),@(1250,1365))){$a=$range[0];$b=$range[1]; for($i=$a;$i -le $b;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}}; $p='"'crates/persistence/src/store.rs'; "'$lines=Get-Content $p; for($i=165;$i -le 275;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}; $p='"'crates/persistence/src/tests.rs'; "'$lines=Get-Content $p; for($i=1240;$i -le 1320;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}' in D:\Workspace\model-serving
+ succeeded in 213ms:
+diff --git a/crates/persistence/migrations/0001_initial.sql b/crates/persistence/migrations/0001_initial.sql
+index 7127960..51db2f9 100644
+--- a/crates/persistence/migrations/0001_initial.sql
++++ b/crates/persistence/migrations/0001_initial.sql
+@@ -107,7 +107,8 @@ CREATE TABLE instances (
+     health          TEXT,
+     failure         TEXT,
+     created_at      TEXT NOT NULL,
+-    updated_at      TEXT NOT NULL
++    updated_at      TEXT NOT NULL,
++    revision        INTEGER NOT NULL DEFAULT 0
+ );
+ CREATE INDEX idx_instances_model ON instances (model_id);
+ CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+@@ -129,6 +130,7 @@ CREATE TABLE operations (
+     model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
+     created_at   TEXT NOT NULL,
+     updated_at   TEXT NOT NULL,
++    revision     INTEGER NOT NULL DEFAULT 0,
+     finished_at  TEXT,
+     error        TEXT,
+     result       TEXT
+diff --git a/crates/persistence/src/repos.rs b/crates/persistence/src/repos.rs
+index 21f1021..ad41a9b 100644
+--- a/crates/persistence/src/repos.rs
++++ b/crates/persistence/src/repos.rs
+@@ -71,14 +71,17 @@ enum OperationFilter {
+ /// exists, or `None` for a first-seen row (no prior state, so a legal initial
+ /// state may be written and no transition check applies). Callers then issue
+ /// a write guarded on BOTH the returned state and revision
+-/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
+-/// revision>`) and must check `rows_affected`: the guarded update is a
+-/// compare-and-set, so a row that moved concurrently affects 0 rows and the
+-/// write is rejected, even though the SELECT and the UPDATE are separate
+-/// statements (a transaction is not required for the guard to be safe).
+-/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
++/// (`UPDATE ... WHERE <state_col> = <returned state> AND <revision_col> =
++/// <returned revision>`) and must check `rows_affected`: the guarded update
++/// is a compare-and-set that also bumps the row's monotonic `revision`
++/// counter, so a row that moved concurrently affects 0 rows and the write is
++/// rejected, even though the SELECT and the UPDATE are separate statements
++/// (a transaction is not required for the guard to be safe).
++/// Guarding on `revision` as well as `state` closes the ABA hole: a
+ /// concurrent legal `ready -> draining -> ready` cycle leaves `state`
+-/// unchanged but bumps `updated_at`, so a stale write is still rejected.
++/// unchanged but bumps `revision` (a strictly increasing integer written as
++/// `revision = revision + 1`, so two writes can never collide, unlike a
++/// timestamp), so a stale write is still rejected.
+ async fn validate_state<'c, E, S>(
+     exec: E,
+     table: &str,
+@@ -86,12 +89,12 @@ async fn validate_state<'c, E, S>(
+     key: &str,
+     to: S,
+     transition: fn(S, S) -> Result<S>,
+-) -> Result<Option<(S, String)>>
++) -> Result<Option<(S, i64)>>
+ where
+     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+ {
+-    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
++    let sql = format!("SELECT state, revision FROM {table} WHERE {key_col} = ?1");
+     let row = sqlx::query(&sql)
+         .bind(key)
+         .fetch_optional(exec)
+@@ -103,8 +106,8 @@ where
+     let raw = row.try_get::<String, _>(0).map_err(|e| {
+         DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
+     })?;
+-    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
+-        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
++    let updated_at = row.try_get::<i64, _>(1).map_err(|e| {
++        DomainError::with_message(ErrorCode::Internal, format!("read {table}.revision: {e}"))
+     })?;
+     let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+     if current != to {
+@@ -114,9 +117,9 @@ where
+ }
+ 
+ /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+-/// guard validated the state and revision, so a row that vanished or moved in
+-/// the interim (including a same-state ABA cycle) means the update raced a
+-/// concurrent writer.
++/// guard validated the state and the row revision, so a row that vanished or
++/// moved in the interim (including a same-state ABA cycle) means the update
++/// raced a concurrent writer.
+ #[track_caller]
+ fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+     if rows_affected == 0 {
+@@ -880,7 +883,7 @@ impl InstancesRepo {
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+             }
+-            Some((expected_state, expected_revised)) => {
++            Some((expected_state, expected_revision)) => {
+                 // Existing row: guarded update (`desired_state` preserved).
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+@@ -888,8 +891,9 @@ impl InstancesRepo {
+                          model_id = ?, runtime_id = ?, load_config = ?,
+                          state = ?, pid = ?, port = ?, device_ids = ?,
+                          started_at = ?, last_used_at = ?, active_requests = ?,
+-                         health = ?, failure = ?, updated_at = ?
+-                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
++                         health = ?, failure = ?, updated_at = ?,
++                         revision = revision + 1
++                     WHERE instance_id = ? AND state = ? AND revision = ?",
+                 )
+                 .bind(&instance.model_id)
+                 .bind(&instance.runtime_id)
+@@ -906,7 +910,7 @@ impl InstancesRepo {
+                 .bind(&at_str)
+                 .bind(&instance.instance_id)
+                 .bind(&expected_token)
+-                .bind(&expected_revised)
++                .bind(expected_revision)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+@@ -984,18 +988,19 @@ impl InstancesRepo {
+         )
+         .await?;
+         let state_token = wire_token(&state);
+-        if let Some((expected_state, expected_revised)) = expected {
++        if let Some((expected_state, expected_revision)) = expected {
+             let expected_token = wire_token(&expected_state);
+             let result = sqlx::query(
+-                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+-                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
++                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
++                 revision = revision + 1 \
++                 WHERE instance_id = ?1 AND state = ?5 AND revision = ?6",
+             )
+             .bind(instance_id)
+             .bind(&state_token)
+             .bind(&failure_json)
+             .bind(ts_string(updated_at))
+             .bind(&expected_token)
+-            .bind(&expected_revised)
++            .bind(expected_revision)
+             .execute(exec)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+@@ -1324,11 +1329,11 @@ impl OperationsRepo {
+         let finished_at = operation.finished_at.map(ts_string);
+         match expected {
+             None => Ok(false),
+-            Some((expected_state, expected_revised)) => {
++            Some((expected_state, expected_revision)) => {
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+-                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
+-                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
++                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
++                     WHERE operation_id = ?1 AND state = ?7 AND revision = ?8",
+                 )
+                 .bind(&operation.operation_id)
+                 .bind(&to_token)
+@@ -1337,7 +1342,7 @@ impl OperationsRepo {
+                 .bind(result_json)
+                 .bind(ts_string(now()))
+                 .bind(&expected_token)
+-                .bind(&expected_revised)
++                .bind(expected_revision)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "advance operation"))?;
+diff --git a/crates/persistence/src/store.rs b/crates/persistence/src/store.rs
+index 74b7c00..a8b7607 100644
+--- a/crates/persistence/src/store.rs
++++ b/crates/persistence/src/store.rs
+@@ -41,25 +41,30 @@ fn secure_db_file(path: &Path) -> Result<()> {
+             std::fs::OpenOptions::new()
+                 .write(true)
+                 .create(true)
++                // The file was just proven absent above; the open only ever
++                // creates a fresh empty file, so truncation is a no-op but
++                // stated explicitly (clippy wants the truncate behaviour
++                // spelled out when `create` is set).
++                .truncate(true)
+                 .mode(0o600)
+                 .open(path)
+                 .map_err(|e| {
+                     DomainError::with_message(
+                         ErrorCode::Internal,
+-                        format!("create database file {path:?}: {e}"),
++                        format!("create database file {}: {e}", path.display()),
+                     )
+                 })?;
+             std::fs::metadata(path).map_err(|e| {
+                 DomainError::with_message(
+                     ErrorCode::Internal,
+-                    format!("stat database file {path:?}: {e}"),
++                    format!("stat database file {}: {e}", path.display()),
+                 )
+             })?
+         }
+         Err(e) => {
+             return Err(DomainError::with_message(
+                 ErrorCode::Internal,
+-                format!("stat database file {path:?}: {e}"),
++                format!("stat database file {}: {e}", path.display()),
+             ));
+         }
+     };
+@@ -68,7 +73,10 @@ fn secure_db_file(path: &Path) -> Result<()> {
+         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+             DomainError::with_message(
+                 ErrorCode::Internal,
+-                format!("set database file {path:?} permissions to 0600: {e}"),
++                format!(
++                    "set database file {} permissions to 0600: {e}",
++                    path.display()
++                ),
+             )
+         })?;
+     }
+@@ -185,12 +193,12 @@ impl SqliteStore {
+             // cycle could have moved the row and back. Validate the move
+             // through the frozen domain state machine (never a raw write)
+             // against this fresh state, then guard the update on BOTH the
+-            // state and the `updated_at` revision so a same-state ABA
++            // state and the monotonic `revision` counter so a same-state ABA
+             // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
+             // so the two-query repository guard cannot run in a transaction;
+             // sequential re-borrows of the transaction do the same job).
+             let current =
+-                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
++                sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
+                     .bind(found.instance_id())
+                     .fetch_optional(&mut *tx)
+                     .await
+@@ -210,10 +218,10 @@ impl SqliteStore {
+                     format!("read instance {} state: {e}", found.instance_id()),
+                 )
+             })?;
+-            let revised = current.try_get::<String, _>(1).map_err(|e| {
++            let revised = current.try_get::<i64, _>(1).map_err(|e| {
+                 DomainError::with_message(
+                     ErrorCode::Internal,
+-                    format!("read instance {} updated_at: {e}", found.instance_id()),
++                    format!("read instance {} revision: {e}", found.instance_id()),
+                 )
+             })?;
+             let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+@@ -227,14 +235,14 @@ impl SqliteStore {
+                 )
+             })?;
+             let result = sqlx::query(
+-                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+-                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
++                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
++                 WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
+             )
+             .bind(found.instance_id())
+             .bind(wire_token(&InstanceState::Crashed))
+             .bind(ts_string(at))
+             .bind(wire_token(&current_state))
+-            .bind(&revised)
++            .bind(revised)
+             .execute(&mut *tx)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+@@ -254,7 +262,11 @@ impl SqliteStore {
+                     Some("instance".to_owned()),
+                     Some(found.instance_id().to_string()),
+                     None,
+-                    serde_json::json!({ "previous_state": found.state() }),
++                    // The fresh in-transaction state, not the older pool-scan
++                    // value: if the row moved between scan and transaction,
++                    // this is the state the recovery actually transitioned
++                    // from.
++                    serde_json::json!({ "previous_state": current_state }),
+                     at,
+                 ),
+             )
+diff --git a/crates/persistence/src/tests.rs b/crates/persistence/src/tests.rs
+index 6ac40fb..47f0d47 100644
+--- a/crates/persistence/src/tests.rs
++++ b/crates/persistence/src/tests.rs
+@@ -1244,11 +1244,14 @@ async fn same_state_writes_are_idempotent_data_updates() {
+     );
+ }
+ 
+-// P1 (codex round 3): a state-only compare-and-set has an ABA hole because
+-// the instance machine has legal cycles (ready -> draining -> ready). The
+-// guard therefore also pins the `updated_at` revision: a writer that
+-// validated a stale (state, updated_at) pair must affect 0 rows even when
+-// the state has cycled back to the same token.
++// P1 (codex rounds 3+4): a state-only compare-and-set has an ABA hole
++// because the instance machine has legal cycles (ready -> draining ->
++// ready). The guard therefore also pins the monotonic `revision` counter
++// (bumped as `revision = revision + 1` on every guarded write, so a cycled
++// row can never present a stale writer with the same (state, revision)
++// pair): a writer that validated a stale pair must affect 0 rows even when
++// the state has cycled back to the same token, while a CAS pinned at the
++// current revision still applies (positive control).
+ #[tokio::test]
+ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     let fixture = Fixture::new().await.expect("fixture");
+@@ -1256,8 +1259,8 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     let pool = store.pool();
+ 
+     seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
+-    let stale_revised: String =
+-        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
++    let stale_revision: i64 =
++        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+             .fetch_one(pool)
+             .await
+             .expect("read the seeded revision");
+@@ -1274,26 +1277,43 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     // stale, so the double guard must reject it (0 rows affected).
+     let rejected = sqlx::query(
+         "UPDATE instances SET active_requests = 99 \
+-         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
++         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+     )
+-    .bind(&stale_revised)
++    .bind(stale_revision)
+     .execute(pool)
+     .await
+     .expect("stale guarded update runs");
+     assert_eq!(
+         rejected.rows_affected(),
+         0,
+-        "the state+updated_at guard must reject the ABA write"
++        "the state+revision guard must reject the ABA write"
++    );
++
++    // Positive control: a CAS pinned at the CURRENT revision still applies.
++    let fresh_revision: i64 =
++        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
++            .fetch_one(pool)
++            .await
++            .expect("read the current revision");
++    let applied = sqlx::query(
++        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
++         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
++    )
++    .bind(fresh_revision)
++    .execute(pool)
++    .await
++    .expect("fresh guarded update runs");
++    assert_eq!(
++        applied.rows_affected(),
++        1,
++        "a CAS on the current revision must apply"
+     );
+     let after = InstancesRepo::get(pool, "i-aba")
+         .await
+         .expect("get")
+         .expect("row");
+     assert_eq!(after.state(), InstanceState::Ready);
+-    assert_ne!(
+-        after.active_requests, 99,
+-        "the stale write must not have landed"
+-    );
++    assert_eq!(after.active_requests, 99, "only the fresh write may land");
+ }
+ 
+ // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+   60: /// (`docs/architecture.md` 搂8). It selects the row's `state` and, when the row
+   61: /// exists and the target differs, runs `transition` (the domain machine) on
+   62: /// `(current, to)`. A write whose target equals the persisted state is an
+   63: /// idempotent *data* update (e.g. pid/health/progress while the lifecycle
+   64: /// state is unchanged), not a transition: the frozen machine defines no
+   65: /// self-loops, so same-state writes are accepted without consulting it.
+   66: /// `ErrorCode::InvalidStateTransition` is returned when the domain machine
+   67: /// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
+   68: /// as `Internal`.
+   69: ///
+   70: /// Returns the **current** state plus its `updated_at` revision when the row
+   71: /// exists, or `None` for a first-seen row (no prior state, so a legal initial
+   72: /// state may be written and no transition check applies). Callers then issue
+   73: /// a write guarded on BOTH the returned state and revision
+   74: /// (`UPDATE ... WHERE <state_col> = <returned state> AND <revision_col> =
+   75: /// <returned revision>`) and must check `rows_affected`: the guarded update
+   76: /// is a compare-and-set that also bumps the row's monotonic `revision`
+   77: /// counter, so a row that moved concurrently affects 0 rows and the write is
+   78: /// rejected, even though the SELECT and the UPDATE are separate statements
+   79: /// (a transaction is not required for the guard to be safe).
+   80: /// Guarding on `revision` as well as `state` closes the ABA hole: a
+   81: /// concurrent legal `ready -> draining -> ready` cycle leaves `state`
+   82: /// unchanged but bumps `revision` (a strictly increasing integer written as
+   83: /// `revision = revision + 1`, so two writes can never collide, unlike a
+   84: /// timestamp), so a stale write is still rejected.
+   85: async fn validate_state<'c, E, S>(
+   86:     exec: E,
+   87:     table: &str,
+   88:     key_col: &str,
+   89:     key: &str,
+   90:     to: S,
+   91:     transition: fn(S, S) -> Result<S>,
+   92: ) -> Result<Option<(S, i64)>>
+   93: where
+   94:     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+   95:     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+   96: {
+   97:     let sql = format!("SELECT state, revision FROM {table} WHERE {key_col} = ?1");
+   98:     let row = sqlx::query(&sql)
+   99:         .bind(key)
+  100:         .fetch_optional(exec)
+  101:         .await
+  102:         .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
+  103:     let Some(row) = row else {
+  104:         return Ok(None);
+  105:     };
+  106:     let raw = row.try_get::<String, _>(0).map_err(|e| {
+  107:         DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
+  108:     })?;
+  109:     let updated_at = row.try_get::<i64, _>(1).map_err(|e| {
+  110:         DomainError::with_message(ErrorCode::Internal, format!("read {table}.revision: {e}"))
+  111:     })?;
+  112:     let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+  113:     if current != to {
+  114:         transition(current, to)?;
+  115:     }
+  116:     Ok(Some((current, updated_at)))
+  117: }
+  118: 
+  119: /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+  120: /// guard validated the state and the row revision, so a row that vanished or
+  121: /// moved in the interim (including a same-state ABA cycle) means the update
+  122: /// raced a concurrent writer.
+  123: #[track_caller]
+  124: fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+  125:     if rows_affected == 0 {
+  126:         return Err(DomainError::with_message(
+  127:             ErrorCode::InvalidStateTransition,
+  128:             format!("{subject} changed state before the update applied"),
+  129:         ));
+  130:     }
+  131:     Ok(())
+  132: }
+  133: 
+  134: /// A controlled scan directory (`docs/api.md` 搂5 model-roots).
+  135: ///
+  800:     /// `InvalidStateTransition` if the stored state tokens escape the state
+  801:     /// fences (defensive), `Internal` otherwise.
+  802:     /// Insert or update an instance row. On insert `desired_state` starts at
+  803:     /// the instance's current state; on update the stored `desired_state` is
+  804:     /// preserved (drive it explicitly via [`Self::set_desired_state`]).
+  805:     ///
+  806:     /// The write is guarded against the persisted state: on an existing row
+  807:     /// the row's current state is validated through the domain state machine
+  808:     /// before the (guarded) update, so an illegal move such as `failed -> ready`
+  809:     /// is rejected and the row left unchanged (`docs/architecture.md` 搂8).
+  810:     ///
+  811:     /// # Errors
+  812:     ///
+  813:     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+  814:     /// `InvalidStateTransition` for an illegal state transition or a row that
+  815:     /// raced the guard, `Internal` otherwise. A same-state upsert is an
+  816:     /// idempotent *data* update (pid/health/progress while the lifecycle state
+  817:     /// is unchanged) and is always legal: the frozen machine defines no
+  818:     /// self-loops, so same-state writes skip the transition check (see
+  819:     /// `validate_state`).
+  820:     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
+  821:     where
+  822:         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  823:     {
+  824:         let to = instance.state();
+  825:         let expected = validate_state(
+  826:             exec,
+  827:             "instances",
+  828:             "instance_id",
+  829:             &instance.instance_id,
+  830:             to,
+  831:             transition_instance,
+  832:         )
+  833:         .await?;
+  834:         let to_token = wire_token(&to);
+  835:         let load_config = to_json(&instance.load_config, "load_config")?;
+  836:         let device_ids = to_json(&instance.device_ids, "device_ids")?;
+  837:         let health = instance
+  838:             .health
+  839:             .as_ref()
+  840:             .map(|h| to_json(h, "health"))
+  841:             .transpose()?;
+  842:         let failure = instance
+  843:             .failure
+  844:             .as_ref()
+  845:             .map(|f| to_json(f, "failure"))
+  846:             .transpose()?;
+  847:         let at = now();
+  848:         let at_str = ts_string(at);
+  849:         let pid = instance.pid.map(u64::from).map(as_i64);
+  850:         let port = instance.port.map(i32::from);
+  851:         let started_at = instance.started_at.map(ts_string);
+  852:         let last_used_at = instance.last_used_at.map(ts_string);
+  853:         let active_requests = i64::from(instance.active_requests);
+  854: 
+  855:         match expected {
+  856:             None => {
+  857:                 // First-seen row: insert with `desired_state` = state.
+  858:                 sqlx::query(
+  859:                     "INSERT INTO instances (
+  860:                         instance_id, model_id, runtime_id, load_config,
+  861:                         state, desired_state, pid, port, device_ids,
+  862:                         started_at, last_used_at, active_requests, health, failure,
+  863:                         created_at, updated_at
+  864:                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  865:                 )
+  866:                 .bind(&instance.instance_id)
+  867:                 .bind(&instance.model_id)
+  868:                 .bind(&instance.runtime_id)
+  869:                 .bind(&load_config)
+  870:                 .bind(&to_token)
+  871:                 .bind(&to_token)
+  872:                 .bind(pid)
+  873:                 .bind(port)
+  874:                 .bind(&device_ids)
+  875:                 .bind(started_at)
+  876:                 .bind(last_used_at)
+  877:                 .bind(active_requests)
+  878:                 .bind(health)
+  879:                 .bind(failure)
+  880:                 .bind(&at_str)
+  881:                 .bind(&at_str)
+  882:                 .execute(exec)
+  883:                 .await
+  884:                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  885:             }
+  886:             Some((expected_state, expected_revision)) => {
+  887:                 // Existing row: guarded update (`desired_state` preserved).
+  888:                 let expected_token = wire_token(&expected_state);
+  889:                 let result = sqlx::query(
+  890:                     "UPDATE instances SET
+  891:                          model_id = ?, runtime_id = ?, load_config = ?,
+  892:                          state = ?, pid = ?, port = ?, device_ids = ?,
+  893:                          started_at = ?, last_used_at = ?, active_requests = ?,
+  894:                          health = ?, failure = ?, updated_at = ?,
+  895:                          revision = revision + 1
+  896:                      WHERE instance_id = ? AND state = ? AND revision = ?",
+  897:                 )
+  898:                 .bind(&instance.model_id)
+  899:                 .bind(&instance.runtime_id)
+  900:                 .bind(&load_config)
+  901:                 .bind(&to_token)
+  902:                 .bind(pid)
+  903:                 .bind(port)
+  904:                 .bind(&device_ids)
+  905:                 .bind(started_at)
+  906:                 .bind(last_used_at)
+  907:                 .bind(active_requests)
+  908:                 .bind(health)
+  909:                 .bind(failure)
+  910:                 .bind(&at_str)
+  911:                 .bind(&instance.instance_id)
+  912:                 .bind(&expected_token)
+  913:                 .bind(expected_revision)
+  914:                 .execute(exec)
+  915:                 .await
+  916:                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  917:                 require_state_write(
+  918:                     result.rows_affected(),
+  919:                     &format!("instance {}", instance.instance_id),
+  920:                 )?;
+  921:             }
+  922:         }
+  923:         Ok(())
+  924:     }
+  925: 
+  926:     /// Drive an instance's `desired_state` (written together with the
+  927:     /// triggering operation + audit event in one transaction 鈥?    /// `docs/architecture.md` 搂9). `desired_state` is the target an in-flight
+  928:     /// operation drives the instance toward, so it is fenced only by the
+  929:     /// schema's `instance_desired_state_valid` vocabulary `CHECK` (not by the
+  930:     /// lifecycle state machine, which fences the *actual* `state` column).
+  955: 
+  956:     /// Write an instance's actual lifecycle state (plus an optional
+  957:     /// structured failure and the `updated_at` stamp). The move is validated
+  958:     /// against the row's persisted state through the domain state machine
+  959:     /// (e.g. `Instance::with_state` encodes the same rules); the update is
+  960:     /// guarded on the persisted state, so a concurrent change is rejected.
+  961:     ///
+  962:     /// # Errors
+  963:     ///
+  964:     /// `InvalidStateTransition` for an illegal move from the persisted state,
+  965:     /// `Internal` otherwise.
+  966:     pub async fn write_state<'c, E>(
+  967:         exec: E,
+  968:         instance_id: &str,
+  969:         state: InstanceState,
+  970:         failure: &Option<InstanceFailure>,
+  971:         updated_at: DateTime<Utc>,
+  972:     ) -> Result<()>
+  973:     where
+  974:         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  975:     {
+  976:         let failure_json = failure
+  977:             .as_ref()
+  978:             .map(|f| to_json(f, "failure"))
+  979:             .transpose()?;
+  980:         let expected = validate_state(
+  981:             exec,
+  982:             "instances",
+  983:             "instance_id",
+  984:             instance_id,
+  985:             state,
+  986:             transition_instance,
+  987:         )
+  988:         .await?;
+  989:         let state_token = wire_token(&state);
+  990:         if let Some((expected_state, expected_revision)) = expected {
+  991:             let expected_token = wire_token(&expected_state);
+  992:             let result = sqlx::query(
+  993:                 "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
+  994:                  revision = revision + 1 \
+  995:                  WHERE instance_id = ?1 AND state = ?5 AND revision = ?6",
+  996:             )
+  997:             .bind(instance_id)
+  998:             .bind(&state_token)
+  999:             .bind(&failure_json)
+ 1000:             .bind(ts_string(updated_at))
+ 1001:             .bind(&expected_token)
+ 1002:             .bind(expected_revision)
+ 1003:             .execute(exec)
+ 1004:             .await
+ 1005:             .map_err(|e| storage_error(&e, "write instance state"))?;
+ 1006:             require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+ 1007:         }
+ 1008:         Ok(())
+ 1009:     }
+ 1010: 
+ 1011:     /// Fetch one instance by `instance_id`.
+ 1012:     ///
+ 1013:     /// # Errors
+ 1014:     ///
+ 1015:     /// `Internal` on a corrupt row, `InvalidStateTransition` if a stored
+ 1016:     /// state token escaped the fences (should be impossible).
+ 1017:     pub async fn get<'c, E>(exec: E, instance_id: &str) -> Result<Option<Instance>>
+ 1018:     where
+ 1019:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+ 1020:     {
+ 1250:     /// # Errors
+ 1251:     ///
+ 1252:     /// `InvalidRequest` on a constraint violation (unknown instance / model
+ 1253:     /// reference), `InvalidStateTransition` if the stored state token escapes
+ 1254:     /// the fence, `Internal` otherwise.
+ 1255:     pub async fn create<'c, E>(exec: E, operation: &Operation) -> Result<()>
+ 1256:     where
+ 1257:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+ 1258:     {
+ 1259:         let created = operation.created_at.unwrap_or_else(now);
+ 1260:         let error_json = operation
+ 1261:             .error
+ 1262:             .as_ref()
+ 1263:             .map(|e| to_json(e, "error"))
+ 1264:             .transpose()?;
+ 1265:         let result_json = operation
+ 1266:             .result
+ 1267:             .as_ref()
+ 1268:             .map(|r| to_json(r, "result"))
+ 1269:             .transpose()?;
+ 1270:         sqlx::query(
+ 1271:             "INSERT INTO operations (
+ 1272:                 operation_id, kind, state, instance_id, model_id,
+ 1273:                 created_at, updated_at, finished_at, error, result
+ 1274:              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+ 1275:         )
+ 1276:         .bind(&operation.operation_id)
+ 1277:         .bind(wire_token(&operation.kind))
+ 1278:         .bind(wire_token(&operation.state()))
+ 1279:         .bind(&operation.instance_id)
+ 1280:         .bind(&operation.model_id)
+ 1281:         .bind(ts_string(created))
+ 1282:         .bind(ts_string(created))
+ 1283:         .bind(operation.finished_at.map(ts_string))
+ 1284:         .bind(error_json)
+ 1285:         .bind(result_json)
+ 1286:         .execute(exec)
+ 1287:         .await
+ 1288:         .map_err(|e| storage_error(&e, "create operation"))?;
+ 1289:         Ok(())
+ 1290:     }
+ 1291: 
+ 1292:     /// Persist a state advance of an existing operation (terminal or not):
+ 1293:     /// `state`, `finished_at`, the structured `error` and `result` are
+ 1294:     /// rewritten from the passed domain value. The move is validated against
+ 1295:     /// the row's persisted state through the domain operation state machine,
+ 1296:     /// and the update is guarded on that state (`docs/architecture.md` 搂8).
+ 1297:     /// Returns `false` when no such operation exists.
+ 1298:     ///
+ 1299:     /// # Errors
+ 1300:     ///
+ 1301:     /// `InvalidStateTransition` for an illegal move from the persisted state
+ 1302:     /// (or a row that raced the guard), `Internal` otherwise.
+ 1303:     pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+ 1304:     where
+ 1305:         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+ 1306:     {
+ 1307:         let to = operation.state();
+ 1308:         let expected = validate_state(
+ 1309:             exec,
+ 1310:             "operations",
+ 1311:             "operation_id",
+ 1312:             &operation.operation_id,
+ 1313:             to,
+ 1314:             transition_operation,
+ 1315:         )
+ 1316:         .await?;
+ 1317:         let to_token = wire_token(&to);
+ 1318:         let error_json = operation
+ 1319:             .error
+ 1320:             .as_ref()
+ 1321:             .map(|e| to_json(e, "error"))
+ 1322:             .transpose()?;
+ 1323:         let result_json = operation
+ 1324:             .result
+ 1325:             .as_ref()
+ 1326:             .map(|r| to_json(r, "result"))
+ 1327:             .transpose()?;
+ 1328:         let finished_at = operation.finished_at.map(ts_string);
+ 1329:         match expected {
+ 1330:             None => Ok(false),
+ 1331:             Some((expected_state, expected_revision)) => {
+ 1332:                 let expected_token = wire_token(&expected_state);
+ 1333:                 let result = sqlx::query(
+ 1334:                     "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
+ 1335:                      WHERE operation_id = ?1 AND state = ?7 AND revision = ?8",
+ 1336:                 )
+ 1337:                 .bind(&operation.operation_id)
+ 1338:                 .bind(&to_token)
+ 1339:                 .bind(finished_at)
+ 1340:                 .bind(error_json)
+ 1341:                 .bind(result_json)
+ 1342:                 .bind(ts_string(now()))
+ 1343:                 .bind(&expected_token)
+ 1344:                 .bind(expected_revision)
+ 1345:                 .execute(exec)
+ 1346:                 .await
+ 1347:                 .map_err(|e| storage_error(&e, "advance operation"))?;
+ 1348:                 require_state_write(
+ 1349:                     result.rows_affected(),
+ 1350:                     &format!("operation {}", operation.operation_id),
+ 1351:                 )?;
+ 1352:                 Ok(true)
+ 1353:             }
+ 1354:         }
+ 1355:     }
+ 1356: 
+ 1357:     /// Fetch one operation by `operation_id`.
+ 1358:     ///
+ 1359:     /// # Errors
+ 1360:     ///
+ 1361:     /// `Internal` on a corrupt row (e.g. malformed stored `error` / `result`
+ 1362:     /// JSON).
+ 1363:     pub async fn get<'c, E>(exec: E, operation_id: &str) -> Result<Option<Operation>>
+ 1364:     where
+ 1365:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  165:     /// instance (`queued` / `loading` / `ready` / `draining` / `unloading`)
+  166:     /// as `crashed` 鈥?a process was expected to be running but the daemon
+  167:     /// restarted, so those records are orphaned. Each move is validated
+  168:     /// through the domain state machine (every non-terminal state legally
+  169:     /// reaches `crashed`) and audit-logged, and the whole recovery commits
+  170:     /// in one transaction. Settled records (`unloaded` / `failed` /
+  171:     /// `crashed`) are left untouched, and a second call finds nothing to do.
+  172:     ///
+  173:     /// Returns the instances as they were found (with their pre-recovery
+  174:     /// state), in recovery order. Non-terminal **operations** are exposed
+  175:     /// via `crate::repos::OperationsRepo::non_terminal` for the supervisor
+  176:     /// (job 6) rather than settled here.
+  177:     ///
+  178:     /// # Errors
+  179:     ///
+  180:     /// `InvalidStateTransition` if a stored state cannot legally reach
+  181:     /// `crashed` (defensive: schema fence and state machine agree on the
+  182:     /// vocabulary), or `Internal` on storage failure.
+  183:     pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+  184:         let stale = InstancesRepo::non_terminal(self.pool()).await?;
+  185:         if stale.is_empty() {
+  186:             return Ok(Vec::new());
+  187:         }
+  188:         let at = now();
+  189:         let mut tx = self.transaction().await?;
+  190:         for found in &stale {
+  191:             // Re-read the row inside the transaction: the pool-based scan
+  192:             // above predates it, and a legal `ready -> draining -> ready`
+  193:             // cycle could have moved the row and back. Validate the move
+  194:             // through the frozen domain state machine (never a raw write)
+  195:             // against this fresh state, then guard the update on BOTH the
+  196:             // state and the monotonic `revision` counter so a same-state ABA
+  197:             // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
+  198:             // so the two-query repository guard cannot run in a transaction;
+  199:             // sequential re-borrows of the transaction do the same job).
+  200:             let current =
+  201:                 sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
+  202:                     .bind(found.instance_id())
+  203:                     .fetch_optional(&mut *tx)
+  204:                     .await
+  205:                     .map_err(|e| storage_error(&e, "read instance state"))?;
+  206:             let Some(current) = current else {
+  207:                 return Err(DomainError::with_message(
+  208:                     ErrorCode::Internal,
+  209:                     format!(
+  210:                         "instance {} vanished before recovery applied",
+  211:                         found.instance_id()
+  212:                     ),
+  213:                 ));
+  214:             };
+  215:             let raw_state = current.try_get::<String, _>(0).map_err(|e| {
+  216:                 DomainError::with_message(
+  217:                     ErrorCode::Internal,
+  218:                     format!("read instance {} state: {e}", found.instance_id()),
+  219:                 )
+  220:             })?;
+  221:             let revised = current.try_get::<i64, _>(1).map_err(|e| {
+  222:                 DomainError::with_message(
+  223:                     ErrorCode::Internal,
+  224:                     format!("read instance {} revision: {e}", found.instance_id()),
+  225:                 )
+  226:             })?;
+  227:             let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+  228:             transition_instance(current_state, InstanceState::Crashed).map_err(|_| {
+  229:                 DomainError::with_message(
+  230:                     ErrorCode::InvalidStateTransition,
+  231:                     format!(
+  232:                         "instance {} in {current_state:?} cannot legally reach crashed",
+  233:                         found.instance_id()
+  234:                     ),
+  235:                 )
+  236:             })?;
+  237:             let result = sqlx::query(
+  238:                 "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
+  239:                  WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
+  240:             )
+  241:             .bind(found.instance_id())
+  242:             .bind(wire_token(&InstanceState::Crashed))
+  243:             .bind(ts_string(at))
+  244:             .bind(wire_token(&current_state))
+  245:             .bind(revised)
+  246:             .execute(&mut *tx)
+  247:             .await
+  248:             .map_err(|e| storage_error(&e, "write instance state"))?;
+  249:             if result.rows_affected() == 0 {
+  250:                 return Err(DomainError::with_message(
+  251:                     ErrorCode::InvalidStateTransition,
+  252:                     format!(
+  253:                         "instance {} changed state before recovery applied",
+  254:                         found.instance_id()
+  255:                     ),
+  256:                 ));
+  257:             }
+  258:             AuditRepo::append(
+  259:                 &mut *tx,
+  260:                 &AuditEvent::new(
+  261:                     AuditKind::InstanceRecovered,
+  262:                     Some("instance".to_owned()),
+  263:                     Some(found.instance_id().to_string()),
+  264:                     None,
+  265:                     // The fresh in-transaction state, not the older pool-scan
+  266:                     // value: if the row moved between scan and transaction,
+  267:                     // this is the state the recovery actually transitioned
+  268:                     // from.
+  269:                     serde_json::json!({ "previous_state": current_state }),
+  270:                     at,
+  271:                 ),
+  272:             )
+  273:             .await?;
+  274:         }
+  275:         tx.commit()
+ 1240:             .expect("get")
+ 1241:             .expect("row")
+ 1242:             .state(),
+ 1243:         InstanceState::Ready
+ 1244:     );
+ 1245: }
+ 1246: 
+ 1247: // P1 (codex rounds 3+4): a state-only compare-and-set has an ABA hole
+ 1248: // because the instance machine has legal cycles (ready -> draining ->
+ 1249: // ready). The guard therefore also pins the monotonic `revision` counter
+ 1250: // (bumped as `revision = revision + 1` on every guarded write, so a cycled
+ 1251: // row can never present a stale writer with the same (state, revision)
+ 1252: // pair): a writer that validated a stale pair must affect 0 rows even when
+ 1253: // the state has cycled back to the same token, while a CAS pinned at the
+ 1254: // current revision still applies (positive control).
+ 1255: #[tokio::test]
+ 1256: async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+ 1257:     let fixture = Fixture::new().await.expect("fixture");
+ 1258:     let store = &fixture.store;
+ 1259:     let pool = store.pool();
+ 1260: 
+ 1261:     seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
+ 1262:     let stale_revision: i64 =
+ 1263:         sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+ 1264:             .fetch_one(pool)
+ 1265:             .await
+ 1266:             .expect("read the seeded revision");
+ 1267: 
+ 1268:     // A concurrent writer legally cycles the row: ready -> draining -> ready.
+ 1269:     InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
+ 1270:         .await
+ 1271:         .expect("legal ready -> draining");
+ 1272:     InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
+ 1273:         .await
+ 1274:         .expect("legal draining -> ready");
+ 1275: 
+ 1276:     // The stale writer's update: `state` matches (ready) but the revision is
+ 1277:     // stale, so the double guard must reject it (0 rows affected).
+ 1278:     let rejected = sqlx::query(
+ 1279:         "UPDATE instances SET active_requests = 99 \
+ 1280:          WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+ 1281:     )
+ 1282:     .bind(stale_revision)
+ 1283:     .execute(pool)
+ 1284:     .await
+ 1285:     .expect("stale guarded update runs");
+ 1286:     assert_eq!(
+ 1287:         rejected.rows_affected(),
+ 1288:         0,
+ 1289:         "the state+revision guard must reject the ABA write"
+ 1290:     );
+ 1291: 
+ 1292:     // Positive control: a CAS pinned at the CURRENT revision still applies.
+ 1293:     let fresh_revision: i64 =
+ 1294:         sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+ 1295:             .fetch_one(pool)
+ 1296:             .await
+ 1297:             .expect("read the current revision");
+ 1298:     let applied = sqlx::query(
+ 1299:         "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+ 1300:          WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+ 1301:     )
+ 1302:     .bind(fresh_revision)
+ 1303:     .execute(pool)
+ 1304:     .await
+ 1305:     .expect("fresh guarded update runs");
+ 1306:     assert_eq!(
+ 1307:         applied.rows_affected(),
+ 1308:         1,
+ 1309:         "a CAS on the current revision must apply"
+ 1310:     );
+ 1311:     let after = InstancesRepo::get(pool, "i-aba")
+ 1312:         .await
+ 1313:         .expect("get")
+ 1314:         .expect("row");
+ 1315:     assert_eq!(after.state(), InstanceState::Ready);
+ 1316:     assert_eq!(after.active_requests, 99, "only the fresh write may land");
+ 1317: }
+ 1318: 
+ 1319: // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+ 1320: // InvalidRequest, not InvalidStateTransition (state fences only) and not
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+The core guards are consistently using `(state, revision)` and incrementing in the same statement. I’m now checking less-obvious write paths, schema/migration compatibility, and whether transaction semantics leave any recovery-specific race.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n -U \"(?i)(INSERT INTO|UPDATE|DELETE FROM)\\s+(instances|operations)\" crates --glob '*.rs' --glob '*.sql'; rg -n \"state\\s*=|revision\\s*=|revision\" crates/persistence/src crates/persistence/migrations --glob '*.rs' --glob '*.sql'; Get-Content crates/persistence/migrations/0001_initial.sql | Select-Object -First 170; git show --stat --oneline 7a3cfa1; git show --stat --oneline 9209113; git diff 7a3cfa1"'^..9209113 -- crates/persistence/src/store.rs crates/persistence/src/repos.rs crates/persistence/src/tests.rs crates/persistence/migrations/0001_initial.sql; rg -n "migrate|MIGRATOR|Migration|0001" crates/persistence Cargo.toml crates/persistence/Cargo.toml README.md docs' in D:\Workspace\model-serving
+ succeeded in 273ms:
+crates\persistence\src\store.rs:238:                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
+crates\persistence\src\repos.rs:859:                    "INSERT INTO instances (
+crates\persistence\src\repos.rs:890:                    "UPDATE instances SET
+crates\persistence\src\repos.rs:946:            "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+crates\persistence\src\repos.rs:994:                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
+crates\persistence\src\repos.rs:1272:            "INSERT INTO operations (
+crates\persistence\src\repos.rs:1335:                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
+crates\persistence\src\tests.rs:591:    let err = sqlx::query("UPDATE instances SET state = 'sideways' WHERE instance_id = ?1")
+crates\persistence\src\tests.rs:603:    let err = sqlx::query("UPDATE instances SET desired_state = 'sideways' WHERE instance_id = ?1")
+crates\persistence\src\tests.rs:757:    let err = sqlx::query("UPDATE operations SET state = 'exploded' WHERE operation_id = ?1")
+crates\persistence\src\tests.rs:1063:    sqlx::query("UPDATE instances SET load_config = 'not json' WHERE instance_id = ?1")
+crates\persistence\src\tests.rs:1279:        "UPDATE instances SET active_requests = 99 \
+crates\persistence\src\tests.rs:1299:        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+crates\persistence\src\tests.rs:1329:    let err = sqlx::query("UPDATE instances SET port = ?2 WHERE instance_id = ?1")
+crates\persistence\src\tests.rs:1423:    sqlx::query("UPDATE instances SET pid = ?2 WHERE instance_id = ?1")
+crates/persistence/migrations\0001_initial.sql:111:    revision        INTEGER NOT NULL DEFAULT 0
+crates/persistence/migrations\0001_initial.sql:133:    revision     INTEGER NOT NULL DEFAULT 0,
+crates/persistence/src\store.rs:196:            // state and the monotonic `revision` counter so a same-state ABA
+crates/persistence/src\store.rs:201:                sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
+crates/persistence/src\store.rs:215:            let raw_state = current.try_get::<String, _>(0).map_err(|e| {
+crates/persistence/src\store.rs:224:                    format!("read instance {} revision: {e}", found.instance_id()),
+crates/persistence/src\store.rs:227:            let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+crates/persistence/src\store.rs:238:                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
+crates/persistence/src\store.rs:239:                 WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
+crates/persistence/src\tests.rs:568:    let by_state = InstancesRepo::list(
+crates/persistence/src\tests.rs:591:    let err = sqlx::query("UPDATE instances SET state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:603:    let err = sqlx::query("UPDATE instances SET desired_state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:757:    let err = sqlx::query("UPDATE operations SET state = 'exploded' WHERE operation_id = ?1")
+crates/persistence/src\tests.rs:1249:// ready). The guard therefore also pins the monotonic `revision` counter
+crates/persistence/src\tests.rs:1250:// (bumped as `revision = revision + 1` on every guarded write, so a cycled
+crates/persistence/src\tests.rs:1251:// row can never present a stale writer with the same (state, revision)
+crates/persistence/src\tests.rs:1254:// current revision still applies (positive control).
+crates/persistence/src\tests.rs:1256:async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+crates/persistence/src\tests.rs:1262:    let stale_revision: i64 =
+crates/persistence/src\tests.rs:1263:        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+crates/persistence/src\tests.rs:1266:            .expect("read the seeded revision");
+crates/persistence/src\tests.rs:1276:    // The stale writer's update: `state` matches (ready) but the revision is
+crates/persistence/src\tests.rs:1280:         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+crates/persistence/src\tests.rs:1282:    .bind(stale_revision)
+crates/persistence/src\tests.rs:1289:        "the state+revision guard must reject the ABA write"
+crates/persistence/src\tests.rs:1292:    // Positive control: a CAS pinned at the CURRENT revision still applies.
+crates/persistence/src\tests.rs:1293:    let fresh_revision: i64 =
+crates/persistence/src\tests.rs:1294:        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+crates/persistence/src\tests.rs:1297:            .expect("read the current revision");
+crates/persistence/src\tests.rs:1299:        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+crates/persistence/src\tests.rs:1300:         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+crates/persistence/src\tests.rs:1302:    .bind(fresh_revision)
+crates/persistence/src\tests.rs:1309:        "a CAS on the current revision must apply"
+crates/persistence/src\repos.rs:70:/// Returns the **current** state plus its `updated_at` revision when the row
+crates/persistence/src\repos.rs:73:/// a write guarded on BOTH the returned state and revision
+crates/persistence/src\repos.rs:74:/// (`UPDATE ... WHERE <state_col> = <returned state> AND <revision_col> =
+crates/persistence/src\repos.rs:75:/// <returned revision>`) and must check `rows_affected`: the guarded update
+crates/persistence/src\repos.rs:76:/// is a compare-and-set that also bumps the row's monotonic `revision`
+crates/persistence/src\repos.rs:80:/// Guarding on `revision` as well as `state` closes the ABA hole: a
+crates/persistence/src\repos.rs:82:/// unchanged but bumps `revision` (a strictly increasing integer written as
+crates/persistence/src\repos.rs:83:/// `revision = revision + 1`, so two writes can never collide, unlike a
+crates/persistence/src\repos.rs:97:    let sql = format!("SELECT state, revision FROM {table} WHERE {key_col} = ?1");
+crates/persistence/src\repos.rs:110:        DomainError::with_message(ErrorCode::Internal, format!("read {table}.revision: {e}"))
+crates/persistence/src\repos.rs:120:/// guard validated the state and the row revision, so a row that vanished or
+crates/persistence/src\repos.rs:886:            Some((expected_state, expected_revision)) => {
+crates/persistence/src\repos.rs:892:                         state = ?, pid = ?, port = ?, device_ids = ?,
+crates/persistence/src\repos.rs:895:                         revision = revision + 1
+crates/persistence/src\repos.rs:896:                     WHERE instance_id = ? AND state = ? AND revision = ?",
+crates/persistence/src\repos.rs:913:                .bind(expected_revision)
+crates/persistence/src\repos.rs:946:            "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+crates/persistence/src\repos.rs:991:        if let Some((expected_state, expected_revision)) = expected {
+crates/persistence/src\repos.rs:994:                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
+crates/persistence/src\repos.rs:995:                 revision = revision + 1 \
+crates/persistence/src\repos.rs:996:                 WHERE instance_id = ?1 AND state = ?5 AND revision = ?6",
+crates/persistence/src\repos.rs:1003:            .bind(expected_revision)
+crates/persistence/src\repos.rs:1071:                    builder.push("state = ");
+crates/persistence/src\repos.rs:1187:    let state = parse_wire::<InstanceState>(&row.state, "state")?;
+crates/persistence/src\repos.rs:1332:            Some((expected_state, expected_revision)) => {
+crates/persistence/src\repos.rs:1335:                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
+crates/persistence/src\repos.rs:1336:                     WHERE operation_id = ?1 AND state = ?7 AND revision = ?8",
+crates/persistence/src\repos.rs:1345:                .bind(expected_revision)
+crates/persistence/src\repos.rs:1414:                    builder.push("state = ");
+crates/persistence/src\repos.rs:1491:    let state = parse_wire::<OperationState>(&row.state, "state")?;
+-- 0001_initial.sql
+--
+-- Initial schema for the `model-serving` control plane (docs/architecture.md
+-- 搂3, 搂8, 搂9).
+--
+-- Migration policy: **append-only**. Never edit or delete a shipped file; the
+-- upgrade path for existing databases is "run the new numbered files".
+--
+-- Conventions (docs/api.md 搂1, 搂2.2):
+--   * every state / kind / class column stores the lowercase snake_case wire
+--     token as TEXT and is fenced by a named CHECK constraint so a row outside
+--     the state-machine vocabulary can never be stored (docs/architecture.md
+--     搂9; the repositories additionally validate transitions through the
+--     domain state machines before writing);
+--   * timestamps are RFC 3339 UTC TEXT (`created_at`, `updated_at`, `mtime`,
+--     `started_at`, ...);
+--   * structured payloads (`load_config`, `capabilities`, `metadata`,
+--     `health`, `failure`, `device_ids`, `error`, `result`, `payload`) are
+--     JSON TEXT.
+--
+-- NOTE: `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON` are enforced at
+-- connection time by `SqliteStore::open` (journal_mode cannot be switched
+-- inside a transaction, so it must not live in a migration file).
+
+-- Daemon-wide key/value settings (docs/api.md 搂5: GET/PATCH /admin/v1/settings).
+-- `restart_required` flags values that only take effect after a restart.
+CREATE TABLE settings (
+    key              TEXT PRIMARY KEY,
+    value            TEXT NOT NULL,
+    restart_required INTEGER NOT NULL DEFAULT 0 CHECK (restart_required IN (0, 1)),
+    updated_at       TEXT NOT NULL
+);
+
+-- Registered inference runtimes (docs/architecture.md 搂3 "Runtime").
+-- `last_probe_ok` / `last_probed_at` hold the most recent probe outcome; they
+-- are written by the runtime-probe job (M1 job 5) and preserved by CRUD.
+CREATE TABLE runtimes (
+    id             TEXT PRIMARY KEY,
+    kind           TEXT NOT NULL CHECK (kind IN ('llama_cpp', 'ninfer')),
+    executable_path TEXT NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    version_text   TEXT,
+    capabilities   TEXT NOT NULL DEFAULT '{}',
+    fixed_args     TEXT NOT NULL DEFAULT '[]',
+    last_probe_ok  INTEGER,
+    last_probed_at TEXT
+);
+
+-- Controlled scan directories (docs/api.md 搂5: model-roots).
+-- `last_scan_at` / `last_scan_result` hold the most recent scan outcome for
+-- `GET /admin/v1/model-roots` (written by the scanner job, M1 job 4).
+CREATE TABLE model_roots (
+    id               TEXT PRIMARY KEY,
+    path             TEXT NOT NULL UNIQUE,
+    enabled          INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    last_scan_at     TEXT,
+    last_scan_result TEXT,
+    created_at       TEXT NOT NULL
+);
+
+-- Indexed model artifacts (docs/architecture.md 搂3 "Model").
+-- `root_id` / `first_seen_at` / `last_seen_at` are scanner bookkeeping
+-- reserved for the scan job (M1 job 4); CRUD upserts preserve them.
+CREATE TABLE models (
+    id                  TEXT PRIMARY KEY,
+    key                 TEXT NOT NULL UNIQUE,
+    path                TEXT NOT NULL,
+    display_name        TEXT,
+    artifact_kind       TEXT NOT NULL CHECK (artifact_kind IN ('gguf', 'ninfer')),
+    size_bytes          INTEGER NOT NULL CHECK (size_bytes >= 0),
+    mtime               TEXT NOT NULL,
+    default_runtime_id  TEXT REFERENCES runtimes (id) ON DELETE SET NULL,
+    default_load_config TEXT,
+    metadata            TEXT,
+    deleted             INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+    root_id             TEXT REFERENCES model_roots (id) ON DELETE SET NULL,
+    first_seen_at       TEXT NOT NULL,
+    last_seen_at        TEXT NOT NULL
+);
+CREATE INDEX idx_models_key ON models (key);
+CREATE INDEX idx_models_path ON models (path);
+
+-- Instance records (docs/architecture.md 搂3 "Instance").
+-- `state` is the actual lifecycle state; `desired_state` is the state an
+-- in-flight operation drives the instance toward (docs/architecture.md 搂9:
+-- "operation銆乮nstance desired state 鍜?audit event 鍚屾鎻愪氦").
+-- `pid` / `port` are only trusted once the process supervisor confirms them.
+CREATE TABLE instances (
+    instance_id     TEXT PRIMARY KEY,
+    model_id        TEXT NOT NULL REFERENCES models (id) ON DELETE CASCADE,
+    runtime_id      TEXT NOT NULL REFERENCES runtimes (id),
+    load_config     TEXT NOT NULL,
+    state           TEXT NOT NULL
+        CONSTRAINT instance_state_valid
+        CHECK (state IN ('unloaded', 'queued', 'loading', 'ready',
+                         'draining', 'unloading', 'failed', 'crashed')),
+    desired_state   TEXT NOT NULL
+        CONSTRAINT instance_desired_state_valid
+        CHECK (desired_state IN ('unloaded', 'queued', 'loading', 'ready',
+                                 'draining', 'unloading', 'failed', 'crashed')),
+    pid             INTEGER,
+    port            INTEGER CHECK (port IS NULL OR (port BETWEEN 1 AND 65535)),
+    device_ids      TEXT NOT NULL DEFAULT '[]',
+    started_at      TEXT,
+    last_used_at    TEXT,
+    active_requests INTEGER NOT NULL DEFAULT 0 CHECK (active_requests >= 0),
+    health          TEXT,
+    failure         TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    revision        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_instances_model ON instances (model_id);
+CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+-- Partial index serving the docs/architecture.md 搂8 restart-recovery query.
+CREATE INDEX idx_instances_state_nonterminal
+    ON instances (state)
+    WHERE state IN ('queued', 'loading', 'ready', 'draining', 'unloading');
+
+-- Load / unload / rescan operations (docs/architecture.md 搂3 "Operation").
+-- `error` is the structured `OperationError` JSON; `result` the structured
+-- result payload JSON (docs/api.md 搂5).
+CREATE TABLE operations (
+    operation_id TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL CHECK (kind IN ('load', 'unload', 'rescan')),
+    state        TEXT NOT NULL
+        CONSTRAINT operation_state_valid
+        CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+    instance_id  TEXT REFERENCES instances (instance_id) ON DELETE SET NULL,
+    model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    revision     INTEGER NOT NULL DEFAULT 0,
+    finished_at  TEXT,
+    error        TEXT,
+    result       TEXT
+);
+CREATE INDEX idx_operations_state ON operations (state);
+CREATE INDEX idx_operations_instance ON operations (instance_id);
+CREATE INDEX idx_operations_model ON operations (model_id);
+
+-- Append-only audit / event log (docs/architecture.md 搂9, docs/api.md 搂5 SSE
+-- replay). The autoincrement id is the monotonically increasing event id used
+-- for `Last-Event-ID` replay.
+CREATE TABLE audit_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL,
+    subject_type TEXT,
+    subject_id   TEXT,
+    operation_id TEXT,
+    payload      TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX idx_audit_events_created ON audit_events (created_at);
+CREATE INDEX idx_audit_events_operation ON audit_events (operation_id);
+7a3cfa1 fix(persistence): monotonic revision closes ABA hole
+ crates/persistence/migrations/0001_initial.sql |  4 +-
+ crates/persistence/src/repos.rs                | 57 ++++++++++++++------------
+ crates/persistence/src/store.rs                | 20 +++++----
+ crates/persistence/src/tests.rs                | 48 +++++++++++++++-------
+ 4 files changed, 80 insertions(+), 49 deletions(-)
+9209113 fix(persistence): spell out db-file open truncate + Display paths (WSL clippy)
+ crates/persistence/src/store.rs | 16 ++++++++++++----
+ docs/jobs.md                    |  2 +-
+ 2 files changed, 13 insertions(+), 5 deletions(-)
+diff --git a/crates/persistence/migrations/0001_initial.sql b/crates/persistence/migrations/0001_initial.sql
+index 7127960..51db2f9 100644
+--- a/crates/persistence/migrations/0001_initial.sql
++++ b/crates/persistence/migrations/0001_initial.sql
+@@ -107,7 +107,8 @@ CREATE TABLE instances (
+     health          TEXT,
+     failure         TEXT,
+     created_at      TEXT NOT NULL,
+-    updated_at      TEXT NOT NULL
++    updated_at      TEXT NOT NULL,
++    revision        INTEGER NOT NULL DEFAULT 0
+ );
+ CREATE INDEX idx_instances_model ON instances (model_id);
+ CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+@@ -129,6 +130,7 @@ CREATE TABLE operations (
+     model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
+     created_at   TEXT NOT NULL,
+     updated_at   TEXT NOT NULL,
++    revision     INTEGER NOT NULL DEFAULT 0,
+     finished_at  TEXT,
+     error        TEXT,
+     result       TEXT
+diff --git a/crates/persistence/src/repos.rs b/crates/persistence/src/repos.rs
+index 21f1021..ad41a9b 100644
+--- a/crates/persistence/src/repos.rs
++++ b/crates/persistence/src/repos.rs
+@@ -71,14 +71,17 @@ enum OperationFilter {
+ /// exists, or `None` for a first-seen row (no prior state, so a legal initial
+ /// state may be written and no transition check applies). Callers then issue
+ /// a write guarded on BOTH the returned state and revision
+-/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
+-/// revision>`) and must check `rows_affected`: the guarded update is a
+-/// compare-and-set, so a row that moved concurrently affects 0 rows and the
+-/// write is rejected, even though the SELECT and the UPDATE are separate
+-/// statements (a transaction is not required for the guard to be safe).
+-/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
++/// (`UPDATE ... WHERE <state_col> = <returned state> AND <revision_col> =
++/// <returned revision>`) and must check `rows_affected`: the guarded update
++/// is a compare-and-set that also bumps the row's monotonic `revision`
++/// counter, so a row that moved concurrently affects 0 rows and the write is
++/// rejected, even though the SELECT and the UPDATE are separate statements
++/// (a transaction is not required for the guard to be safe).
++/// Guarding on `revision` as well as `state` closes the ABA hole: a
+ /// concurrent legal `ready -> draining -> ready` cycle leaves `state`
+-/// unchanged but bumps `updated_at`, so a stale write is still rejected.
++/// unchanged but bumps `revision` (a strictly increasing integer written as
++/// `revision = revision + 1`, so two writes can never collide, unlike a
++/// timestamp), so a stale write is still rejected.
+ async fn validate_state<'c, E, S>(
+     exec: E,
+     table: &str,
+@@ -86,12 +89,12 @@ async fn validate_state<'c, E, S>(
+     key: &str,
+     to: S,
+     transition: fn(S, S) -> Result<S>,
+-) -> Result<Option<(S, String)>>
++) -> Result<Option<(S, i64)>>
+ where
+     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+ {
+-    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
++    let sql = format!("SELECT state, revision FROM {table} WHERE {key_col} = ?1");
+     let row = sqlx::query(&sql)
+         .bind(key)
+         .fetch_optional(exec)
+@@ -103,8 +106,8 @@ where
+     let raw = row.try_get::<String, _>(0).map_err(|e| {
+         DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
+     })?;
+-    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
+-        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
++    let updated_at = row.try_get::<i64, _>(1).map_err(|e| {
++        DomainError::with_message(ErrorCode::Internal, format!("read {table}.revision: {e}"))
+     })?;
+     let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+     if current != to {
+@@ -114,9 +117,9 @@ where
+ }
+ 
+ /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+-/// guard validated the state and revision, so a row that vanished or moved in
+-/// the interim (including a same-state ABA cycle) means the update raced a
+-/// concurrent writer.
++/// guard validated the state and the row revision, so a row that vanished or
++/// moved in the interim (including a same-state ABA cycle) means the update
++/// raced a concurrent writer.
+ #[track_caller]
+ fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+     if rows_affected == 0 {
+@@ -880,7 +883,7 @@ impl InstancesRepo {
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+             }
+-            Some((expected_state, expected_revised)) => {
++            Some((expected_state, expected_revision)) => {
+                 // Existing row: guarded update (`desired_state` preserved).
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+@@ -888,8 +891,9 @@ impl InstancesRepo {
+                          model_id = ?, runtime_id = ?, load_config = ?,
+                          state = ?, pid = ?, port = ?, device_ids = ?,
+                          started_at = ?, last_used_at = ?, active_requests = ?,
+-                         health = ?, failure = ?, updated_at = ?
+-                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
++                         health = ?, failure = ?, updated_at = ?,
++                         revision = revision + 1
++                     WHERE instance_id = ? AND state = ? AND revision = ?",
+                 )
+                 .bind(&instance.model_id)
+                 .bind(&instance.runtime_id)
+@@ -906,7 +910,7 @@ impl InstancesRepo {
+                 .bind(&at_str)
+                 .bind(&instance.instance_id)
+                 .bind(&expected_token)
+-                .bind(&expected_revised)
++                .bind(expected_revision)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+@@ -984,18 +988,19 @@ impl InstancesRepo {
+         )
+         .await?;
+         let state_token = wire_token(&state);
+-        if let Some((expected_state, expected_revised)) = expected {
++        if let Some((expected_state, expected_revision)) = expected {
+             let expected_token = wire_token(&expected_state);
+             let result = sqlx::query(
+-                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+-                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
++                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4, \
++                 revision = revision + 1 \
++                 WHERE instance_id = ?1 AND state = ?5 AND revision = ?6",
+             )
+             .bind(instance_id)
+             .bind(&state_token)
+             .bind(&failure_json)
+             .bind(ts_string(updated_at))
+             .bind(&expected_token)
+-            .bind(&expected_revised)
++            .bind(expected_revision)
+             .execute(exec)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+@@ -1324,11 +1329,11 @@ impl OperationsRepo {
+         let finished_at = operation.finished_at.map(ts_string);
+         match expected {
+             None => Ok(false),
+-            Some((expected_state, expected_revised)) => {
++            Some((expected_state, expected_revision)) => {
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+-                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
+-                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
++                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6, revision = revision + 1 \
++                     WHERE operation_id = ?1 AND state = ?7 AND revision = ?8",
+                 )
+                 .bind(&operation.operation_id)
+                 .bind(&to_token)
+@@ -1337,7 +1342,7 @@ impl OperationsRepo {
+                 .bind(result_json)
+                 .bind(ts_string(now()))
+                 .bind(&expected_token)
+-                .bind(&expected_revised)
++                .bind(expected_revision)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "advance operation"))?;
+diff --git a/crates/persistence/src/store.rs b/crates/persistence/src/store.rs
+index 74b7c00..a8b7607 100644
+--- a/crates/persistence/src/store.rs
++++ b/crates/persistence/src/store.rs
+@@ -41,25 +41,30 @@ fn secure_db_file(path: &Path) -> Result<()> {
+             std::fs::OpenOptions::new()
+                 .write(true)
+                 .create(true)
++                // The file was just proven absent above; the open only ever
++                // creates a fresh empty file, so truncation is a no-op but
++                // stated explicitly (clippy wants the truncate behaviour
++                // spelled out when `create` is set).
++                .truncate(true)
+                 .mode(0o600)
+                 .open(path)
+                 .map_err(|e| {
+                     DomainError::with_message(
+                         ErrorCode::Internal,
+-                        format!("create database file {path:?}: {e}"),
++                        format!("create database file {}: {e}", path.display()),
+                     )
+                 })?;
+             std::fs::metadata(path).map_err(|e| {
+                 DomainError::with_message(
+                     ErrorCode::Internal,
+-                    format!("stat database file {path:?}: {e}"),
++                    format!("stat database file {}: {e}", path.display()),
+                 )
+             })?
+         }
+         Err(e) => {
+             return Err(DomainError::with_message(
+                 ErrorCode::Internal,
+-                format!("stat database file {path:?}: {e}"),
++                format!("stat database file {}: {e}", path.display()),
+             ));
+         }
+     };
+@@ -68,7 +73,10 @@ fn secure_db_file(path: &Path) -> Result<()> {
+         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+             DomainError::with_message(
+                 ErrorCode::Internal,
+-                format!("set database file {path:?} permissions to 0600: {e}"),
++                format!(
++                    "set database file {} permissions to 0600: {e}",
++                    path.display()
++                ),
+             )
+         })?;
+     }
+@@ -185,12 +193,12 @@ impl SqliteStore {
+             // cycle could have moved the row and back. Validate the move
+             // through the frozen domain state machine (never a raw write)
+             // against this fresh state, then guard the update on BOTH the
+-            // state and the `updated_at` revision so a same-state ABA
++            // state and the monotonic `revision` counter so a same-state ABA
+             // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
+             // so the two-query repository guard cannot run in a transaction;
+             // sequential re-borrows of the transaction do the same job).
+             let current =
+-                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
++                sqlx::query("SELECT state, revision FROM instances WHERE instance_id = ?1")
+                     .bind(found.instance_id())
+                     .fetch_optional(&mut *tx)
+                     .await
+@@ -210,10 +218,10 @@ impl SqliteStore {
+                     format!("read instance {} state: {e}", found.instance_id()),
+                 )
+             })?;
+-            let revised = current.try_get::<String, _>(1).map_err(|e| {
++            let revised = current.try_get::<i64, _>(1).map_err(|e| {
+                 DomainError::with_message(
+                     ErrorCode::Internal,
+-                    format!("read instance {} updated_at: {e}", found.instance_id()),
++                    format!("read instance {} revision: {e}", found.instance_id()),
+                 )
+             })?;
+             let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+@@ -227,14 +235,14 @@ impl SqliteStore {
+                 )
+             })?;
+             let result = sqlx::query(
+-                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+-                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
++                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3, revision = revision + 1 \
++                 WHERE instance_id = ?1 AND state = ?4 AND revision = ?5",
+             )
+             .bind(found.instance_id())
+             .bind(wire_token(&InstanceState::Crashed))
+             .bind(ts_string(at))
+             .bind(wire_token(&current_state))
+-            .bind(&revised)
++            .bind(revised)
+             .execute(&mut *tx)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+@@ -254,7 +262,11 @@ impl SqliteStore {
+                     Some("instance".to_owned()),
+                     Some(found.instance_id().to_string()),
+                     None,
+-                    serde_json::json!({ "previous_state": found.state() }),
++                    // The fresh in-transaction state, not the older pool-scan
++                    // value: if the row moved between scan and transaction,
++                    // this is the state the recovery actually transitioned
++                    // from.
++                    serde_json::json!({ "previous_state": current_state }),
+                     at,
+                 ),
+             )
+diff --git a/crates/persistence/src/tests.rs b/crates/persistence/src/tests.rs
+index 6ac40fb..47f0d47 100644
+--- a/crates/persistence/src/tests.rs
++++ b/crates/persistence/src/tests.rs
+@@ -1244,11 +1244,14 @@ async fn same_state_writes_are_idempotent_data_updates() {
+     );
+ }
+ 
+-// P1 (codex round 3): a state-only compare-and-set has an ABA hole because
+-// the instance machine has legal cycles (ready -> draining -> ready). The
+-// guard therefore also pins the `updated_at` revision: a writer that
+-// validated a stale (state, updated_at) pair must affect 0 rows even when
+-// the state has cycled back to the same token.
++// P1 (codex rounds 3+4): a state-only compare-and-set has an ABA hole
++// because the instance machine has legal cycles (ready -> draining ->
++// ready). The guard therefore also pins the monotonic `revision` counter
++// (bumped as `revision = revision + 1` on every guarded write, so a cycled
++// row can never present a stale writer with the same (state, revision)
++// pair): a writer that validated a stale pair must affect 0 rows even when
++// the state has cycled back to the same token, while a CAS pinned at the
++// current revision still applies (positive control).
+ #[tokio::test]
+ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     let fixture = Fixture::new().await.expect("fixture");
+@@ -1256,8 +1259,8 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     let pool = store.pool();
+ 
+     seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
+-    let stale_revised: String =
+-        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
++    let stale_revision: i64 =
++        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+             .fetch_one(pool)
+             .await
+             .expect("read the seeded revision");
+@@ -1274,26 +1277,43 @@ async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+     // stale, so the double guard must reject it (0 rows affected).
+     let rejected = sqlx::query(
+         "UPDATE instances SET active_requests = 99 \
+-         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
++         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+     )
+-    .bind(&stale_revised)
++    .bind(stale_revision)
+     .execute(pool)
+     .await
+     .expect("stale guarded update runs");
+     assert_eq!(
+         rejected.rows_affected(),
+         0,
+-        "the state+updated_at guard must reject the ABA write"
++        "the state+revision guard must reject the ABA write"
++    );
++
++    // Positive control: a CAS pinned at the CURRENT revision still applies.
++    let fresh_revision: i64 =
++        sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
++            .fetch_one(pool)
++            .await
++            .expect("read the current revision");
++    let applied = sqlx::query(
++        "UPDATE instances SET active_requests = 99, revision = revision + 1 \
++         WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
++    )
++    .bind(fresh_revision)
++    .execute(pool)
++    .await
++    .expect("fresh guarded update runs");
++    assert_eq!(
++        applied.rows_affected(),
++        1,
++        "a CAS on the current revision must apply"
+     );
+     let after = InstancesRepo::get(pool, "i-aba")
+         .await
+         .expect("get")
+         .expect("row");
+     assert_eq!(after.state(), InstanceState::Ready);
+-    assert_ne!(
+-        after.active_requests, 99,
+-        "the stale write must not have landed"
+-    );
++    assert_eq!(after.active_requests, 99, "only the fresh write may land");
+ }
+ 
+ // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+Cargo.toml:44:sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "derive", "chrono"] }
+crates/persistence\src\lib.rs:15://!   `migrate()`; also runs the docs/architecture.md §8 restart-recovery
+crates/persistence\src\lib.rs:23://!   tests): a temp-directory SQLite fixture that is already migrated.
+crates/persistence\src\lib.rs:38://! # Migration policy
+crates/persistence\src\lib.rs:40://! Numbered `.sql` files under `migrations/`, applied by sqlx (`migrate()`).
+crates/persistence\src\lib.rs:42://! shipped files are never edited, and `migrate()` on an already-current
+crates/persistence\src\mapping.rs:22:/// state-machine vocabularies (see `migrations/0001_initial.sql`). A
+crates/persistence\src\store.rs:130:    /// Idempotent: already-applied migrations are a no-op, so `migrate()` is
+crates/persistence\src\store.rs:136:    pub async fn migrate(&self) -> Result<()> {
+crates/persistence\src\store.rs:137:        sqlx::migrate!().run(&self.pool).await.map_err(|e| {
+crates/persistence\src\tests.rs:297:async fn migrate_is_idempotent() {
+crates/persistence\src\tests.rs:299:    // A second migrate on the same store is a no-op.
+crates/persistence\src\tests.rs:300:    fixture.store.migrate().await.expect("second migrate");
+crates/persistence\src\tests.rs:301:    // ... and so is a migrate on a freshly opened store over the same file.
+crates/persistence\src\tests.rs:303:    reopened.migrate().await.expect("migrate over existing db");
+crates/persistence\migrations\0001_initial.sql:1:-- 0001_initial.sql
+crates/persistence\migrations\0001_initial.sql:6:-- Migration policy: **append-only**. Never edit or delete a shipped file; the
+crates/persistence\src\test_support.rs:2://! migrated [`crate::SqliteStore`].
+crates/persistence\src\test_support.rs:22:/// A migrated temporary SQLite database.
+crates/persistence\src\test_support.rs:33:    /// The migrated store connected to `db_path`.
+crates/persistence\src\test_support.rs:44:    /// migrated.
+crates/persistence\src\test_support.rs:54:        store.migrate().await?;
+docs\adr\ADR-0001-port-allocation.md:1:# ADR-0001: Runtime child port allocation — child self-selects, reports via stdout
+docs\adr\ADR-0003-runtime-version-baseline.md:14:3. `llama-server --port 0` 时打印实际端口（ADR-0001 的 ready 行协议）。
+docs\jobs.md:8:| S1 | M0 风险 spike + fixtures + ADR | passed/committed | ✅ Spike A (SSE 转发/中断取消, ADR-0004, codex 两轮通过)；✅ Spike B 子进程 (subprocess.rs: stdout+stderr 双路 drain / TERM→KILL 升级+双路 EOF / unix 组杀 / in-terminate in-loop pump, 4 常规 + 1 unix 测试)；✅ Spike C 端口竞态 (port_race.rs: A 预分配 100/100 失败 vs B child 自选 100/100 成功)；✅ ADR-0002(accepted)；ADR-0001/0003 为 proposed——真实 runtime ready-line 契约与 b5555 基线待 WSL 现场 fixture（本 WSL 无 llama.cpp/NInfer/cargo，M2 llama adapter 开工门槛）；fixtures/upstream ✅ 字节级核对，fixtures/runtimes 为占位（PENDING WSL 现场采集）。codex review 通过（分支 job/s1-m0-spikes, 5bba80a→bbfeaf3） |
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'rg -n "DELETE FROM|ON CONFLICT|deleted|remove|delete" crates/persistence/src/repos.rs crates/persistence/migrations/0001_initial.sql crates/persistence/src/tests.rs | Select-Object -First 250; $p='"'crates/persistence/src/repos.rs'; "'$lines=Get-Content $p; for($i=805;$i -le 925;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}; for($i=280;$i -le 460;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}; $p='"'crates/persistence/src/lib.rs'; "'$lines=Get-Content $p; for($i=30;$i -le 48;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}; $p='"'crates/persistence/src/store.rs'; "'$lines=Get-Content $p; for($i=120;$i -le 148;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}' in D:\Workspace\model-serving
+ succeeded in 161ms:
+crates/persistence/src/tests.rs:50:        deleted: false,
+crates/persistence/src/tests.rs:313:async fn model_round_trip_and_soft_delete() {
+crates/persistence/src/tests.rs:346:    // Soft delete hides the row from the default list but not from the
+crates/persistence/src/tests.rs:347:    // full list; a re-upsert with deleted = false restores it.
+crates/persistence/src/tests.rs:348:    let hidden = ModelsRepo::set_deleted(pool, "mistral-7b", true)
+crates/persistence/src/tests.rs:350:        .expect("soft delete");
+crates/persistence/src/tests.rs:356:    assert!(all[0].deleted);
+crates/persistence/src/tests.rs:359:    restored.deleted = false;
+crates/persistence/src/tests.rs:367:    assert!(!back.deleted);
+crates/persistence/src/tests.rs:370:        !ModelsRepo::set_deleted(pool, "no-such-key", true)
+crates/persistence/src/tests.rs:372:            .expect("missing delete")
+crates/persistence/src/tests.rs:403:    root.last_scan_result = Some(serde_json::json!({ "new": 0, "removed": 1 }));
+crates/persistence/src/tests.rs:414:        Some(serde_json::json!({ "new": 0, "removed": 1 }))
+crates/persistence/src/tests.rs:431:        ModelRootsRepo::delete(pool, "root-a")
+crates/persistence/src/tests.rs:433:            .expect("delete")
+crates/persistence/src/tests.rs:436:        !ModelRootsRepo::delete(pool, "root-a")
+crates/persistence/src/tests.rs:438:            .expect("delete missing")
+crates/persistence/src/tests.rs:507:    assert!(RuntimeRepo::delete(pool, "llama-1").await.expect("delete"));
+crates/persistence/migrations/0001_initial.sql:6:-- Migration policy: **append-only**. Never edit or delete a shipped file; the
+crates/persistence/migrations/0001_initial.sql:75:    deleted             INTEGER NOT NULL DEFAULT 0 CHECK (deleted IN (0, 1)),
+crates/persistence/src/repos.rs:183:    /// A model row was soft-deleted.
+crates/persistence/src/repos.rs:185:    /// A soft-deleted model row was restored by a re-appearing artifact.
+crates/persistence/src/repos.rs:189:    /// A model root was removed.
+crates/persistence/src/repos.rs:193:    /// A runtime was removed.
+crates/persistence/src/repos.rs:302:            default_runtime_id, default_load_config, metadata, deleted,
+crates/persistence/src/repos.rs:305:        ON CONFLICT (key) DO UPDATE SET
+crates/persistence/src/repos.rs:314:            deleted = excluded.deleted,
+crates/persistence/src/repos.rs:319:    /// refreshed (including `deleted`, so an upsert with `deleted = false`
+crates/persistence/src/repos.rs:320:    /// restores a soft-deleted row) while the row's `id` / `root_id` /
+crates/persistence/src/repos.rs:353:            .bind(model.deleted)
+crates/persistence/src/repos.rs:362:    /// Fetch one model by its readable `key`, regardless of `deleted`.
+crates/persistence/src/repos.rs:373:                 default_runtime_id, default_load_config, metadata, deleted \
+crates/persistence/src/repos.rs:388:    pub async fn list<'c, E>(exec: E, include_deleted: bool) -> Result<Vec<Model>>
+crates/persistence/src/repos.rs:392:        let sql = if include_deleted {
+crates/persistence/src/repos.rs:394:             default_runtime_id, default_load_config, metadata, deleted \
+crates/persistence/src/repos.rs:398:             default_runtime_id, default_load_config, metadata, deleted \
+crates/persistence/src/repos.rs:399:             FROM models WHERE deleted = 0 ORDER BY key"
+crates/persistence/src/repos.rs:408:    /// Soft-delete (`deleted = true`) or restore (`deleted = false`) a model
+crates/persistence/src/repos.rs:414:    pub async fn set_deleted<'c, E>(exec: E, key: &str, deleted: bool) -> Result<bool>
+crates/persistence/src/repos.rs:419:            sqlx::query("UPDATE models SET deleted = ?2, last_seen_at = ?3 WHERE key = ?1")
+crates/persistence/src/repos.rs:421:                .bind(deleted)
+crates/persistence/src/repos.rs:425:                .map_err(|e| storage_error(&e, "set model deleted"))?;
+crates/persistence/src/repos.rs:442:    deleted: bool,
+crates/persistence/src/repos.rs:463:        deleted: row.deleted,
+crates/persistence/src/repos.rs:475:        ON CONFLICT (id) DO UPDATE SET
+crates/persistence/src/repos.rs:575:    pub async fn delete<'c, E>(exec: E, id: &str) -> Result<bool>
+crates/persistence/src/repos.rs:579:        let result = sqlx::query("DELETE FROM model_roots WHERE id = ?1")
+crates/persistence/src/repos.rs:583:            .map_err(|e| storage_error(&e, "delete model root"))?;
+crates/persistence/src/repos.rs:629:        ON CONFLICT (id) DO UPDATE SET
+crates/persistence/src/repos.rs:738:    pub async fn delete<'c, E>(exec: E, id: &str) -> Result<bool>
+crates/persistence/src/repos.rs:742:        let result = sqlx::query("DELETE FROM runtimes WHERE id = ?1")
+crates/persistence/src/repos.rs:746:            .map_err(|e| storage_error(&e, "delete runtime"))?;
+crates/persistence/src/repos.rs:1531:/// and the instance desired state); events are never updated or deleted.
+crates/persistence/src/repos.rs:1675:             ON CONFLICT (key) DO UPDATE SET
+  805:     ///
+  806:     /// The write is guarded against the persisted state: on an existing row
+  807:     /// the row's current state is validated through the domain state machine
+  808:     /// before the (guarded) update, so an illegal move such as `failed -> ready`
+  809:     /// is rejected and the row left unchanged (`docs/architecture.md` 搂8).
+  810:     ///
+  811:     /// # Errors
+  812:     ///
+  813:     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+  814:     /// `InvalidStateTransition` for an illegal state transition or a row that
+  815:     /// raced the guard, `Internal` otherwise. A same-state upsert is an
+  816:     /// idempotent *data* update (pid/health/progress while the lifecycle state
+  817:     /// is unchanged) and is always legal: the frozen machine defines no
+  818:     /// self-loops, so same-state writes skip the transition check (see
+  819:     /// `validate_state`).
+  820:     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
+  821:     where
+  822:         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  823:     {
+  824:         let to = instance.state();
+  825:         let expected = validate_state(
+  826:             exec,
+  827:             "instances",
+  828:             "instance_id",
+  829:             &instance.instance_id,
+  830:             to,
+  831:             transition_instance,
+  832:         )
+  833:         .await?;
+  834:         let to_token = wire_token(&to);
+  835:         let load_config = to_json(&instance.load_config, "load_config")?;
+  836:         let device_ids = to_json(&instance.device_ids, "device_ids")?;
+  837:         let health = instance
+  838:             .health
+  839:             .as_ref()
+  840:             .map(|h| to_json(h, "health"))
+  841:             .transpose()?;
+  842:         let failure = instance
+  843:             .failure
+  844:             .as_ref()
+  845:             .map(|f| to_json(f, "failure"))
+  846:             .transpose()?;
+  847:         let at = now();
+  848:         let at_str = ts_string(at);
+  849:         let pid = instance.pid.map(u64::from).map(as_i64);
+  850:         let port = instance.port.map(i32::from);
+  851:         let started_at = instance.started_at.map(ts_string);
+  852:         let last_used_at = instance.last_used_at.map(ts_string);
+  853:         let active_requests = i64::from(instance.active_requests);
+  854: 
+  855:         match expected {
+  856:             None => {
+  857:                 // First-seen row: insert with `desired_state` = state.
+  858:                 sqlx::query(
+  859:                     "INSERT INTO instances (
+  860:                         instance_id, model_id, runtime_id, load_config,
+  861:                         state, desired_state, pid, port, device_ids,
+  862:                         started_at, last_used_at, active_requests, health, failure,
+  863:                         created_at, updated_at
+  864:                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  865:                 )
+  866:                 .bind(&instance.instance_id)
+  867:                 .bind(&instance.model_id)
+  868:                 .bind(&instance.runtime_id)
+  869:                 .bind(&load_config)
+  870:                 .bind(&to_token)
+  871:                 .bind(&to_token)
+  872:                 .bind(pid)
+  873:                 .bind(port)
+  874:                 .bind(&device_ids)
+  875:                 .bind(started_at)
+  876:                 .bind(last_used_at)
+  877:                 .bind(active_requests)
+  878:                 .bind(health)
+  879:                 .bind(failure)
+  880:                 .bind(&at_str)
+  881:                 .bind(&at_str)
+  882:                 .execute(exec)
+  883:                 .await
+  884:                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  885:             }
+  886:             Some((expected_state, expected_revision)) => {
+  887:                 // Existing row: guarded update (`desired_state` preserved).
+  888:                 let expected_token = wire_token(&expected_state);
+  889:                 let result = sqlx::query(
+  890:                     "UPDATE instances SET
+  891:                          model_id = ?, runtime_id = ?, load_config = ?,
+  892:                          state = ?, pid = ?, port = ?, device_ids = ?,
+  893:                          started_at = ?, last_used_at = ?, active_requests = ?,
+  894:                          health = ?, failure = ?, updated_at = ?,
+  895:                          revision = revision + 1
+  896:                      WHERE instance_id = ? AND state = ? AND revision = ?",
+  897:                 )
+  898:                 .bind(&instance.model_id)
+  899:                 .bind(&instance.runtime_id)
+  900:                 .bind(&load_config)
+  901:                 .bind(&to_token)
+  902:                 .bind(pid)
+  903:                 .bind(port)
+  904:                 .bind(&device_ids)
+  905:                 .bind(started_at)
+  906:                 .bind(last_used_at)
+  907:                 .bind(active_requests)
+  908:                 .bind(health)
+  909:                 .bind(failure)
+  910:                 .bind(&at_str)
+  911:                 .bind(&instance.instance_id)
+  912:                 .bind(&expected_token)
+  913:                 .bind(expected_revision)
+  914:                 .execute(exec)
+  915:                 .await
+  916:                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+  917:                 require_state_write(
+  918:                     result.rows_affected(),
+  919:                     &format!("instance {}", instance.instance_id),
+  920:                 )?;
+  921:             }
+  922:         }
+  923:         Ok(())
+  924:     }
+  925: 
+  280: 
+  281: impl OperationQuery {
+  282:     /// No restrictions.
+  283:     #[must_use]
+  284:     pub fn all() -> Self {
+  285:         Self::default()
+  286:     }
+  287: }
+  288: 
+  289: /// Indexed model artifact rows.
+  290: ///
+  291: /// Model `id` (the stable UUID, `models.id`) is the identity; `key` is the
+  292: /// unique readable API identifier. `upsert` preserves scanner bookkeeping
+  293: /// (`root_id`, `first_seen_at`) on conflict, so it doubles as the
+  294: /// re-appearing-file restore path for the scan job (M1 job 4).
+  295: #[derive(Debug)]
+  296: pub struct ModelsRepo;
+  297: 
+  298: impl ModelsRepo {
+  299:     const UPSERT: &str = "
+  300:         INSERT INTO models (
+  301:             id, key, path, display_name, artifact_kind, size_bytes, mtime,
+  302:             default_runtime_id, default_load_config, metadata, deleted,
+  303:             first_seen_at, last_seen_at
+  304:         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  305:         ON CONFLICT (key) DO UPDATE SET
+  306:             path = excluded.path,
+  307:             display_name = excluded.display_name,
+  308:             artifact_kind = excluded.artifact_kind,
+  309:             size_bytes = excluded.size_bytes,
+  310:             mtime = excluded.mtime,
+  311:             default_runtime_id = excluded.default_runtime_id,
+  312:             default_load_config = excluded.default_load_config,
+  313:             metadata = excluded.metadata,
+  314:             deleted = excluded.deleted,
+  315:             last_seen_at = excluded.last_seen_at
+  316:     ";
+  317: 
+  318:     /// Insert or update a model by `key`. On conflict every stored field is
+  319:     /// refreshed (including `deleted`, so an upsert with `deleted = false`
+  320:     /// restores a soft-deleted row) while the row's `id` / `root_id` /
+  321:     /// `first_seen_at` are preserved.
+  322:     ///
+  323:     /// # Errors
+  324:     ///
+  325:     /// `InvalidRequest` on a uniqueness collision (e.g. the model UUID is
+  326:     /// already used by another row), `Internal` on storage/serialization
+  327:     /// failure.
+  328:     pub async fn upsert<'c, E>(exec: E, model: &Model) -> Result<()>
+  329:     where
+  330:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  331:     {
+  332:         let load_config = match &model.default_load_config {
+  333:             Some(cfg) => Some(to_json(cfg, "default_load_config")?),
+  334:             None => None,
+  335:         };
+  336:         let metadata = model
+  337:             .metadata
+  338:             .as_ref()
+  339:             .map(|m| to_json(m, "metadata"))
+  340:             .transpose()?;
+  341:         let seen_at = ts_string(now());
+  342:         sqlx::query(Self::UPSERT)
+  343:             .bind(&model.id)
+  344:             .bind(&model.key)
+  345:             .bind(&model.path)
+  346:             .bind(&model.display_name)
+  347:             .bind(wire_token(&model.artifact_kind))
+  348:             .bind(as_i64(model.size_bytes))
+  349:             .bind(ts_string(model.mtime))
+  350:             .bind(&model.default_runtime_id)
+  351:             .bind(load_config)
+  352:             .bind(metadata)
+  353:             .bind(model.deleted)
+  354:             .bind(&seen_at)
+  355:             .bind(&seen_at)
+  356:             .execute(exec)
+  357:             .await
+  358:             .map_err(|e| storage_error(&e, "upsert model"))?;
+  359:         Ok(())
+  360:     }
+  361: 
+  362:     /// Fetch one model by its readable `key`, regardless of `deleted`.
+  363:     ///
+  364:     /// # Errors
+  365:     ///
+  366:     /// `Internal` on a corrupt row or storage failure.
+  367:     pub async fn get_by_key<'c, E>(exec: E, key: &str) -> Result<Option<Model>>
+  368:     where
+  369:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  370:     {
+  371:         let row: Option<ModelRow> = sqlx::query_as(
+  372:             "SELECT id, key, path, display_name, artifact_kind, size_bytes, mtime, \
+  373:                  default_runtime_id, default_load_config, metadata, deleted \
+  374:              FROM models WHERE key = ?1",
+  375:         )
+  376:         .bind(key)
+  377:         .fetch_optional(exec)
+  378:         .await
+  379:         .map_err(|e| storage_error(&e, "get model"))?;
+  380:         row.map(model_from_row).transpose()
+  381:     }
+  382: 
+  383:     /// List models in `key` order.
+  384:     ///
+  385:     /// # Errors
+  386:     ///
+  387:     /// `Internal` on a corrupt row or storage failure.
+  388:     pub async fn list<'c, E>(exec: E, include_deleted: bool) -> Result<Vec<Model>>
+  389:     where
+  390:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  391:     {
+  392:         let sql = if include_deleted {
+  393:             "SELECT id, key, path, display_name, artifact_kind, size_bytes, mtime, \
+  394:              default_runtime_id, default_load_config, metadata, deleted \
+  395:              FROM models ORDER BY key"
+  396:         } else {
+  397:             "SELECT id, key, path, display_name, artifact_kind, size_bytes, mtime, \
+  398:              default_runtime_id, default_load_config, metadata, deleted \
+  399:              FROM models WHERE deleted = 0 ORDER BY key"
+  400:         };
+  401:         let rows: Vec<ModelRow> = sqlx::query_as(sql)
+  402:             .fetch_all(exec)
+  403:             .await
+  404:             .map_err(|e| storage_error(&e, "list models"))?;
+  405:         rows.into_iter().map(model_from_row).collect()
+  406:     }
+  407: 
+  408:     /// Soft-delete (`deleted = true`) or restore (`deleted = false`) a model
+  409:     /// by `key`. Returns `false` when no such model exists.
+  410:     ///
+  411:     /// # Errors
+  412:     ///
+  413:     /// `Internal` on storage failure.
+  414:     pub async fn set_deleted<'c, E>(exec: E, key: &str, deleted: bool) -> Result<bool>
+  415:     where
+  416:         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  417:     {
+  418:         let result =
+  419:             sqlx::query("UPDATE models SET deleted = ?2, last_seen_at = ?3 WHERE key = ?1")
+  420:                 .bind(key)
+  421:                 .bind(deleted)
+  422:                 .bind(ts_string(now()))
+  423:                 .execute(exec)
+  424:                 .await
+  425:                 .map_err(|e| storage_error(&e, "set model deleted"))?;
+  426:         Ok(result.rows_affected() > 0)
+  427:     }
+  428: }
+  429: 
+  430: #[derive(sqlx::FromRow)]
+  431: struct ModelRow {
+  432:     id: String,
+  433:     key: String,
+  434:     path: String,
+  435:     display_name: Option<String>,
+  436:     artifact_kind: String,
+  437:     size_bytes: i64,
+  438:     mtime: String,
+  439:     default_runtime_id: Option<String>,
+  440:     default_load_config: Option<String>,
+  441:     metadata: Option<String>,
+  442:     deleted: bool,
+  443: }
+  444: 
+  445: fn model_from_row(row: ModelRow) -> Result<Model> {
+  446:     Ok(Model {
+  447:         id: row.id,
+  448:         key: row.key,
+  449:         path: row.path,
+  450:         display_name: row.display_name,
+  451:         artifact_kind: parse_wire(&row.artifact_kind, "artifact_kind")?,
+  452:         size_bytes: from_i64::<u64>(row.size_bytes, "size_bytes")?,
+  453:         mtime: parse_ts(&row.mtime, "mtime")?,
+  454:         default_runtime_id: row.default_runtime_id,
+  455:         default_load_config: match row.default_load_config {
+  456:             Some(raw) => Some(from_json::<LoadConfig>(&raw, "default_load_config")?),
+  457:             None => None,
+  458:         },
+  459:         metadata: match row.metadata {
+  460:             Some(raw) => Some(from_json::<serde_json::Value>(&raw, "metadata")?),
+   30: //! - `PRAGMA journal_mode = WAL` (durable across reconnects, once set on the
+   31: //!   file);
+   32: //! - `PRAGMA foreign_keys = ON` (off by default in SQLite);
+   33: //! - `PRAGMA busy_timeout = 10 s` (WAL writers vs. readers).
+   34: //!
+   35: //! `journal_mode` cannot be switched inside a transaction, so it is applied
+   36: //! by the connect options, never in a migration file.
+   37: //!
+   38: //! # Migration policy
+   39: //!
+   40: //! Numbered `.sql` files under `migrations/`, applied by sqlx (`migrate()`).
+   41: //! **Append-only**: an older database upgrades by running the newer files;
+   42: //! shipped files are never edited, and `migrate()` on an already-current
+   43: //! database is a no-op. State columns are fenced by named `CHECK`
+   44: //! constraints holding the docs/api.md wire tokens, so a state outside the
+   45: //! domain state machines can never be stored even by out-of-band writes.
+   46: 
+   47: mod mapping;
+   48: pub mod repos;
+  120:             .busy_timeout(Duration::from_secs(BUSY_TIMEOUT_SECS));
+  121:         let pool = SqlitePoolOptions::new()
+  122:             .connect_with(options)
+  123:             .await
+  124:             .map_err(|e| storage_error(&e, "open sqlite database"))?;
+  125:         Ok(Self { pool })
+  126:     }
+  127: 
+  128:     /// Run the embedded `migrations/` against the database.
+  129:     ///
+  130:     /// Idempotent: already-applied migrations are a no-op, so `migrate()` is
+  131:     /// safe to call on every daemon start (append-only upgrade path).
+  132:     ///
+  133:     /// # Errors
+  134:     ///
+  135:     /// The domain `Internal` error code if a migration fails to apply.
+  136:     pub async fn migrate(&self) -> Result<()> {
+  137:         sqlx::migrate!().run(&self.pool).await.map_err(|e| {
+  138:             DomainError::with_message(ErrorCode::Internal, format!("run migrations: {e}"))
+  139:         })
+  140:     }
+  141: 
+  142:     /// The underlying pool (use as the repository executor for
+  143:     /// single-statement work).
+  144:     #[must_use]
+  145:     pub fn pool(&self) -> &SqlitePool {
+  146:         &self.pool
+  147:     }
+  148: 
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$p='"'crates/persistence/src/store.rs'; "'$lines=Get-Content $p; for($i=1;$i -le 120;$i++){('"'{0,5}: {1}' -f "'$i,$lines[$i-1])}; cargo test -p persistence stale_same_state_write_is_rejected_by_the_revision_guard -- --exact --nocapture' in D:\Workspace\model-serving
+ exited 1 in 426ms:
+    1: //! The pooled SQLite endpoint, PRAGMA enforcement, migration runner,
+    2: //! explicit transaction API and the 搂8 restart-recovery entry point.
+    3: 
+    4: use std::path::Path;
+    5: use std::time::Duration;
+    6: 
+    7: use model_serving_domain::error::{DomainError, ErrorCode, Result};
+    8: use model_serving_domain::model::{Instance, InstanceState};
+    9: use model_serving_domain::state_machine::transition_instance;
+   10: use sqlx::Row;
+   11: use sqlx::SqlitePool;
+   12: use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransaction};
+   13: 
+   14: use crate::mapping::{now, parse_wire, storage_error, ts_string, wire_token};
+   15: use crate::repos::{AuditEvent, AuditKind, AuditRepo, InstancesRepo};
+   16: 
+   17: /// The `busy_timeout` enforced on every connection, in seconds.
+   18: pub const BUSY_TIMEOUT_SECS: u64 = 10;
+   19: 
+   20: /// Ensure the on-disk database file is owner-only (`0600`), per
+   21: /// `docs/security-and-deployment.md` (the file holds credentials-adjacent
+   22: /// state and must not be group/world readable).
+   23: ///
+   24: /// If the file does not yet exist it is created owner-only up front (so the
+   25: /// first byte SQLite writes already lands in a `0600` file 鈥?no permissive
+   26: /// window); if it exists and is more permissive than `0600` (any group/other
+   27: /// bit set) it is tightened to `0600`. The `set_permissions` call is what makes
+   28: /// the result deterministic regardless of the process `umask`.
+   29: ///
+   30: /// Unix-only: on Windows the file-attribute model differs and this is a no-op.
+   31: ///
+   32: /// # Errors
+   33: ///
+   34: /// [`ErrorCode::Internal`] if the file cannot be stat-ed, created, or `chmod`-ed.
+   35: #[cfg(unix)]
+   36: fn secure_db_file(path: &Path) -> Result<()> {
+   37:     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+   38:     let meta = match std::fs::metadata(path) {
+   39:         Ok(meta) => meta,
+   40:         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+   41:             std::fs::OpenOptions::new()
+   42:                 .write(true)
+   43:                 .create(true)
+   44:                 // The file was just proven absent above; the open only ever
+   45:                 // creates a fresh empty file, so truncation is a no-op but
+   46:                 // stated explicitly (clippy wants the truncate behaviour
+   47:                 // spelled out when `create` is set).
+   48:                 .truncate(true)
+   49:                 .mode(0o600)
+   50:                 .open(path)
+   51:                 .map_err(|e| {
+   52:                     DomainError::with_message(
+   53:                         ErrorCode::Internal,
+   54:                         format!("create database file {}: {e}", path.display()),
+   55:                     )
+   56:                 })?;
+   57:             std::fs::metadata(path).map_err(|e| {
+   58:                 DomainError::with_message(
+   59:                     ErrorCode::Internal,
+   60:                     format!("stat database file {}: {e}", path.display()),
+   61:                 )
+   62:             })?
+   63:         }
+   64:         Err(e) => {
+   65:             return Err(DomainError::with_message(
+   66:                 ErrorCode::Internal,
+   67:                 format!("stat database file {}: {e}", path.display()),
+   68:             ));
+   69:         }
+   70:     };
+   71:     // Deterministically force owner-only (0600) regardless of umask.
+   72:     if meta.permissions().mode() & 0o777 != 0o600 {
+   73:         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+   74:             DomainError::with_message(
+   75:                 ErrorCode::Internal,
+   76:                 format!(
+   77:                     "set database file {} permissions to 0600: {e}",
+   78:                     path.display()
+   79:                 ),
+   80:             )
+   81:         })?;
+   82:     }
+   83:     Ok(())
+   84: }
+   85: 
+   86: /// A pooled SQLite connection with the mandatory PRAGMAs applied at connect
+   87: /// time: `journal_mode = WAL`, `foreign_keys = ON`,
+   88: /// `busy_timeout = 10 s` (policy in the crate docs).
+   89: ///
+   90: /// `SqliteStore` is the shared endpoint for a daemon process. Repositories
+   91: /// take an explicit `sqlx::Executor` (either `store.pool()` for
+   92: /// single-statement work or a handle from [`SqliteStore::transaction`] for
+   93: /// multi-table writes) so that `docs/architecture.md` 搂9 consistency writes
+   94: /// 鈥?operation + instance desired state + audit event 鈥?commit atomically.
+   95: ///
+   96: /// `SqliteStore` is `Sync`; clone the cheap pool, do not clone the store
+   97: /// between unrelated async tasks unless you intend to share the pool.
+   98: #[derive(Debug)]
+   99: pub struct SqliteStore {
+  100:     pool: SqlitePool,
+  101: }
+  102: 
+  103: impl SqliteStore {
+  104:     /// Open (creating the file if missing) the SQLite database at `path` and
+  105:     /// connect with `journal_mode = WAL`, `foreign_keys = ON` and a
+  106:     /// 10-second `busy_timeout` on every pool connection.
+  107:     ///
+  108:     /// # Errors
+  109:     ///
+  110:     /// The domain `Internal` error code if the database cannot be opened.
+  111:     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+  112:         let path = path.as_ref();
+  113:         #[cfg(unix)]
+  114:         secure_db_file(path)?;
+  115:         let options = SqliteConnectOptions::new()
+  116:             .filename(path)
+  117:             .create_if_missing(true)
+  118:             .journal_mode(SqliteJournalMode::Wal)
+  119:             .foreign_keys(true)
+  120:             .busy_timeout(Duration::from_secs(BUSY_TIMEOUT_SECS));
+error: package ID specification `persistence` did not match any packages
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+I found one release-blocking regression outside the CAS logic: the new Unix `.truncate(true)` turns the metadata/open gap into a data-loss race if another process creates the DB in between. I’m confirming the focused test under the crate’s actual package name and checking severity/evidence before the verdict.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'Get-Content crates/persistence/Cargo.toml | Select-Object -First 20; cargo test -p model-serving-persistence stale_same_state_write_is_rejected_by_the_revision_guard -- --exact --nocapture; cargo clippy -p model-serving-persistence --all-targets -- -D warnings' in D:\Workspace\model-serving
+ succeeded in 5648ms:
+[package]
+name = "model-serving-persistence"
+edition = "2024"
+description = "SQLite repositories, migrations and event/audit persistence"
+
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+model-serving-domain = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+# Only used by the `test-support` feature (test fixture helpers for other crates).
+tempfile = { workspace = true, optional = true }
+
+[features]
+# Expose `test_support` (temp-dir SQLite fixture) to dependent crates.
+   Compiling model-serving-persistence v0.1.0 (D:\Workspace\model-serving\crates\persistence)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.96s
+     Running unittests src\lib.rs (target\debug\deps\model_serving_persistence-e587a5085dd666e2.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+    Checking model-serving-persistence v0.1.0 (D:\Workspace\model-serving\crates\persistence)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.04s
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'cargo test -p model-serving-persistence stale_same_state_write_is_rejected_by_the_revision_guard -- --nocapture; git blame -L 35,60 crates/persistence/src/store.rs; git blame -L 105,136 crates/persistence/migrations/0001_initial.sql; git blame -L 1247,1317 crates/persistence/src/tests.rs' in D:\Workspace\model-serving
+ succeeded in 603ms:
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.37s
+     Running unittests src\lib.rs (target\debug\deps\model_serving_persistence-e587a5085dd666e2.exe)
+
+running 1 test
+test tests::stale_same_state_write_is_rejected_by_the_revision_guard ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 0.03s
+
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 35) #[cfg(unix)]
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 36) fn secure_db_file(path: &Path) -> Result<()> {
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 37)     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 38)     let meta = match std::fs::metadata(path) {
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 39)         Ok(meta) => meta,
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 40)         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 41)             std::fs::OpenOptions::new()
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 42)                 .write(true)
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 43)                 .create(true)
+92091131 (space             2026-09-16 14:56:43 +0800 44)                 // The file was just proven absent above; the open only ever
+92091131 (space             2026-09-16 14:56:43 +0800 45)                 // creates a fresh empty file, so truncation is a no-op but
+92091131 (space             2026-09-16 14:56:43 +0800 46)                 // stated explicitly (clippy wants the truncate behaviour
+92091131 (space             2026-09-16 14:56:43 +0800 47)                 // spelled out when `create` is set).
+92091131 (space             2026-09-16 14:56:43 +0800 48)                 .truncate(true)
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 49)                 .mode(0o600)
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 50)                 .open(path)
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 51)                 .map_err(|e| {
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 52)                     DomainError::with_message(
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 53)                         ErrorCode::Internal,
+92091131 (space             2026-09-16 14:56:43 +0800 54)                         format!("create database file {}: {e}", path.display()),
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 55)                     )
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 56)                 })?;
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 57)             std::fs::metadata(path).map_err(|e| {
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 58)                 DomainError::with_message(
+9e88c6b3 (model-serving dev 2026-09-16 14:17:57 +0800 59)                     ErrorCode::Internal,
+92091131 (space             2026-09-16 14:56:43 +0800 60)                     format!("stat database file {}: {e}", path.display()),
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 105)     last_used_at    TEXT,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 106)     active_requests INTEGER NOT NULL DEFAULT 0 CHECK (active_requests >= 0),
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 107)     health          TEXT,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 108)     failure         TEXT,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 109)     created_at      TEXT NOT NULL,
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 110)     updated_at      TEXT NOT NULL,
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 111)     revision        INTEGER NOT NULL DEFAULT 0
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 112) );
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 113) CREATE INDEX idx_instances_model ON instances (model_id);
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 114) CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 115) -- Partial index serving the docs/architecture.md §8 restart-recovery query.
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 116) CREATE INDEX idx_instances_state_nonterminal
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 117)     ON instances (state)
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 118)     WHERE state IN ('queued', 'loading', 'ready', 'draining', 'unloading');
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 119) 
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 120) -- Load / unload / rescan operations (docs/architecture.md §3 "Operation").
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 121) -- `error` is the structured `OperationError` JSON; `result` the structured
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 122) -- result payload JSON (docs/api.md §5).
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 123) CREATE TABLE operations (
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 124)     operation_id TEXT PRIMARY KEY,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 125)     kind         TEXT NOT NULL CHECK (kind IN ('load', 'unload', 'rescan')),
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 126)     state        TEXT NOT NULL
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 127)         CONSTRAINT operation_state_valid
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 128)         CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 129)     instance_id  TEXT REFERENCES instances (instance_id) ON DELETE SET NULL,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 130)     model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 131)     created_at   TEXT NOT NULL,
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 132)     updated_at   TEXT NOT NULL,
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 133)     revision     INTEGER NOT NULL DEFAULT 0,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 134)     finished_at  TEXT,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 135)     error        TEXT,
+1d430307 (model-serving dev 2026-09-16 11:36:09 +0800 136)     result       TEXT
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1247) // P1 (codex rounds 3+4): a state-only compare-and-set has an ABA hole
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1248) // because the instance machine has legal cycles (ready -> draining ->
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1249) // ready). The guard therefore also pins the monotonic `revision` counter
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1250) // (bumped as `revision = revision + 1` on every guarded write, so a cycled
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1251) // row can never present a stale writer with the same (state, revision)
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1252) // pair): a writer that validated a stale pair must affect 0 rows even when
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1253) // the state has cycled back to the same token, while a CAS pinned at the
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1254) // current revision still applies (positive control).
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1255) #[tokio::test]
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1256) async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1257)     let fixture = Fixture::new().await.expect("fixture");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1258)     let store = &fixture.store;
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1259)     let pool = store.pool();
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1260) 
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1261)     seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1262)     let stale_revision: i64 =
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1263)         sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1264)             .fetch_one(pool)
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1265)             .await
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1266)             .expect("read the seeded revision");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1267) 
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1268)     // A concurrent writer legally cycles the row: ready -> draining -> ready.
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1269)     InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1270)         .await
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1271)         .expect("legal ready -> draining");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1272)     InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1273)         .await
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1274)         .expect("legal draining -> ready");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1275) 
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1276)     // The stale writer's update: `state` matches (ready) but the revision is
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1277)     // stale, so the double guard must reject it (0 rows affected).
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1278)     let rejected = sqlx::query(
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1279)         "UPDATE instances SET active_requests = 99 \
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1280)          WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1281)     )
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1282)     .bind(stale_revision)
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1283)     .execute(pool)
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1284)     .await
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1285)     .expect("stale guarded update runs");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1286)     assert_eq!(
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1287)         rejected.rows_affected(),
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1288)         0,
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1289)         "the state+revision guard must reject the ABA write"
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1290)     );
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1291) 
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1292)     // Positive control: a CAS pinned at the CURRENT revision still applies.
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1293)     let fresh_revision: i64 =
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1294)         sqlx::query_scalar("SELECT revision FROM instances WHERE instance_id = 'i-aba'")
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1295)             .fetch_one(pool)
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1296)             .await
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1297)             .expect("read the current revision");
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1298)     let applied = sqlx::query(
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1299)         "UPDATE instances SET active_requests = 99, revision = revision + 1 \
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1300)          WHERE instance_id = 'i-aba' AND state = 'ready' AND revision = ?1",
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1301)     )
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1302)     .bind(fresh_revision)
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1303)     .execute(pool)
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1304)     .await
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1305)     .expect("fresh guarded update runs");
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1306)     assert_eq!(
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1307)         applied.rows_affected(),
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1308)         1,
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1309)         "a CAS on the current revision must apply"
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1310)     );
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1311)     let after = InstancesRepo::get(pool, "i-aba")
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1312)         .await
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1313)         .expect("get")
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1314)         .expect("row");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1315)     assert_eq!(after.state(), InstanceState::Ready);
+7a3cfa18 (model-serving dev 2026-09-16 14:47:49 +0800 1316)     assert_eq!(after.active_requests, 99, "only the fresh write may land");
+5c90603c (model-serving dev 2026-09-16 14:37:02 +0800 1317) }
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+VERDICT: NEEDS-FIXES
+
+- **P1 – database truncation race introduced by `9209113`:** [`store.rs:38`](D:/Workspace/model-serving/crates/persistence/src/store.rs:38) checks for absence separately from the `.truncate(true)` open at [`store.rs:41`](D:/Workspace/model-serving/crates/persistence/src/store.rs:41). Another process can create or restore the database between those operations, after which this process truncates it. Use atomic `create_new(true)` and handle `AlreadyExists` by re-statting, without truncation.
+
+- **CAS coverage: confirmed.** New rows begin at revision 0 ([`0001_initial.sql:111`](D:/Workspace/model-serving/crates/persistence/migrations/0001_initial.sql:111), [`0001_initial.sql:133`](D:/Workspace/model-serving/crates/persistence/migrations/0001_initial.sql:133)); first-seen upsert inserts rather than overwrites ([`repos.rs:855`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:855)). Existing upsert, `write_state`, `advance`, and recovery all guard on the selected `(state, revision)`, increment revision atomically, and reject zero affected rows ([`repos.rs:890`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:890), [`repos.rs:992`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:992), [`repos.rs:1333`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:1333), [`store.rs:200`](D:/Workspace/model-serving/crates/persistence/src/store.rs:200), [`store.rs:237`](D:/Workspace/model-serving/crates/persistence/src/store.rs:237)). No remaining ABA race found in these paths.
+
+- **ABA test: sound.** It captures the initial revision, performs the legal two-transition cycle through repository code, verifies the stale CAS affects zero rows, then reads the current revision and proves a fresh CAS affects exactly one row and persists its payload ([`tests.rs:1261`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1261), [`tests.rs:1278`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1278), [`tests.rs:1292`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1292), [`tests.rs:1311`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1311)). Focused test passes.
+
+- No other P1/P2 found in `7a3cfa1` or the path-formatting changes in `9209113`.
+hook: Stop
+hook: Stop Completed
+tokens used
+51,965
+VERDICT: NEEDS-FIXES
+
+- **P1 – database truncation race introduced by `9209113`:** [`store.rs:38`](D:/Workspace/model-serving/crates/persistence/src/store.rs:38) checks for absence separately from the `.truncate(true)` open at [`store.rs:41`](D:/Workspace/model-serving/crates/persistence/src/store.rs:41). Another process can create or restore the database between those operations, after which this process truncates it. Use atomic `create_new(true)` and handle `AlreadyExists` by re-statting, without truncation.
+
+- **CAS coverage: confirmed.** New rows begin at revision 0 ([`0001_initial.sql:111`](D:/Workspace/model-serving/crates/persistence/migrations/0001_initial.sql:111), [`0001_initial.sql:133`](D:/Workspace/model-serving/crates/persistence/migrations/0001_initial.sql:133)); first-seen upsert inserts rather than overwrites ([`repos.rs:855`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:855)). Existing upsert, `write_state`, `advance`, and recovery all guard on the selected `(state, revision)`, increment revision atomically, and reject zero affected rows ([`repos.rs:890`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:890), [`repos.rs:992`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:992), [`repos.rs:1333`](D:/Workspace/model-serving/crates/persistence/src/repos.rs:1333), [`store.rs:200`](D:/Workspace/model-serving/crates/persistence/src/store.rs:200), [`store.rs:237`](D:/Workspace/model-serving/crates/persistence/src/store.rs:237)). No remaining ABA race found in these paths.
+
+- **ABA test: sound.** It captures the initial revision, performs the legal two-transition cycle through repository code, verifies the stale CAS affects zero rows, then reads the current revision and proves a fresh CAS affects exactly one row and persists its payload ([`tests.rs:1261`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1261), [`tests.rs:1278`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1278), [`tests.rs:1292`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1292), [`tests.rs:1311`](D:/Workspace/model-serving/crates/persistence/src/tests.rs:1311)). Focused test passes.
+
+- No other P1/P2 found in `7a3cfa1` or the path-formatting changes in `9209113`.

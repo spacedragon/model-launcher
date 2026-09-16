@@ -1,0 +1,311 @@
+Reading prompt from stdin...
+OpenAI Codex v0.151.0
+--------
+workdir: D:\Workspace\model-serving
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a0a909-26ba-7401-8568-b55ef64bf9e4
+--------
+user
+Round 6 (closing) review, job 3 (persistence crate) of model-serving. Your round-5 verdict was NEEDS-FIXES on exactly one P1: secure_db_file (crates/persistence/src/store.rs) used create(true)+truncate(true) after a separate absence stat, so a database file created or restored concurrently could be truncated.
+
+Fix in commit f6c1f20 (branch job/3-persistence, now HEAD): the create branch now uses atomic std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) (O_EXCL, never truncates). A lost create race surfaces ErrorKind::AlreadyExists and simply falls through to the re-stat below; any other open error is returned as Internal. The existing post-stat chmod-to-0600 logic is unchanged, so a concurrently created file still ends up owner-only. Gates green on both toolchains (fmt, clippy -D warnings, full cargo test --workspace on Windows and WSL Ubuntu).
+
+Please confirm the P1 is closed by f6c1f20 (or name the concrete remaining issue). Output: VERDICT: APPROVE / NEEDS-FIXES, then per-point findings with file:line evidence.
+
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+2026-09-16T07:05:49.384305Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+codex
+I’ll inspect the exact commit diff and surrounding `secure_db_file` control flow, then verify the race and permissions behavior from the code.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git status --short; git rev-parse --verify HEAD; git show --stat --oneline --decorate --no-renames f6c1f20; git show --no-ext-diff --unified=80 --no-renames f6c1f20 -- crates/persistence/src/store.rs' in D:\Workspace\model-serving
+ succeeded in 100ms:
+?? fixlist_job3.md
+?? review_job3.md
+?? review_job3_out.txt
+?? review_job3_prompt.txt
+?? review_job3_r2_out.txt
+?? review_job3_r2_prompt.txt
+?? review_job3_r3_out.txt
+?? review_job3_r3_prompt.txt
+?? review_job3_r4_out.txt
+?? review_job3_r4_prompt.txt
+?? review_job3_r5_out.txt
+?? review_job3_r5_prompt.txt
+?? review_job3_r6_out.txt
+?? review_job3_r6_prompt.txt
+f6c1f204babfd74d37427dbe32a2ac0bb5020e3a
+f6c1f20 (HEAD -> job/3-persistence) fix(persistence): atomic O_EXCL db-file create closes truncate race (codex r5)
+ crates/persistence/src/store.rs | 26 +++++++++++++++-----------
+ 1 file changed, 15 insertions(+), 11 deletions(-)
+commit f6c1f204babfd74d37427dbe32a2ac0bb5020e3a
+Author: space <dev@local>
+Date:   Wed Sep 16 15:05:37 2026 +0800
+
+    fix(persistence): atomic O_EXCL db-file create closes truncate race (codex r5)
+    
+    codex round 5: the create(true)+truncate(true) open could truncate a
+    database file created or restored concurrently between the absence stat
+    and the open. create_new(true) is atomic (O_EXCL) and never truncates;
+    losing the create race just re-stats the existing file (whose mode the
+    subsequent chmod 0600 still enforces).
+
+diff --git a/crates/persistence/src/store.rs b/crates/persistence/src/store.rs
+index a8b7607..34b3dda 100644
+--- a/crates/persistence/src/store.rs
++++ b/crates/persistence/src/store.rs
+@@ -1,136 +1,140 @@
+ //! The pooled SQLite endpoint, PRAGMA enforcement, migration runner,
+ //! explicit transaction API and the §8 restart-recovery entry point.
+ 
+ use std::path::Path;
+ use std::time::Duration;
+ 
+ use model_serving_domain::error::{DomainError, ErrorCode, Result};
+ use model_serving_domain::model::{Instance, InstanceState};
+ use model_serving_domain::state_machine::transition_instance;
+ use sqlx::Row;
+ use sqlx::SqlitePool;
+ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransaction};
+ 
+ use crate::mapping::{now, parse_wire, storage_error, ts_string, wire_token};
+ use crate::repos::{AuditEvent, AuditKind, AuditRepo, InstancesRepo};
+ 
+ /// The `busy_timeout` enforced on every connection, in seconds.
+ pub const BUSY_TIMEOUT_SECS: u64 = 10;
+ 
+ /// Ensure the on-disk database file is owner-only (`0600`), per
+ /// `docs/security-and-deployment.md` (the file holds credentials-adjacent
+ /// state and must not be group/world readable).
+ ///
+ /// If the file does not yet exist it is created owner-only up front (so the
+ /// first byte SQLite writes already lands in a `0600` file — no permissive
+ /// window); if it exists and is more permissive than `0600` (any group/other
+ /// bit set) it is tightened to `0600`. The `set_permissions` call is what makes
+ /// the result deterministic regardless of the process `umask`.
+ ///
+ /// Unix-only: on Windows the file-attribute model differs and this is a no-op.
+ ///
+ /// # Errors
+ ///
+ /// [`ErrorCode::Internal`] if the file cannot be stat-ed, created, or `chmod`-ed.
+ #[cfg(unix)]
+ fn secure_db_file(path: &Path) -> Result<()> {
+     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+     let meta = match std::fs::metadata(path) {
+         Ok(meta) => meta,
+         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+-            std::fs::OpenOptions::new()
++            // Atomic create (`O_EXCL`): never truncate, so a file that
++            // appears concurrently (another process creating or restoring
++            // the database between the stat above and this open) can never
++            // be destroyed. Losing the create race just means the file now
++            // exists and falls through to the re-stat below.
++            match std::fs::OpenOptions::new()
+                 .write(true)
+-                .create(true)
+-                // The file was just proven absent above; the open only ever
+-                // creates a fresh empty file, so truncation is a no-op but
+-                // stated explicitly (clippy wants the truncate behaviour
+-                // spelled out when `create` is set).
+-                .truncate(true)
++                .create_new(true)
+                 .mode(0o600)
+                 .open(path)
+-                .map_err(|e| {
+-                    DomainError::with_message(
++            {
++                Ok(_) => {}
++                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
++                Err(e) => {
++                    return Err(DomainError::with_message(
+                         ErrorCode::Internal,
+                         format!("create database file {}: {e}", path.display()),
+-                    )
+-                })?;
++                    ));
++                }
++            }
+             std::fs::metadata(path).map_err(|e| {
+                 DomainError::with_message(
+                     ErrorCode::Internal,
+                     format!("stat database file {}: {e}", path.display()),
+                 )
+             })?
+         }
+         Err(e) => {
+             return Err(DomainError::with_message(
+                 ErrorCode::Internal,
+                 format!("stat database file {}: {e}", path.display()),
+             ));
+         }
+     };
+     // Deterministically force owner-only (0600) regardless of umask.
+     if meta.permissions().mode() & 0o777 != 0o600 {
+         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+             DomainError::with_message(
+                 ErrorCode::Internal,
+                 format!(
+                     "set database file {} permissions to 0600: {e}",
+                     path.display()
+                 ),
+             )
+         })?;
+     }
+     Ok(())
+ }
+ 
+ /// A pooled SQLite connection with the mandatory PRAGMAs applied at connect
+ /// time: `journal_mode = WAL`, `foreign_keys = ON`,
+ /// `busy_timeout = 10 s` (policy in the crate docs).
+ ///
+ /// `SqliteStore` is the shared endpoint for a daemon process. Repositories
+ /// take an explicit `sqlx::Executor` (either `store.pool()` for
+ /// single-statement work or a handle from [`SqliteStore::transaction`] for
+ /// multi-table writes) so that `docs/architecture.md` §9 consistency writes
+ /// — operation + instance desired state + audit event — commit atomically.
+ ///
+ /// `SqliteStore` is `Sync`; clone the cheap pool, do not clone the store
+ /// between unrelated async tasks unless you intend to share the pool.
+ #[derive(Debug)]
+ pub struct SqliteStore {
+     pool: SqlitePool,
+ }
+ 
+ impl SqliteStore {
+     /// Open (creating the file if missing) the SQLite database at `path` and
+     /// connect with `journal_mode = WAL`, `foreign_keys = ON` and a
+     /// 10-second `busy_timeout` on every pool connection.
+     ///
+     /// # Errors
+     ///
+     /// The domain `Internal` error code if the database cannot be opened.
+     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+         let path = path.as_ref();
+         #[cfg(unix)]
+         secure_db_file(path)?;
+         let options = SqliteConnectOptions::new()
+             .filename(path)
+             .create_if_missing(true)
+             .journal_mode(SqliteJournalMode::Wal)
+             .foreign_keys(true)
+             .busy_timeout(Duration::from_secs(BUSY_TIMEOUT_SECS));
+         let pool = SqlitePoolOptions::new()
+             .connect_with(options)
+             .await
+             .map_err(|e| storage_error(&e, "open sqlite database"))?;
+         Ok(Self { pool })
+     }
+ 
+     /// Run the embedded `migrations/` against the database.
+     ///
+     /// Idempotent: already-applied migrations are a no-op, so `migrate()` is
+     /// safe to call on every daemon start (append-only upgrade path).
+     ///
+     /// # Errors
+     ///
+     /// The domain `Internal` error code if a migration fails to apply.
+     pub async fn migrate(&self) -> Result<()> {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+The critical path matches the proposed fix: the absent-file branch now performs an exclusive create and treats only `AlreadyExists` as a lost race before re-statting. I’m checking precise line references and whether any operation in that branch can still truncate an existing inode.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '$n=0; Get-Content crates/persistence/src/store.rs | ForEach-Object { $n++; if ($n -ge 20 -and $n -le 82) { '"'{0,4}: {1}' -f "'$n, $_ } }; rg -n "secure_db_file|create_new|truncate'"\\(\" crates/persistence/src tests crates -g '*.rs'" in D:\Workspace\model-serving
+ exited 1 in 111ms:
+  20: /// Ensure the on-disk database file is owner-only (`0600`), per
+  21: /// `docs/security-and-deployment.md` (the file holds credentials-adjacent
+  22: /// state and must not be group/world readable).
+  23: ///
+  24: /// If the file does not yet exist it is created owner-only up front (so the
+  25: /// first byte SQLite writes already lands in a `0600` file 鈥?no permissive
+  26: /// window); if it exists and is more permissive than `0600` (any group/other
+  27: /// bit set) it is tightened to `0600`. The `set_permissions` call is what makes
+  28: /// the result deterministic regardless of the process `umask`.
+  29: ///
+  30: /// Unix-only: on Windows the file-attribute model differs and this is a no-op.
+  31: ///
+  32: /// # Errors
+  33: ///
+  34: /// [`ErrorCode::Internal`] if the file cannot be stat-ed, created, or `chmod`-ed.
+  35: #[cfg(unix)]
+  36: fn secure_db_file(path: &Path) -> Result<()> {
+  37:     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+  38:     let meta = match std::fs::metadata(path) {
+  39:         Ok(meta) => meta,
+  40:         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+  41:             // Atomic create (`O_EXCL`): never truncate, so a file that
+  42:             // appears concurrently (another process creating or restoring
+  43:             // the database between the stat above and this open) can never
+  44:             // be destroyed. Losing the create race just means the file now
+  45:             // exists and falls through to the re-stat below.
+  46:             match std::fs::OpenOptions::new()
+  47:                 .write(true)
+  48:                 .create_new(true)
+  49:                 .mode(0o600)
+  50:                 .open(path)
+  51:             {
+  52:                 Ok(_) => {}
+  53:                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+  54:                 Err(e) => {
+  55:                     return Err(DomainError::with_message(
+  56:                         ErrorCode::Internal,
+  57:                         format!("create database file {}: {e}", path.display()),
+  58:                     ));
+  59:                 }
+  60:             }
+  61:             std::fs::metadata(path).map_err(|e| {
+  62:                 DomainError::with_message(
+  63:                     ErrorCode::Internal,
+  64:                     format!("stat database file {}: {e}", path.display()),
+  65:                 )
+  66:             })?
+  67:         }
+  68:         Err(e) => {
+  69:             return Err(DomainError::with_message(
+  70:                 ErrorCode::Internal,
+  71:                 format!("stat database file {}: {e}", path.display()),
+  72:             ));
+  73:         }
+  74:     };
+  75:     // Deterministically force owner-only (0600) regardless of umask.
+  76:     if meta.permissions().mode() & 0o777 != 0o600 {
+  77:         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+  78:             DomainError::with_message(
+  79:                 ErrorCode::Internal,
+  80:                 format!(
+  81:                     "set database file {} permissions to 0600: {e}",
+  82:                     path.display()
+rg: tests: 系统找不到指定的文件。 (os error 2)
+crates/persistence/src\store.rs:36:fn secure_db_file(path: &Path) -> Result<()> {
+crates/persistence/src\store.rs:48:                .create_new(true)
+crates/persistence/src\store.rs:118:        secure_db_file(path)?;
+crates\persistence\src\store.rs:36:fn secure_db_file(path: &Path) -> Result<()> {
+crates\persistence\src\store.rs:48:                .create_new(true)
+crates\persistence\src\store.rs:118:        secure_db_file(path)?;
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+VERDICT: APPROVE
+
+- P1 closed — [store.rs:46](D:/Workspace/model-serving/crates/persistence/src/store.rs:46): `create_new(true)` performs atomic exclusive creation without truncation. `AlreadyExists` is handled as a lost race at line 53, followed by re-stat at line 61. The resulting file is enforced to mode `0600` at lines 76–77. No concrete remaining issue found.
+hook: Stop
+hook: Stop Completed
+tokens used
+8,259
+VERDICT: APPROVE
+
+- P1 closed — [store.rs:46](D:/Workspace/model-serving/crates/persistence/src/store.rs:46): `create_new(true)` performs atomic exclusive creation without truncation. `AlreadyExists` is handled as a lost race at line 53, followed by re-stat at line 61. The resulting file is enforced to mode `0600` at lines 76–77. No concrete remaining issue found.

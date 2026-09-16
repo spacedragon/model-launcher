@@ -1,0 +1,17 @@
+- **P1** — `crates/persistence/src/repos.rs:696`, `crates/persistence/src/repos.rs:783`, `crates/persistence/src/repos.rs:1076`: repository writes do not validate transitions against the persisted current state. `upsert`, `write_state`, and `advance` can overwrite a row with any vocabulary-valid state, including `failed → ready` or `succeeded → running`; DB `CHECK`s only validate tokens. Fetch and parse the current state inside the same transaction, invoke the frozen state machine, then perform a guarded `UPDATE ... WHERE state = ?`, returning `InvalidStateTransition` on mismatch.
+
+- **P1** — `crates/persistence/src/mapping.rs:148`: non-state `CHECK` failures—such as invalid ports, negative sizes, or invalid booleans—map to `Internal`, contrary to the required mapping of ordinary constraint failures to `InvalidRequest`. Reserve `InvalidStateTransition` for the three named state fences and map every other SQLite constraint violation, including unnamed `CHECK`s, to `InvalidRequest`; add a test for a non-state `CHECK`.
+
+- **P1** — `crates/persistence/src/repos.rs:828`, `crates/persistence/src/repos.rs:1123`: list filters interpolate caller-controlled IDs using Rust debug formatting instead of SQL parameters. An ID containing `"` can break or alter the SQL expression. Replace this construction with `sqlx::QueryBuilder` and bound parameters for every filter.
+
+- **P1** — `crates/persistence/src/store.rs:43`: `SqliteStore::open` creates the database without enforcing the user-only permissions required by `docs/security-and-deployment.md`. On Unix/WSL, securely create or validate the file as mode `0600` and reject or repair an existing overly permissive file; add a Unix-gated permission test.
+
+- **P1** — `crates/persistence/src/repos.rs:959`: corrupt or out-of-range `pid` and `port` values are silently converted to `None` through `.ok()`, violating the requirement that undecodable rows surface `Internal`. Propagate `from_i64` with `map(...).transpose()?` and test a corrupt numeric row.
+
+- **P2** — `crates/persistence/src/repos.rs:524`, `crates/persistence/src/tests.rs:433`: ordinary runtime upserts overwrite `last_probe_ok` and `last_probed_at`; the purported preservation test clones and resubmits those same values, so its assertion is true by construction. Preserve probe columns during runtime CRUD and expose a separate probe-result update, then test a CRUD update that supplies no probe data.
+
+- **P2** — `crates/persistence/src/tests.rs:223`: the per-connection PRAGMA test acquires and drops connections sequentially, allowing the pool to return the same connection all three times. Hold several acquisitions concurrently before checking each connection.
+
+- **P2** — `crates/persistence/src/tests.rs:261`: the WAL reopen test uses `SqliteStore::open`, which reapplies `journal_mode(WAL)`, so it does not prove WAL persisted across reopening. Close the original store, reopen with plain SQLite options that do not request WAL, and assert `PRAGMA journal_mode = wal`.
+
+Validation: 18 persistence tests were found and `cargo fmt --check` passed. Fresh Clippy and test runs could not complete because the read-only execution environment denied Cargo’s build lock and temporary-directory creation.

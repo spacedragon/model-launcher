@@ -1,0 +1,1833 @@
+OpenAI Codex v0.151.0
+--------
+workdir: D:\Workspace\model-serving
+model: gpt-5.6-sol
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: medium
+reasoning summaries: none
+session id: 01a0a8ef-0ed9-77f0-a083-3f864c3cfc67
+--------
+user
+Round 4 (final) review, job 3 (persistence crate) of model-serving. Your round-3 verdict was NEEDS-FIXES on exactly one point: the state-only CAS in the instance state guards has an ABA race (a legal ready -> draining -> ready cycle leaves `state` unchanged, so a stale `UPDATE ... WHERE state='ready'` can overwrite newer data).
+
+That is fixed in commit 5c90603 on branch job/3-persistence:
+- validate_state (crates/persistence/src/repos.rs) now selects (state, updated_at) and returns both; same-state writes remain legal no-op data updates (round-3 item 1, which you confirmed SOUND).
+- Every guarded state write now guards on BOTH columns: instances upsert (`WHERE instance_id = ? AND state = ? AND updated_at = ?`), instances write_state, operations advance. operations gained an `updated_at TEXT NOT NULL` revision column (migration 0001_initial.sql; set on create, bumped on advance).
+- Restart recovery (crates/persistence/src/store.rs recover_non_terminal_instances) re-reads (state, updated_at) INSIDE its transaction (the pool scan predates it), validates via the frozen transition_instance, and guards the UPDATE on state + updated_at.
+- New regression test stale_same_state_write_is_rejected_by_the_revision_guard: seeds a ready instance, captures its updated_at, drives a legal ready->draining->ready cycle, then proves a raw state+stale-revision CAS affects 0 rows.
+Gates green: fmt --check, clippy -D warnings 0, cargo test --workspace (Windows), WSL cargo test -p model-serving-persistence 25 passed.
+
+REPO: \wsl.localhost\Ubuntu\home\space\code\model-serving (branch job/3-persistence, commit 5c90603). Paths: crates/persistence/src/{repos,store,mapping,tests}.rs, migrations/0001_initial.sql, frozen crates/domain/src/{state_machine,error}.rs.
+
+Please: (1) confirm the ABA fix is complete for every state-write path (including restart recovery and the first-seen insert path), or name the concrete remaining race; (2) check the new test actually proves what it claims; (3) any NEW P1/P2 in 5c90603.
+Output: VERDICT: APPROVE / NEEDS-FIXES, then short per-point findings with file:line evidence.
+
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+I’ll inspect the target commit and its parent diff, then trace every guarded state mutation and the regression test. I’ll keep the review strictly to correctness/P1–P2 issues.
+hook: PreToolUse
+2026-09-16T06:37:23.736785Z ERROR codex_core::tools::router: error=exec_command failed for `"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git status --short --branch; git rev-parse HEAD; git show --stat --oneline --decorate 5c90603; git diff 5c90603''^ 5c90603 -- crates/persistence/src/repos.rs crates/persistence/src/store.rs crates/persistence/src/mapping.rs crates/persistence/src/tests.rs migrations/0001_initial.sql'`: CreateProcess { message: "Rejected(\"Failed to create unified exec process: 目录名称无效。 (os error 267)\")" }
+hook: PreToolUse Completed
+codex
+The shell cannot use the WSL UNC path as its working directory, so I’m switching to WSL-native commands against `/home/space/code/model-serving`; no repository changes are needed.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "wsl.exe -d Ubuntu --cd /home/space/code/model-serving -- bash -lc \"git status --short --branch && git rev-parse HEAD && git show --stat --oneline --decorate 5c90603 && git diff '5c90603"'^'"' 5c90603 -- crates/persistence/src/repos.rs crates/persistence/src/store.rs crates/persistence/src/mapping.rs crates/persistence/src/tests.rs migrations/0001_initial.sql\"" in D:\Workspace\model-serving
+ exited 1 in 144ms:
+<3>WSL (466485 - Relay) ERROR: CreateProcessCommon:810: chdir(/home/space/code/model-serving) failed 2
+fatal: not a git repository (or any of the parent directories): .git
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'wsl.exe -d Ubuntu -- bash -lc "pwd; ls -la /home; ls -la /home/space; find /home/space -maxdepth 3 -type d -name model-serving 2>/dev/null | head"' in D:\Workspace\model-serving
+ succeeded in 126ms:
+/mnt/d/Workspace/model-serving
+total 16
+drwxr-xr-x  4 root  root  4096 May 17 12:19 .
+drwxr-xr-x 19 root  root  4096 Sep 13 09:41 ..
+drwxr-x--- 31 draco draco 4096 Sep 15 21:54 draco
+drwxr-xr-x  3 root  root  4096 May 17 12:19 linuxbrew
+ls: cannot access '/home/space': No such file or directory
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'wsl.exe -d Ubuntu -- bash -lc "find /home/draco -maxdepth 4 -type d -name model-serving 2>/dev/null | head -20; git -C /mnt/d/Workspace/model-serving status --short --branch; git -C /mnt/d/Workspace/model-serving rev-parse HEAD"' in D:\Workspace\model-serving
+ succeeded in 778ms:
+/home/draco/Workspace/model-serving
+## job/3-persistence
+ M docs/jobs.md
+?? fixlist_job3.md
+?? review_job3.md
+?? review_job3_out.txt
+?? review_job3_prompt.txt
+?? review_job3_r2_out.txt
+?? review_job3_r2_prompt.txt
+?? review_job3_r3_out.txt
+?? review_job3_r3_prompt.txt
+?? review_job3_r4_out.txt
+?? review_job3_r4_prompt.txt
+5c90603c8718ae2e36fdb5c8a75fa9624d5f20e1
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "wsl.exe -d Ubuntu -- bash -lc \"git -C /home/draco/Workspace/model-serving status --short --branch; git -C /home/draco/Workspace/model-serving rev-parse HEAD; git -C /home/draco/Workspace/model-serving show --stat --oneline --decorate 5c90603; git -C /home/draco/Workspace/model-serving diff '5c90603"'^'"' 5c90603 -- crates/persistence/src/repos.rs crates/persistence/src/store.rs crates/persistence/src/mapping.rs crates/persistence/src/tests.rs migrations/0001_initial.sql\"" in D:\Workspace\model-serving
+ exited 1 in 125ms:
+fatal: not a git repository (or any of the parent directories): .git
+fatal: not a git repository (or any of the parent directories): .git
+fatal: not a git repository (or any of the parent directories): .git
+warning: Not a git repository. Use --no-index to compare two paths outside a working tree
+usage: git diff --no-index [<options>] <path> <path>
+
+Diff output format options
+    -p, --patch           generate patch
+    -s, --no-patch        suppress diff output
+    -u                    generate patch
+    -U, --unified[=<n>]   generate diffs with <n> lines context
+    -W, --function-context
+                          generate diffs with <n> lines context
+    --raw                 generate the diff in raw format
+    --patch-with-raw      synonym for '-p --raw'
+    --patch-with-stat     synonym for '-p --stat'
+    --numstat             machine friendly --stat
+    --shortstat           output only the last line of --stat
+    -X, --dirstat[=<param1,param2>...]
+                          output the distribution of relative amount of changes for each sub-directory
+    --cumulative          synonym for --dirstat=cumulative
+    --dirstat-by-file[=<param1,param2>...]
+                          synonym for --dirstat=files,param1,param2...
+    --check               warn if changes introduce conflict markers or whitespace errors
+    --summary             condensed summary such as creations, renames and mode changes
+    --name-only           show only names of changed files
+    --name-status         show only names and status of changed files
+    --stat[=<width>[,<name-width>[,<count>]]]
+                          generate diffstat
+    --stat-width <width>  generate diffstat with a given width
+    --stat-name-width <width>
+                          generate diffstat with a given name width
+    --stat-graph-width <width>
+                          generate diffstat with a given graph width
+    --stat-count <count>  generate diffstat with limited lines
+    --compact-summary     generate compact summary in diffstat
+    --binary              output a binary diff that can be applied
+    --full-index          show full pre- and post-image object names on the "index" lines
+    --color[=<when>]      show colored diff
+    --ws-error-highlight <kind>
+                          highlight whitespace errors in the 'context', 'old' or 'new' lines in the diff
+    -z                    do not munge pathnames and use NULs as output field terminators in --raw or --numstat
+    --abbrev[=<n>]        use <n> digits to display object names
+    --src-prefix <prefix>
+                          show the given source prefix instead of "a/"
+    --dst-prefix <prefix>
+                          show the given destination prefix instead of "b/"
+    --line-prefix <prefix>
+                          prepend an additional prefix to every line of output
+    --no-prefix           do not show any source or destination prefix
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    --output-indicator-new <char>
+                          specify the character to indicate a new line instead of '+'
+    --output-indicator-old <char>
+                          specify the character to indicate an old line instead of '-'
+    --output-indicator-context <char>
+                          specify the character to indicate a context instead of ' '
+
+Diff rename options
+    -B, --break-rewrites[=<n>[/<m>]]
+                          break complete rewrite changes into pairs of delete and create
+    -M, --find-renames[=<n>]
+                          detect renames
+    -D, --irreversible-delete
+                          omit the preimage for deletes
+    -C, --find-copies[=<n>]
+                          detect copies
+    --find-copies-harder  use unmodified files as source to find copies
+    --no-renames          disable rename detection
+    --rename-empty        use empty blobs as rename source
+    --follow              continue listing the history of a file beyond renames
+    -l <n>                prevent rename/copy detection if the number of rename/copy targets exceeds given limit
+
+Diff algorithm options
+    --minimal             produce the smallest possible diff
+    -w, --ignore-all-space
+                          ignore whitespace when comparing lines
+    -b, --ignore-space-change
+                          ignore changes in amount of whitespace
+    --ignore-space-at-eol
+                          ignore changes in whitespace at EOL
+    --ignore-cr-at-eol    ignore carrier-return at the end of line
+    --ignore-blank-lines  ignore changes whose lines are all blank
+    -I, --ignore-matching-lines <regex>
+                          ignore changes whose all lines match <regex>
+    --indent-heuristic    heuristic to shift diff hunk boundaries for easy reading
+    --patience            generate diff using the "patience diff" algorithm
+    --histogram           generate diff using the "histogram diff" algorithm
+    --diff-algorithm <algorithm>
+                          choose a diff algorithm
+    --anchored <text>     generate diff using the "anchored diff" algorithm
+    --word-diff[=<mode>]  show word diff, using <mode> to delimit changed words
+    --word-diff-regex <regex>
+                          use <regex> to decide what a word is
+    --color-words[=<regex>]
+                          equivalent to --word-diff=color --word-diff-regex=<regex>
+    --color-moved[=<mode>]
+                          moved lines of code are colored differently
+    --color-moved-ws <mode>
+                          how white spaces are ignored in --color-moved
+
+Other diff options
+    --relative[=<prefix>]
+                          when run from subdir, exclude changes outside and show relative paths
+    -a, --text            treat all files as text
+    -R                    swap two inputs, reverse the diff
+    --exit-code           exit with 1 if there were differences, 0 otherwise
+    --quiet               disable all output of the program
+    --ext-diff            allow an external diff helper to be executed
+    --textconv            run external text conversion filters when comparing binary files
+    --ignore-submodules[=<when>]
+                          ignore changes to submodules in the diff generation
+    --submodule[=<format>]
+                          specify how differences in submodules are shown
+    --ita-invisible-in-index
+                          hide 'git add -N' entries from the index
+    --ita-visible-in-index
+                          treat 'git add -N' entries as real in the index
+    -S <string>           look for differences that change the number of occurrences of the specified string
+    -G <regex>            look for differences that change the number of occurrences of the specified regex
+    --pickaxe-all         show all changes in the changeset with -S or -G
+    --pickaxe-regex       treat <string> in -S as extended POSIX regular expression
+    -O <file>             control the order in which files appear in the output
+    --rotate-to <path>    show the change in the specified path first
+    --skip-to <path>      skip the output to the specified path
+    --find-object <object-id>
+                          look for differences that change the number of occurrences of the specified object
+    --diff-filter [(A|C|D|M|R|T|U|X|B)...[*]]
+                          select files by diff type
+    --output <file>       Output to a specific file
+
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command 'git show --stat --oneline --decorate 5c90603; git diff "5c90603''^" 5c90603 -- crates/persistence/src/repos.rs crates/persistence/src/store.rs crates/persistence/src/mapping.rs crates/persistence/src/tests.rs migrations/0001_initial.sql' in D:\Workspace\model-serving
+ succeeded in 67ms:
+5c90603 (HEAD -> job/3-persistence) fix(persistence): close ABA hole in state guards via updated_at revision
+ crates/persistence/migrations/0001_initial.sql |  1 +
+ crates/persistence/src/repos.rs                | 80 +++++++++++++++-----------
+ crates/persistence/src/store.rs                | 57 ++++++++++++++----
+ crates/persistence/src/tests.rs                | 52 +++++++++++++++++
+ 4 files changed, 144 insertions(+), 46 deletions(-)
+diff --git a/crates/persistence/src/repos.rs b/crates/persistence/src/repos.rs
+index 7024079..21f1021 100644
+--- a/crates/persistence/src/repos.rs
++++ b/crates/persistence/src/repos.rs
+@@ -26,6 +26,7 @@ use model_serving_domain::model::{
+ use model_serving_domain::state_machine::{transition_instance, transition_operation};
+ use serde::{Deserialize, Serialize};
+ use sqlx::QueryBuilder;
++use sqlx::Row;
+ use sqlx::Sqlite;
+ 
+ use crate::mapping::{
+@@ -66,17 +67,18 @@ enum OperationFilter {
+ /// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
+ /// as `Internal`.
+ ///
+-/// Returns the **current** state when the row exists, or `None` for a
+-/// first-seen row (no prior state, so a legal initial state may be written and
+-/// no transition check applies). Callers then issue a write guarded on the
+-/// returned state (`UPDATE ... WHERE <state_col> = <returned>`) and must check
+-/// `rows_affected`: the guarded update is a compare-and-set, so a row that
+-/// moved concurrently affects 0 rows and the write is rejected, even though
+-/// the SELECT and the UPDATE are separate statements (a transaction is not
+-/// required for the guard to be safe). Callers pass a re-usable executor (a
+-/// pool handle, `Copy`); on a transaction connection a non-`Copy` executor
+-/// cannot be used twice, so the caller performs the single guarded `UPDATE`
+-/// inline (the transaction's own read supplies `expected`).
++/// Returns the **current** state plus its `updated_at` revision when the row
++/// exists, or `None` for a first-seen row (no prior state, so a legal initial
++/// state may be written and no transition check applies). Callers then issue
++/// a write guarded on BOTH the returned state and revision
++/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
++/// revision>`) and must check `rows_affected`: the guarded update is a
++/// compare-and-set, so a row that moved concurrently affects 0 rows and the
++/// write is rejected, even though the SELECT and the UPDATE are separate
++/// statements (a transaction is not required for the guard to be safe).
++/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
++/// concurrent legal `ready -> draining -> ready` cycle leaves `state`
++/// unchanged but bumps `updated_at`, so a stale write is still rejected.
+ async fn validate_state<'c, E, S>(
+     exec: E,
+     table: &str,
+@@ -84,32 +86,37 @@ async fn validate_state<'c, E, S>(
+     key: &str,
+     to: S,
+     transition: fn(S, S) -> Result<S>,
+-) -> Result<Option<S>>
++) -> Result<Option<(S, String)>>
+ where
+     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+ {
+-    let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
+-    let current: Option<String> = sqlx::query_scalar(&sql)
++    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
++    let row = sqlx::query(&sql)
+         .bind(key)
+         .fetch_optional(exec)
+         .await
+         .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
+-    match current {
+-        None => Ok(None),
+-        Some(raw) => {
+-            let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+-            if current != to {
+-                transition(current, to)?;
+-            }
+-            Ok(Some(current))
+-        }
++    let Some(row) = row else {
++        return Ok(None);
++    };
++    let raw = row.try_get::<String, _>(0).map_err(|e| {
++        DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
++    })?;
++    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
++        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
++    })?;
++    let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
++    if current != to {
++        transition(current, to)?;
+     }
++    Ok(Some((current, updated_at)))
+ }
+ 
+ /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+-/// guard validated the state, so a row that vanished or moved in the interim
+-/// means the update raced the state machine.
++/// guard validated the state and revision, so a row that vanished or moved in
++/// the interim (including a same-state ABA cycle) means the update raced a
++/// concurrent writer.
+ #[track_caller]
+ fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+     if rows_affected == 0 {
+@@ -873,7 +880,7 @@ impl InstancesRepo {
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+             }
+-            Some(expected_state) => {
++            Some((expected_state, expected_revised)) => {
+                 // Existing row: guarded update (`desired_state` preserved).
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+@@ -882,7 +889,7 @@ impl InstancesRepo {
+                          state = ?, pid = ?, port = ?, device_ids = ?,
+                          started_at = ?, last_used_at = ?, active_requests = ?,
+                          health = ?, failure = ?, updated_at = ?
+-                     WHERE instance_id = ? AND state = ?",
++                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
+                 )
+                 .bind(&instance.model_id)
+                 .bind(&instance.runtime_id)
+@@ -899,6 +906,7 @@ impl InstancesRepo {
+                 .bind(&at_str)
+                 .bind(&instance.instance_id)
+                 .bind(&expected_token)
++                .bind(&expected_revised)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "upsert instance"))?;
+@@ -976,17 +984,18 @@ impl InstancesRepo {
+         )
+         .await?;
+         let state_token = wire_token(&state);
+-        if let Some(expected_state) = expected {
++        if let Some((expected_state, expected_revised)) = expected {
+             let expected_token = wire_token(&expected_state);
+             let result = sqlx::query(
+                 "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+-                 WHERE instance_id = ?1 AND state = ?5",
++                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
+             )
+             .bind(instance_id)
+             .bind(&state_token)
+             .bind(&failure_json)
+             .bind(ts_string(updated_at))
+             .bind(&expected_token)
++            .bind(&expected_revised)
+             .execute(exec)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+@@ -1257,8 +1266,8 @@ impl OperationsRepo {
+         sqlx::query(
+             "INSERT INTO operations (
+                 operation_id, kind, state, instance_id, model_id,
+-                created_at, finished_at, error, result
+-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
++                created_at, updated_at, finished_at, error, result
++             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         )
+         .bind(&operation.operation_id)
+         .bind(wire_token(&operation.kind))
+@@ -1266,6 +1275,7 @@ impl OperationsRepo {
+         .bind(&operation.instance_id)
+         .bind(&operation.model_id)
+         .bind(ts_string(created))
++        .bind(ts_string(created))
+         .bind(operation.finished_at.map(ts_string))
+         .bind(error_json)
+         .bind(result_json)
+@@ -1314,18 +1324,20 @@ impl OperationsRepo {
+         let finished_at = operation.finished_at.map(ts_string);
+         match expected {
+             None => Ok(false),
+-            Some(expected_state) => {
++            Some((expected_state, expected_revised)) => {
+                 let expected_token = wire_token(&expected_state);
+                 let result = sqlx::query(
+-                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
+-                     WHERE operation_id = ?1 AND state = ?6",
++                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
++                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
+                 )
+                 .bind(&operation.operation_id)
+                 .bind(&to_token)
+                 .bind(finished_at)
+                 .bind(error_json)
+                 .bind(result_json)
++                .bind(ts_string(now()))
+                 .bind(&expected_token)
++                .bind(&expected_revised)
+                 .execute(exec)
+                 .await
+                 .map_err(|e| storage_error(&e, "advance operation"))?;
+diff --git a/crates/persistence/src/store.rs b/crates/persistence/src/store.rs
+index 9fa914c..74b7c00 100644
+--- a/crates/persistence/src/store.rs
++++ b/crates/persistence/src/store.rs
+@@ -7,10 +7,11 @@ use std::time::Duration;
+ use model_serving_domain::error::{DomainError, ErrorCode, Result};
+ use model_serving_domain::model::{Instance, InstanceState};
+ use model_serving_domain::state_machine::transition_instance;
++use sqlx::Row;
+ use sqlx::SqlitePool;
+ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransaction};
+ 
+-use crate::mapping::{now, storage_error, ts_string, wire_token};
++use crate::mapping::{now, parse_wire, storage_error, ts_string, wire_token};
+ use crate::repos::{AuditEvent, AuditKind, AuditRepo, InstancesRepo};
+ 
+ /// The `busy_timeout` enforced on every connection, in seconds.
+@@ -179,29 +180,61 @@ impl SqliteStore {
+         let at = now();
+         let mut tx = self.transaction().await?;
+         for found in &stale {
+-            // Validate the move through the frozen domain state machine (never
+-            // a raw write). The expected `from` is the state just read, so the
+-            // guarded update below needs no re-SELECT on the transaction
+-            // connection (`&mut SqliteConnection` is not `Copy`, so the
+-            // two-query repository guard cannot run in a transaction).
+-            transition_instance(found.state(), InstanceState::Crashed).map_err(|_| {
++            // Re-read the row inside the transaction: the pool-based scan
++            // above predates it, and a legal `ready -> draining -> ready`
++            // cycle could have moved the row and back. Validate the move
++            // through the frozen domain state machine (never a raw write)
++            // against this fresh state, then guard the update on BOTH the
++            // state and the `updated_at` revision so a same-state ABA
++            // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
++            // so the two-query repository guard cannot run in a transaction;
++            // sequential re-borrows of the transaction do the same job).
++            let current =
++                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
++                    .bind(found.instance_id())
++                    .fetch_optional(&mut *tx)
++                    .await
++                    .map_err(|e| storage_error(&e, "read instance state"))?;
++            let Some(current) = current else {
++                return Err(DomainError::with_message(
++                    ErrorCode::Internal,
++                    format!(
++                        "instance {} vanished before recovery applied",
++                        found.instance_id()
++                    ),
++                ));
++            };
++            let raw_state = current.try_get::<String, _>(0).map_err(|e| {
++                DomainError::with_message(
++                    ErrorCode::Internal,
++                    format!("read instance {} state: {e}", found.instance_id()),
++                )
++            })?;
++            let revised = current.try_get::<String, _>(1).map_err(|e| {
++                DomainError::with_message(
++                    ErrorCode::Internal,
++                    format!("read instance {} updated_at: {e}", found.instance_id()),
++                )
++            })?;
++            let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
++            transition_instance(current_state, InstanceState::Crashed).map_err(|_| {
+                 DomainError::with_message(
+                     ErrorCode::InvalidStateTransition,
+                     format!(
+-                        "instance {} in {:?} cannot legally reach crashed",
+-                        found.instance_id(),
+-                        found.state()
++                        "instance {} in {current_state:?} cannot legally reach crashed",
++                        found.instance_id()
+                     ),
+                 )
+             })?;
+             let result = sqlx::query(
+                 "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+-                 WHERE instance_id = ?1 AND state = ?4",
++                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
+             )
+             .bind(found.instance_id())
+             .bind(wire_token(&InstanceState::Crashed))
+             .bind(ts_string(at))
+-            .bind(wire_token(&found.state()))
++            .bind(wire_token(&current_state))
++            .bind(&revised)
+             .execute(&mut *tx)
+             .await
+             .map_err(|e| storage_error(&e, "write instance state"))?;
+diff --git a/crates/persistence/src/tests.rs b/crates/persistence/src/tests.rs
+index 7527791..6ac40fb 100644
+--- a/crates/persistence/src/tests.rs
++++ b/crates/persistence/src/tests.rs
+@@ -1244,6 +1244,58 @@ async fn same_state_writes_are_idempotent_data_updates() {
+     );
+ }
+ 
++// P1 (codex round 3): a state-only compare-and-set has an ABA hole because
++// the instance machine has legal cycles (ready -> draining -> ready). The
++// guard therefore also pins the `updated_at` revision: a writer that
++// validated a stale (state, updated_at) pair must affect 0 rows even when
++// the state has cycled back to the same token.
++#[tokio::test]
++async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
++    let fixture = Fixture::new().await.expect("fixture");
++    let store = &fixture.store;
++    let pool = store.pool();
++
++    seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
++    let stale_revised: String =
++        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
++            .fetch_one(pool)
++            .await
++            .expect("read the seeded revision");
++
++    // A concurrent writer legally cycles the row: ready -> draining -> ready.
++    InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
++        .await
++        .expect("legal ready -> draining");
++    InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
++        .await
++        .expect("legal draining -> ready");
++
++    // The stale writer's update: `state` matches (ready) but the revision is
++    // stale, so the double guard must reject it (0 rows affected).
++    let rejected = sqlx::query(
++        "UPDATE instances SET active_requests = 99 \
++         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
++    )
++    .bind(&stale_revised)
++    .execute(pool)
++    .await
++    .expect("stale guarded update runs");
++    assert_eq!(
++        rejected.rows_affected(),
++        0,
++        "the state+updated_at guard must reject the ABA write"
++    );
++    let after = InstancesRepo::get(pool, "i-aba")
++        .await
++        .expect("get")
++        .expect("row");
++    assert_eq!(after.state(), InstanceState::Ready);
++    assert_ne!(
++        after.active_requests, 99,
++        "the stale write must not have landed"
++    );
++}
++
+ // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+ // InvalidRequest, not InvalidStateTransition (state fences only) and not
+ // Internal. The state fence names are the only ones that map to
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n --glob '*.rs' --glob '*.sql' \"(UPDATE|INSERT INTO|ON CONFLICT|state =|SET state|updated_at)\" crates/persistence/src crates/persistence/migrations; rg -n \"validate_state|write_state|advance\\(|recover_non_terminal|InstancesRepo::upsert|OperationsRepo::create\" crates/persistence/src" in D:\Workspace\model-serving
+ succeeded in 58ms:
+crates/persistence/migrations\0001_initial.sql:15:--   * timestamps are RFC 3339 UTC TEXT (`created_at`, `updated_at`, `mtime`,
+crates/persistence/migrations\0001_initial.sql:31:    updated_at       TEXT NOT NULL
+crates/persistence/migrations\0001_initial.sql:110:    updated_at      TEXT NOT NULL
+crates/persistence/migrations\0001_initial.sql:131:    updated_at   TEXT NOT NULL,
+crates/persistence/src\mapping.rs:31:/// Current UTC time for `updated_at` / `created_at` / audit rows.
+crates/persistence/src\store.rs:188:            // state and the `updated_at` revision so a same-state ABA
+crates/persistence/src\store.rs:193:                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
+crates/persistence/src\store.rs:207:            let raw_state = current.try_get::<String, _>(0).map_err(|e| {
+crates/persistence/src\store.rs:216:                    format!("read instance {} updated_at: {e}", found.instance_id()),
+crates/persistence/src\store.rs:219:            let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+crates/persistence/src\store.rs:230:                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+crates/persistence/src\store.rs:231:                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
+crates/persistence/src\tests.rs:568:    let by_state = InstancesRepo::list(
+crates/persistence/src\tests.rs:591:    let err = sqlx::query("UPDATE instances SET state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:603:    let err = sqlx::query("UPDATE instances SET desired_state = 'sideways' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:757:    let err = sqlx::query("UPDATE operations SET state = 'exploded' WHERE operation_id = ?1")
+crates/persistence/src\tests.rs:1050:            updated_at: setting.updated_at,
+crates/persistence/src\tests.rs:1063:    sqlx::query("UPDATE instances SET load_config = 'not json' WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:1249:// guard therefore also pins the `updated_at` revision: a writer that
+crates/persistence/src\tests.rs:1250:// validated a stale (state, updated_at) pair must affect 0 rows even when
+crates/persistence/src\tests.rs:1260:        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
+crates/persistence/src\tests.rs:1276:        "UPDATE instances SET active_requests = 99 \
+crates/persistence/src\tests.rs:1277:         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
+crates/persistence/src\tests.rs:1286:        "the state+updated_at guard must reject the ABA write"
+crates/persistence/src\tests.rs:1309:    let err = sqlx::query("UPDATE instances SET port = ?2 WHERE instance_id = ?1")
+crates/persistence/src\tests.rs:1403:    sqlx::query("UPDATE instances SET pid = ?2 WHERE instance_id = ?1")
+crates/persistence/src\repos.rs:70:/// Returns the **current** state plus its `updated_at` revision when the row
+crates/persistence/src\repos.rs:74:/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
+crates/persistence/src\repos.rs:77:/// write is rejected, even though the SELECT and the UPDATE are separate
+crates/persistence/src\repos.rs:79:/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
+crates/persistence/src\repos.rs:81:/// unchanged but bumps `updated_at`, so a stale write is still rejected.
+crates/persistence/src\repos.rs:94:    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
+crates/persistence/src\repos.rs:106:    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
+crates/persistence/src\repos.rs:107:        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
+crates/persistence/src\repos.rs:113:    Ok(Some((current, updated_at)))
+crates/persistence/src\repos.rs:297:        INSERT INTO models (
+crates/persistence/src\repos.rs:302:        ON CONFLICT (key) DO UPDATE SET
+crates/persistence/src\repos.rs:416:            sqlx::query("UPDATE models SET deleted = ?2, last_seen_at = ?3 WHERE key = ?1")
+crates/persistence/src\repos.rs:470:        INSERT INTO model_roots (id, path, enabled, last_scan_at, last_scan_result, created_at)
+crates/persistence/src\repos.rs:472:        ON CONFLICT (id) DO UPDATE SET
+crates/persistence/src\repos.rs:623:        INSERT INTO runtimes (
+crates/persistence/src\repos.rs:626:        ON CONFLICT (id) DO UPDATE SET
+crates/persistence/src\repos.rs:679:        sqlx::query("UPDATE runtimes SET last_probe_ok = ?1, last_probed_at = ?2 WHERE id = ?3")
+crates/persistence/src\repos.rs:856:                    "INSERT INTO instances (
+crates/persistence/src\repos.rs:860:                        created_at, updated_at
+crates/persistence/src\repos.rs:887:                    "UPDATE instances SET
+crates/persistence/src\repos.rs:889:                         state = ?, pid = ?, port = ?, device_ids = ?,
+crates/persistence/src\repos.rs:891:                         health = ?, failure = ?, updated_at = ?
+crates/persistence/src\repos.rs:892:                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
+crates/persistence/src\repos.rs:942:            "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+crates/persistence/src\repos.rs:954:    /// structured failure and the `updated_at` stamp). The move is validated
+crates/persistence/src\repos.rs:968:        updated_at: DateTime<Utc>,
+crates/persistence/src\repos.rs:990:                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+crates/persistence/src\repos.rs:991:                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
+crates/persistence/src\repos.rs:996:            .bind(ts_string(updated_at))
+crates/persistence/src\repos.rs:1066:                    builder.push("state = ");
+crates/persistence/src\repos.rs:1182:    let state = parse_wire::<InstanceState>(&row.state, "state")?;
+crates/persistence/src\repos.rs:1267:            "INSERT INTO operations (
+crates/persistence/src\repos.rs:1269:                created_at, updated_at, finished_at, error, result
+crates/persistence/src\repos.rs:1330:                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
+crates/persistence/src\repos.rs:1331:                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
+crates/persistence/src\repos.rs:1409:                    builder.push("state = ");
+crates/persistence/src\repos.rs:1486:    let state = parse_wire::<OperationState>(&row.state, "state")?;
+crates/persistence/src\repos.rs:1541:            "INSERT INTO audit_events \
+crates/persistence/src\repos.rs:1650:    pub updated_at: DateTime<Utc>,
+crates/persistence/src\repos.rs:1668:            "INSERT INTO settings (key, value, restart_required, updated_at)
+crates/persistence/src\repos.rs:1670:             ON CONFLICT (key) DO UPDATE SET
+crates/persistence/src\repos.rs:1673:                updated_at = excluded.updated_at",
+crates/persistence/src\repos.rs:1712:            "SELECT key, value, restart_required, updated_at FROM settings ORDER BY key",
+crates/persistence/src\repos.rs:1723:                    updated_at: parse_ts(&r.updated_at, "updated_at")?,
+crates/persistence/src\repos.rs:1735:    updated_at: String,
+crates/persistence/src\lib.rs:16://!   (`recover_non_terminal_instances`).
+crates/persistence/src\tests.rs:167:    OperationsRepo::create(&mut *connection, operation)
+crates/persistence/src\tests.rs:211:    InstancesRepo::upsert(store.pool(), &instance)
+crates/persistence/src\tests.rs:538:    InstancesRepo::upsert(pool, &ready)
+crates/persistence/src\tests.rs:615:async fn write_state_with_failure_round_trips() {
+crates/persistence/src\tests.rs:626:    InstancesRepo::write_state(
+crates/persistence/src\tests.rs:647:        "write_state must not touch the stored desired state"
+crates/persistence/src\tests.rs:662:    let err = InstancesRepo::upsert(pool, &orphan)
+crates/persistence/src\tests.rs:670:    let err = OperationsRepo::create(pool, &operation)
+crates/persistence/src\tests.rs:677:async fn operation_round_trip_and_terminal_advance() {
+crates/persistence/src\tests.rs:686:    OperationsRepo::create(pool, &operation)
+crates/persistence/src\tests.rs:707:        OperationsRepo::advance(pool, &running)
+crates/persistence/src\tests.rs:720:        OperationsRepo::advance(pool, &failed)
+crates/persistence/src\tests.rs:753:    OperationsRepo::create(pool, &operation)
+crates/persistence/src\tests.rs:897:        InstancesRepo::upsert(store.pool(), &instance)
+crates/persistence/src\tests.rs:905:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:913:        .recover_non_terminal_instances()
+crates/persistence/src\tests.rs:1099:        OperationsRepo::create(pool, &operation)
+crates/persistence/src\tests.rs:1111:// InvalidStateTransition AND leave the row unchanged (write_state, upsert,
+crates/persistence/src\tests.rs:1119:    // --- instances: write_state ---
+crates/persistence/src\tests.rs:1121:    InstancesRepo::write_state(pool, "i-ws", InstanceState::Draining, &None, ts(T2))
+crates/persistence/src\tests.rs:1124:    let err = InstancesRepo::write_state(pool, "i-ws", InstanceState::Queued, &None, ts(T2))
+crates/persistence/src\tests.rs:1141:    let err = InstancesRepo::upsert(pool, &queued)
+crates/persistence/src\tests.rs:1158:    OperationsRepo::create(pool, &queued_op)
+crates/persistence/src\tests.rs:1166:        OperationsRepo::advance(pool, &running)
+crates/persistence/src\tests.rs:1175:        OperationsRepo::advance(pool, &succeeded)
+crates/persistence/src\tests.rs:1185:    let err = OperationsRepo::advance(pool, &back_to_running)
+crates/persistence/src\tests.rs:1203:// persisted; write_state of the same state is likewise a legal no-op move.
+crates/persistence/src\tests.rs:1218:    InstancesRepo::upsert(pool, &updated)
+crates/persistence/src\tests.rs:1232:    // write_state of the same state is a legal no-op move (e.g. recording a
+crates/persistence/src\tests.rs:1234:    InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
+crates/persistence/src\tests.rs:1236:        .expect("same-state write_state must be accepted");
+crates/persistence/src\tests.rs:1266:    InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
+crates/persistence/src\tests.rs:1269:    InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
+crates/persistence/src\repos.rs:82:async fn validate_state<'c, E, S>(
+crates/persistence/src\repos.rs:816:    /// `validate_state`).
+crates/persistence/src\repos.rs:822:        let expected = validate_state(
+crates/persistence/src\repos.rs:963:    pub async fn write_state<'c, E>(
+crates/persistence/src\repos.rs:977:        let expected = validate_state(
+crates/persistence/src\repos.rs:1304:        let expected = validate_state(
+crates/persistence/src\store.rs:175:    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+The state-write inventory is small and fully identifiable: instance insert/update, instance `write_state`, operation create/advance, and restart recovery. I’m now checking whether `updated_at` is a true revision (guaranteed to change per mutation), because guarding on it only closes ABA if tokens cannot be reused.
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "wsl.exe -d Ubuntu -- bash -lc \"cd /mnt/d/Workspace/model-serving && nl -ba crates/persistence/src/repos.rs | sed -n '800,1020p;1250,1350p' && nl -ba crates/persistence/src/store.rs | sed -n '145,260p' && nl -ba crates/persistence/src/tests.rs | sed -n '120,225p;1190,1305p' && nl -ba crates/persistence/migrations/0001_initial.sql | sed -n '85,145p' && nl -ba crates/persistence/src/mapping.rs | sed -n '1,70p'\"" in D:\Workspace\model-serving
+ succeeded in 196ms:
+   800	    /// the instance's current state; on update the stored `desired_state` is
+   801	    /// preserved (drive it explicitly via [`Self::set_desired_state`]).
+   802	    ///
+   803	    /// The write is guarded against the persisted state: on an existing row
+   804	    /// the row's current state is validated through the domain state machine
+   805	    /// before the (guarded) update, so an illegal move such as `failed -> ready`
+   806	    /// is rejected and the row left unchanged (`docs/architecture.md` §8).
+   807	    ///
+   808	    /// # Errors
+   809	    ///
+   810	    /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+   811	    /// `InvalidStateTransition` for an illegal state transition or a row that
+   812	    /// raced the guard, `Internal` otherwise. A same-state upsert is an
+   813	    /// idempotent *data* update (pid/health/progress while the lifecycle state
+   814	    /// is unchanged) and is always legal: the frozen machine defines no
+   815	    /// self-loops, so same-state writes skip the transition check (see
+   816	    /// `validate_state`).
+   817	    pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
+   818	    where
+   819	        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+   820	    {
+   821	        let to = instance.state();
+   822	        let expected = validate_state(
+   823	            exec,
+   824	            "instances",
+   825	            "instance_id",
+   826	            &instance.instance_id,
+   827	            to,
+   828	            transition_instance,
+   829	        )
+   830	        .await?;
+   831	        let to_token = wire_token(&to);
+   832	        let load_config = to_json(&instance.load_config, "load_config")?;
+   833	        let device_ids = to_json(&instance.device_ids, "device_ids")?;
+   834	        let health = instance
+   835	            .health
+   836	            .as_ref()
+   837	            .map(|h| to_json(h, "health"))
+   838	            .transpose()?;
+   839	        let failure = instance
+   840	            .failure
+   841	            .as_ref()
+   842	            .map(|f| to_json(f, "failure"))
+   843	            .transpose()?;
+   844	        let at = now();
+   845	        let at_str = ts_string(at);
+   846	        let pid = instance.pid.map(u64::from).map(as_i64);
+   847	        let port = instance.port.map(i32::from);
+   848	        let started_at = instance.started_at.map(ts_string);
+   849	        let last_used_at = instance.last_used_at.map(ts_string);
+   850	        let active_requests = i64::from(instance.active_requests);
+   851	
+   852	        match expected {
+   853	            None => {
+   854	                // First-seen row: insert with `desired_state` = state.
+   855	                sqlx::query(
+   856	                    "INSERT INTO instances (
+   857	                        instance_id, model_id, runtime_id, load_config,
+   858	                        state, desired_state, pid, port, device_ids,
+   859	                        started_at, last_used_at, active_requests, health, failure,
+   860	                        created_at, updated_at
+   861	                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+   862	                )
+   863	                .bind(&instance.instance_id)
+   864	                .bind(&instance.model_id)
+   865	                .bind(&instance.runtime_id)
+   866	                .bind(&load_config)
+   867	                .bind(&to_token)
+   868	                .bind(&to_token)
+   869	                .bind(pid)
+   870	                .bind(port)
+   871	                .bind(&device_ids)
+   872	                .bind(started_at)
+   873	                .bind(last_used_at)
+   874	                .bind(active_requests)
+   875	                .bind(health)
+   876	                .bind(failure)
+   877	                .bind(&at_str)
+   878	                .bind(&at_str)
+   879	                .execute(exec)
+   880	                .await
+   881	                .map_err(|e| storage_error(&e, "upsert instance"))?;
+   882	            }
+   883	            Some((expected_state, expected_revised)) => {
+   884	                // Existing row: guarded update (`desired_state` preserved).
+   885	                let expected_token = wire_token(&expected_state);
+   886	                let result = sqlx::query(
+   887	                    "UPDATE instances SET
+   888	                         model_id = ?, runtime_id = ?, load_config = ?,
+   889	                         state = ?, pid = ?, port = ?, device_ids = ?,
+   890	                         started_at = ?, last_used_at = ?, active_requests = ?,
+   891	                         health = ?, failure = ?, updated_at = ?
+   892	                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
+   893	                )
+   894	                .bind(&instance.model_id)
+   895	                .bind(&instance.runtime_id)
+   896	                .bind(&load_config)
+   897	                .bind(&to_token)
+   898	                .bind(pid)
+   899	                .bind(port)
+   900	                .bind(&device_ids)
+   901	                .bind(started_at)
+   902	                .bind(last_used_at)
+   903	                .bind(active_requests)
+   904	                .bind(health)
+   905	                .bind(failure)
+   906	                .bind(&at_str)
+   907	                .bind(&instance.instance_id)
+   908	                .bind(&expected_token)
+   909	                .bind(&expected_revised)
+   910	                .execute(exec)
+   911	                .await
+   912	                .map_err(|e| storage_error(&e, "upsert instance"))?;
+   913	                require_state_write(
+   914	                    result.rows_affected(),
+   915	                    &format!("instance {}", instance.instance_id),
+   916	                )?;
+   917	            }
+   918	        }
+   919	        Ok(())
+   920	    }
+   921	
+   922	    /// Drive an instance's `desired_state` (written together with the
+   923	    /// triggering operation + audit event in one transaction —
+   924	    /// `docs/architecture.md` §9). `desired_state` is the target an in-flight
+   925	    /// operation drives the instance toward, so it is fenced only by the
+   926	    /// schema's `instance_desired_state_valid` vocabulary `CHECK` (not by the
+   927	    /// lifecycle state machine, which fences the *actual* `state` column).
+   928	    ///
+   929	    /// # Errors
+   930	    ///
+   931	    /// `InvalidStateTransition` for a token outside the state vocabulary,
+   932	    /// `Internal` otherwise.
+   933	    pub async fn set_desired_state<'c, E>(
+   934	        exec: E,
+   935	        instance_id: &str,
+   936	        desired: InstanceState,
+   937	    ) -> Result<()>
+   938	    where
+   939	        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+   940	    {
+   941	        sqlx::query(
+   942	            "UPDATE instances SET desired_state = ?2, updated_at = ?3 WHERE instance_id = ?1",
+   943	        )
+   944	        .bind(instance_id)
+   945	        .bind(wire_token(&desired))
+   946	        .bind(ts_string(now()))
+   947	        .execute(exec)
+   948	        .await
+   949	        .map_err(|e| storage_error(&e, "set instance desired state"))?;
+   950	        Ok(())
+   951	    }
+   952	
+   953	    /// Write an instance's actual lifecycle state (plus an optional
+   954	    /// structured failure and the `updated_at` stamp). The move is validated
+   955	    /// against the row's persisted state through the domain state machine
+   956	    /// (e.g. `Instance::with_state` encodes the same rules); the update is
+   957	    /// guarded on the persisted state, so a concurrent change is rejected.
+   958	    ///
+   959	    /// # Errors
+   960	    ///
+   961	    /// `InvalidStateTransition` for an illegal move from the persisted state,
+   962	    /// `Internal` otherwise.
+   963	    pub async fn write_state<'c, E>(
+   964	        exec: E,
+   965	        instance_id: &str,
+   966	        state: InstanceState,
+   967	        failure: &Option<InstanceFailure>,
+   968	        updated_at: DateTime<Utc>,
+   969	    ) -> Result<()>
+   970	    where
+   971	        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+   972	    {
+   973	        let failure_json = failure
+   974	            .as_ref()
+   975	            .map(|f| to_json(f, "failure"))
+   976	            .transpose()?;
+   977	        let expected = validate_state(
+   978	            exec,
+   979	            "instances",
+   980	            "instance_id",
+   981	            instance_id,
+   982	            state,
+   983	            transition_instance,
+   984	        )
+   985	        .await?;
+   986	        let state_token = wire_token(&state);
+   987	        if let Some((expected_state, expected_revised)) = expected {
+   988	            let expected_token = wire_token(&expected_state);
+   989	            let result = sqlx::query(
+   990	                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+   991	                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
+   992	            )
+   993	            .bind(instance_id)
+   994	            .bind(&state_token)
+   995	            .bind(&failure_json)
+   996	            .bind(ts_string(updated_at))
+   997	            .bind(&expected_token)
+   998	            .bind(&expected_revised)
+   999	            .execute(exec)
+  1000	            .await
+  1001	            .map_err(|e| storage_error(&e, "write instance state"))?;
+  1002	            require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+  1003	        }
+  1004	        Ok(())
+  1005	    }
+  1006	
+  1007	    /// Fetch one instance by `instance_id`.
+  1008	    ///
+  1009	    /// # Errors
+  1010	    ///
+  1011	    /// `Internal` on a corrupt row, `InvalidStateTransition` if a stored
+  1012	    /// state token escaped the fences (should be impossible).
+  1013	    pub async fn get<'c, E>(exec: E, instance_id: &str) -> Result<Option<Instance>>
+  1014	    where
+  1015	        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  1016	    {
+  1017	        let row: Option<InstanceRow> = sqlx::query_as(
+  1018	            "SELECT instance_id, model_id, runtime_id, load_config, state, \
+  1019	                 pid, port, device_ids, started_at, last_used_at, active_requests, \
+  1020	                 health, failure FROM instances WHERE instance_id = ?1",
+  1250	    /// the fence, `Internal` otherwise.
+  1251	    pub async fn create<'c, E>(exec: E, operation: &Operation) -> Result<()>
+  1252	    where
+  1253	        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+  1254	    {
+  1255	        let created = operation.created_at.unwrap_or_else(now);
+  1256	        let error_json = operation
+  1257	            .error
+  1258	            .as_ref()
+  1259	            .map(|e| to_json(e, "error"))
+  1260	            .transpose()?;
+  1261	        let result_json = operation
+  1262	            .result
+  1263	            .as_ref()
+  1264	            .map(|r| to_json(r, "result"))
+  1265	            .transpose()?;
+  1266	        sqlx::query(
+  1267	            "INSERT INTO operations (
+  1268	                operation_id, kind, state, instance_id, model_id,
+  1269	                created_at, updated_at, finished_at, error, result
+  1270	             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  1271	        )
+  1272	        .bind(&operation.operation_id)
+  1273	        .bind(wire_token(&operation.kind))
+  1274	        .bind(wire_token(&operation.state()))
+  1275	        .bind(&operation.instance_id)
+  1276	        .bind(&operation.model_id)
+  1277	        .bind(ts_string(created))
+  1278	        .bind(ts_string(created))
+  1279	        .bind(operation.finished_at.map(ts_string))
+  1280	        .bind(error_json)
+  1281	        .bind(result_json)
+  1282	        .execute(exec)
+  1283	        .await
+  1284	        .map_err(|e| storage_error(&e, "create operation"))?;
+  1285	        Ok(())
+  1286	    }
+  1287	
+  1288	    /// Persist a state advance of an existing operation (terminal or not):
+  1289	    /// `state`, `finished_at`, the structured `error` and `result` are
+  1290	    /// rewritten from the passed domain value. The move is validated against
+  1291	    /// the row's persisted state through the domain operation state machine,
+  1292	    /// and the update is guarded on that state (`docs/architecture.md` §8).
+  1293	    /// Returns `false` when no such operation exists.
+  1294	    ///
+  1295	    /// # Errors
+  1296	    ///
+  1297	    /// `InvalidStateTransition` for an illegal move from the persisted state
+  1298	    /// (or a row that raced the guard), `Internal` otherwise.
+  1299	    pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
+  1300	    where
+  1301	        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
+  1302	    {
+  1303	        let to = operation.state();
+  1304	        let expected = validate_state(
+  1305	            exec,
+  1306	            "operations",
+  1307	            "operation_id",
+  1308	            &operation.operation_id,
+  1309	            to,
+  1310	            transition_operation,
+  1311	        )
+  1312	        .await?;
+  1313	        let to_token = wire_token(&to);
+  1314	        let error_json = operation
+  1315	            .error
+  1316	            .as_ref()
+  1317	            .map(|e| to_json(e, "error"))
+  1318	            .transpose()?;
+  1319	        let result_json = operation
+  1320	            .result
+  1321	            .as_ref()
+  1322	            .map(|r| to_json(r, "result"))
+  1323	            .transpose()?;
+  1324	        let finished_at = operation.finished_at.map(ts_string);
+  1325	        match expected {
+  1326	            None => Ok(false),
+  1327	            Some((expected_state, expected_revised)) => {
+  1328	                let expected_token = wire_token(&expected_state);
+  1329	                let result = sqlx::query(
+  1330	                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
+  1331	                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
+  1332	                )
+  1333	                .bind(&operation.operation_id)
+  1334	                .bind(&to_token)
+  1335	                .bind(finished_at)
+  1336	                .bind(error_json)
+  1337	                .bind(result_json)
+  1338	                .bind(ts_string(now()))
+  1339	                .bind(&expected_token)
+  1340	                .bind(&expected_revised)
+  1341	                .execute(exec)
+  1342	                .await
+  1343	                .map_err(|e| storage_error(&e, "advance operation"))?;
+  1344	                require_state_write(
+  1345	                    result.rows_affected(),
+  1346	                    &format!("operation {}", operation.operation_id),
+  1347	                )?;
+  1348	                Ok(true)
+  1349	            }
+  1350	        }
+   145	    /// # Errors
+   146	    ///
+   147	    /// The domain `Internal` error code if the transaction cannot be
+   148	    /// started.
+   149	    pub async fn transaction(&self) -> Result<SqliteTransaction<'static>> {
+   150	        self.pool
+   151	            .begin()
+   152	            .await
+   153	            .map_err(|e| storage_error(&e, "begin transaction"))
+   154	    }
+   155	
+   156	    /// Docs/architecture.md §8: on daemon start, mark every **non-terminal**
+   157	    /// instance (`queued` / `loading` / `ready` / `draining` / `unloading`)
+   158	    /// as `crashed` — a process was expected to be running but the daemon
+   159	    /// restarted, so those records are orphaned. Each move is validated
+   160	    /// through the domain state machine (every non-terminal state legally
+   161	    /// reaches `crashed`) and audit-logged, and the whole recovery commits
+   162	    /// in one transaction. Settled records (`unloaded` / `failed` /
+   163	    /// `crashed`) are left untouched, and a second call finds nothing to do.
+   164	    ///
+   165	    /// Returns the instances as they were found (with their pre-recovery
+   166	    /// state), in recovery order. Non-terminal **operations** are exposed
+   167	    /// via `crate::repos::OperationsRepo::non_terminal` for the supervisor
+   168	    /// (job 6) rather than settled here.
+   169	    ///
+   170	    /// # Errors
+   171	    ///
+   172	    /// `InvalidStateTransition` if a stored state cannot legally reach
+   173	    /// `crashed` (defensive: schema fence and state machine agree on the
+   174	    /// vocabulary), or `Internal` on storage failure.
+   175	    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+   176	        let stale = InstancesRepo::non_terminal(self.pool()).await?;
+   177	        if stale.is_empty() {
+   178	            return Ok(Vec::new());
+   179	        }
+   180	        let at = now();
+   181	        let mut tx = self.transaction().await?;
+   182	        for found in &stale {
+   183	            // Re-read the row inside the transaction: the pool-based scan
+   184	            // above predates it, and a legal `ready -> draining -> ready`
+   185	            // cycle could have moved the row and back. Validate the move
+   186	            // through the frozen domain state machine (never a raw write)
+   187	            // against this fresh state, then guard the update on BOTH the
+   188	            // state and the `updated_at` revision so a same-state ABA
+   189	            // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
+   190	            // so the two-query repository guard cannot run in a transaction;
+   191	            // sequential re-borrows of the transaction do the same job).
+   192	            let current =
+   193	                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
+   194	                    .bind(found.instance_id())
+   195	                    .fetch_optional(&mut *tx)
+   196	                    .await
+   197	                    .map_err(|e| storage_error(&e, "read instance state"))?;
+   198	            let Some(current) = current else {
+   199	                return Err(DomainError::with_message(
+   200	                    ErrorCode::Internal,
+   201	                    format!(
+   202	                        "instance {} vanished before recovery applied",
+   203	                        found.instance_id()
+   204	                    ),
+   205	                ));
+   206	            };
+   207	            let raw_state = current.try_get::<String, _>(0).map_err(|e| {
+   208	                DomainError::with_message(
+   209	                    ErrorCode::Internal,
+   210	                    format!("read instance {} state: {e}", found.instance_id()),
+   211	                )
+   212	            })?;
+   213	            let revised = current.try_get::<String, _>(1).map_err(|e| {
+   214	                DomainError::with_message(
+   215	                    ErrorCode::Internal,
+   216	                    format!("read instance {} updated_at: {e}", found.instance_id()),
+   217	                )
+   218	            })?;
+   219	            let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+   220	            transition_instance(current_state, InstanceState::Crashed).map_err(|_| {
+   221	                DomainError::with_message(
+   222	                    ErrorCode::InvalidStateTransition,
+   223	                    format!(
+   224	                        "instance {} in {current_state:?} cannot legally reach crashed",
+   225	                        found.instance_id()
+   226	                    ),
+   227	                )
+   228	            })?;
+   229	            let result = sqlx::query(
+   230	                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+   231	                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
+   232	            )
+   233	            .bind(found.instance_id())
+   234	            .bind(wire_token(&InstanceState::Crashed))
+   235	            .bind(ts_string(at))
+   236	            .bind(wire_token(&current_state))
+   237	            .bind(&revised)
+   238	            .execute(&mut *tx)
+   239	            .await
+   240	            .map_err(|e| storage_error(&e, "write instance state"))?;
+   241	            if result.rows_affected() == 0 {
+   242	                return Err(DomainError::with_message(
+   243	                    ErrorCode::InvalidStateTransition,
+   244	                    format!(
+   245	                        "instance {} changed state before recovery applied",
+   246	                        found.instance_id()
+   247	                    ),
+   248	                ));
+   249	            }
+   250	            AuditRepo::append(
+   251	                &mut *tx,
+   252	                &AuditEvent::new(
+   253	                    AuditKind::InstanceRecovered,
+   254	                    Some("instance".to_owned()),
+   255	                    Some(found.instance_id().to_string()),
+   256	                    None,
+   257	                    serde_json::json!({ "previous_state": found.state() }),
+   258	                    at,
+   259	                ),
+   260	            )
+   120	        ],
+   121	        _ => panic!("test needs a non-terminal state"),
+   122	    };
+   123	    for step in path {
+   124	        instance = instance.with_state(*step).expect("test path is legal");
+   125	    }
+   126	    instance
+   127	}
+   128	
+   129	/// An instance in the terminal state `state` for `model` / `runtime`.
+   130	fn terminal_instance(
+   131	    instance_id: &str,
+   132	    model: &Model,
+   133	    runtime: &str,
+   134	    state: InstanceState,
+   135	) -> Instance {
+   136	    match state {
+   137	        InstanceState::Unloaded => Instance::new(
+   138	            instance_id.to_owned(),
+   139	            model.id.clone(),
+   140	            runtime.to_owned(),
+   141	            load_config(),
+   142	        ),
+   143	        InstanceState::Failed => {
+   144	            let instance =
+   145	                non_terminal_instance(instance_id, model, runtime, InstanceState::Queued);
+   146	            instance
+   147	                .with_state(InstanceState::Failed)
+   148	                .expect("queued -> failed is legal")
+   149	        }
+   150	        _ => panic!("test needs a terminal state"),
+   151	    }
+   152	}
+   153	
+   154	/// The `store` half of the §9 atomic write inside an open transaction: the
+   155	/// trigger operation, the instance desired-state drive, and the audit event.
+   156	async fn drive_desired_state_in_tx(
+   157	    tx: &mut sqlx::SqliteTransaction<'static>,
+   158	    instance: &Instance,
+   159	    operation: &Operation,
+   160	    desired: InstanceState,
+   161	) {
+   162	    // sqlx 0.8 implements `Executor` for `&mut SqliteConnection`, not for
+   163	    // `&mut Transaction` (sqlx-core#3857): deref the transaction down to its
+   164	    // connection before handing it to the repositories.
+   165	    let connection = &mut **tx;
+   166	    let at = Utc::now();
+   167	    OperationsRepo::create(&mut *connection, operation)
+   168	        .await
+   169	        .expect("operation insert in tx");
+   170	    InstancesRepo::set_desired_state(&mut *connection, &instance.instance_id, desired)
+   171	        .await
+   172	        .expect("desired state update in tx");
+   173	    AuditRepo::append(
+   174	        &mut *connection,
+   175	        &AuditEvent::new(
+   176	            AuditKind::InstanceDesiredChanged,
+   177	            Some("instance".into()),
+   178	            Some(instance.instance_id.clone()),
+   179	            Some(operation.operation_id.clone()),
+   180	            serde_json::json!({ "state": desired }),
+   181	            at,
+   182	        ),
+   183	    )
+   184	    .await
+   185	    .expect("audit append in tx");
+   186	}
+   187	
+   188	/// The §9 three-table consistency write in one transaction: operation +
+   189	/// instance desired state + audit event.
+   190	async fn three_table_write(
+   191	    store: &SqliteStore,
+   192	    instance: &Instance,
+   193	    operation: &Operation,
+   194	    desired: InstanceState,
+   195	) {
+   196	    let mut tx = store.transaction().await.expect("begin tx");
+   197	    drive_desired_state_in_tx(&mut tx, instance, operation, desired).await;
+   198	    tx.commit().await.expect("commit tx");
+   199	}
+   200	
+   201	/// Seed one model, one runtime and one instance in `state`.
+   202	async fn seed(store: &SqliteStore, key: &str, instance_id: &str, state: InstanceState) {
+   203	    let model = model_fixture(key);
+   204	    ModelsRepo::upsert(store.pool(), &model)
+   205	        .await
+   206	        .expect("seed model");
+   207	    RuntimeRepo::upsert(store.pool(), &runtime_record("rt", RuntimeKind::LlamaCpp))
+   208	        .await
+   209	        .expect("seed runtime");
+   210	    let instance = non_terminal_instance(instance_id, &model, "rt", state);
+   211	    InstancesRepo::upsert(store.pool(), &instance)
+   212	        .await
+   213	        .expect("seed instance");
+   214	}
+   215	
+   216	/// Assert the storage error carries the expected domain code.
+   217	fn assert_code(err: &DomainError, expected: ErrorCode) {
+   218	    assert_eq!(err.code, expected, "expected {expected:?}, got {err:?}");
+   219	}
+   220	
+   221	#[tokio::test]
+   222	async fn pragmas_are_enforced_on_every_connection() {
+   223	    let fixture = Fixture::new().await.expect("fixture");
+   224	    let pool = fixture.store.pool();
+   225	    // Hold several distinct pooled connections alive at once (6 < the default
+  1190	        OperationsRepo::get(pool, "op-illegal")
+  1191	            .await
+  1192	            .expect("get")
+  1193	            .expect("row")
+  1194	            .state(),
+  1195	        OperationState::Succeeded,
+  1196	        "the operation must remain in its terminal state"
+  1197	    );
+  1198	}
+  1199	
+  1200	// P1 (codex round 2): a same-state upsert is an idempotent data update, not a
+  1201	// transition. The frozen machine has no self-loops, so keeping the persisted
+  1202	// state while changing data (pid, active_requests, ...) must be accepted and
+  1203	// persisted; write_state of the same state is likewise a legal no-op move.
+  1204	#[tokio::test]
+  1205	async fn same_state_writes_are_idempotent_data_updates() {
+  1206	    let fixture = Fixture::new().await.expect("fixture");
+  1207	    let store = &fixture.store;
+  1208	    let pool = store.pool();
+  1209	
+  1210	    seed(store, "m-ss", "i-ss", InstanceState::Ready).await;
+  1211	    let found = InstancesRepo::get(pool, "i-ss")
+  1212	        .await
+  1213	        .expect("get")
+  1214	        .expect("row");
+  1215	    let mut updated = found.clone();
+  1216	    updated.pid = Some(4242);
+  1217	    updated.active_requests = 3;
+  1218	    InstancesRepo::upsert(pool, &updated)
+  1219	        .await
+  1220	        .expect("same-state upsert (Ready -> Ready with new data) must be accepted");
+  1221	    let after = InstancesRepo::get(pool, "i-ss")
+  1222	        .await
+  1223	        .expect("get")
+  1224	        .expect("row");
+  1225	    assert_eq!(after.state(), InstanceState::Ready, "state is unchanged");
+  1226	    assert_eq!(after.pid, Some(4242), "the new pid is persisted");
+  1227	    assert_eq!(
+  1228	        after.active_requests, 3,
+  1229	        "the new active_requests is persisted"
+  1230	    );
+  1231	
+  1232	    // write_state of the same state is a legal no-op move (e.g. recording a
+  1233	    // refreshed failure while already in the same state).
+  1234	    InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
+  1235	        .await
+  1236	        .expect("same-state write_state must be accepted");
+  1237	    assert_eq!(
+  1238	        InstancesRepo::get(pool, "i-ss")
+  1239	            .await
+  1240	            .expect("get")
+  1241	            .expect("row")
+  1242	            .state(),
+  1243	        InstanceState::Ready
+  1244	    );
+  1245	}
+  1246	
+  1247	// P1 (codex round 3): a state-only compare-and-set has an ABA hole because
+  1248	// the instance machine has legal cycles (ready -> draining -> ready). The
+  1249	// guard therefore also pins the `updated_at` revision: a writer that
+  1250	// validated a stale (state, updated_at) pair must affect 0 rows even when
+  1251	// the state has cycled back to the same token.
+  1252	#[tokio::test]
+  1253	async fn stale_same_state_write_is_rejected_by_the_revision_guard() {
+  1254	    let fixture = Fixture::new().await.expect("fixture");
+  1255	    let store = &fixture.store;
+  1256	    let pool = store.pool();
+  1257	
+  1258	    seed(store, "m-aba", "i-aba", InstanceState::Ready).await;
+  1259	    let stale_revised: String =
+  1260	        sqlx::query_scalar("SELECT updated_at FROM instances WHERE instance_id = 'i-aba'")
+  1261	            .fetch_one(pool)
+  1262	            .await
+  1263	            .expect("read the seeded revision");
+  1264	
+  1265	    // A concurrent writer legally cycles the row: ready -> draining -> ready.
+  1266	    InstancesRepo::write_state(pool, "i-aba", InstanceState::Draining, &None, ts(T2))
+  1267	        .await
+  1268	        .expect("legal ready -> draining");
+  1269	    InstancesRepo::write_state(pool, "i-aba", InstanceState::Ready, &None, ts(T2))
+  1270	        .await
+  1271	        .expect("legal draining -> ready");
+  1272	
+  1273	    // The stale writer's update: `state` matches (ready) but the revision is
+  1274	    // stale, so the double guard must reject it (0 rows affected).
+  1275	    let rejected = sqlx::query(
+  1276	        "UPDATE instances SET active_requests = 99 \
+  1277	         WHERE instance_id = 'i-aba' AND state = 'ready' AND updated_at = ?1",
+  1278	    )
+  1279	    .bind(&stale_revised)
+  1280	    .execute(pool)
+  1281	    .await
+  1282	    .expect("stale guarded update runs");
+  1283	    assert_eq!(
+  1284	        rejected.rows_affected(),
+  1285	        0,
+  1286	        "the state+updated_at guard must reject the ABA write"
+  1287	    );
+  1288	    let after = InstancesRepo::get(pool, "i-aba")
+  1289	        .await
+  1290	        .expect("get")
+  1291	        .expect("row");
+  1292	    assert_eq!(after.state(), InstanceState::Ready);
+  1293	    assert_ne!(
+  1294	        after.active_requests, 99,
+  1295	        "the stale write must not have landed"
+  1296	    );
+  1297	}
+  1298	
+  1299	// P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+  1300	// InvalidRequest, not InvalidStateTransition (state fences only) and not
+  1301	// Internal. The state fence names are the only ones that map to
+  1302	// InvalidStateTransition.
+  1303	#[tokio::test]
+  1304	async fn non_state_check_violation_maps_to_invalid_request() {
+  1305	    let fixture = Fixture::new().await.expect("fixture");
+    85	-- in-flight operation drives the instance toward (docs/architecture.md §9:
+    86	-- "operation、instance desired state 和 audit event 同步提交").
+    87	-- `pid` / `port` are only trusted once the process supervisor confirms them.
+    88	CREATE TABLE instances (
+    89	    instance_id     TEXT PRIMARY KEY,
+    90	    model_id        TEXT NOT NULL REFERENCES models (id) ON DELETE CASCADE,
+    91	    runtime_id      TEXT NOT NULL REFERENCES runtimes (id),
+    92	    load_config     TEXT NOT NULL,
+    93	    state           TEXT NOT NULL
+    94	        CONSTRAINT instance_state_valid
+    95	        CHECK (state IN ('unloaded', 'queued', 'loading', 'ready',
+    96	                         'draining', 'unloading', 'failed', 'crashed')),
+    97	    desired_state   TEXT NOT NULL
+    98	        CONSTRAINT instance_desired_state_valid
+    99	        CHECK (desired_state IN ('unloaded', 'queued', 'loading', 'ready',
+   100	                                 'draining', 'unloading', 'failed', 'crashed')),
+   101	    pid             INTEGER,
+   102	    port            INTEGER CHECK (port IS NULL OR (port BETWEEN 1 AND 65535)),
+   103	    device_ids      TEXT NOT NULL DEFAULT '[]',
+   104	    started_at      TEXT,
+   105	    last_used_at    TEXT,
+   106	    active_requests INTEGER NOT NULL DEFAULT 0 CHECK (active_requests >= 0),
+   107	    health          TEXT,
+   108	    failure         TEXT,
+   109	    created_at      TEXT NOT NULL,
+   110	    updated_at      TEXT NOT NULL
+   111	);
+   112	CREATE INDEX idx_instances_model ON instances (model_id);
+   113	CREATE INDEX idx_instances_runtime ON instances (runtime_id);
+   114	-- Partial index serving the docs/architecture.md §8 restart-recovery query.
+   115	CREATE INDEX idx_instances_state_nonterminal
+   116	    ON instances (state)
+   117	    WHERE state IN ('queued', 'loading', 'ready', 'draining', 'unloading');
+   118	
+   119	-- Load / unload / rescan operations (docs/architecture.md §3 "Operation").
+   120	-- `error` is the structured `OperationError` JSON; `result` the structured
+   121	-- result payload JSON (docs/api.md §5).
+   122	CREATE TABLE operations (
+   123	    operation_id TEXT PRIMARY KEY,
+   124	    kind         TEXT NOT NULL CHECK (kind IN ('load', 'unload', 'rescan')),
+   125	    state        TEXT NOT NULL
+   126	        CONSTRAINT operation_state_valid
+   127	        CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+   128	    instance_id  TEXT REFERENCES instances (instance_id) ON DELETE SET NULL,
+   129	    model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
+   130	    created_at   TEXT NOT NULL,
+   131	    updated_at   TEXT NOT NULL,
+   132	    finished_at  TEXT,
+   133	    error        TEXT,
+   134	    result       TEXT
+   135	);
+   136	CREATE INDEX idx_operations_state ON operations (state);
+   137	CREATE INDEX idx_operations_instance ON operations (instance_id);
+   138	CREATE INDEX idx_operations_model ON operations (model_id);
+   139	
+   140	-- Append-only audit / event log (docs/architecture.md §9, docs/api.md §5 SSE
+   141	-- replay). The autoincrement id is the monotonically increasing event id used
+   142	-- for `Last-Event-ID` replay.
+   143	CREATE TABLE audit_events (
+   144	    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+   145	    kind         TEXT NOT NULL,
+     1	//! Row <-> domain mapping helpers and the error mapping from `sqlx` failures
+     2	//! onto the frozen `model-serving-domain` error catalog.
+     3	//!
+     4	//! Storage failures never panic and never invent error codes:
+     5	//!
+     6	//! - a state token that violates one of the state-fence `CHECK` constraints
+     7	//!   (`instance_state_valid`, `instance_desired_state_valid`,
+     8	//!   `operation_state_valid`) maps to [`ErrorCode::InvalidStateTransition`];
+     9	//! - any other integrity violation (unique key, foreign key, other checks)
+    10	//!   maps to [`ErrorCode::InvalidRequest`];
+    11	//! - anything else (I/O, decode, corrupt JSON, driver) maps to
+    12	//!   [`ErrorCode::Internal`].
+    13	//!
+    14	//! Callers translate the "not found" shape themselves: repositories return
+    15	//! [`Option`] variants for that, and the required lookups map `None` to
+    16	//! [`ErrorCode::ModelNotFound`] / [`ErrorCode::InstanceNotFound`].
+    17	
+    18	use chrono::{DateTime, SecondsFormat, Utc};
+    19	use model_serving_domain::error::{DomainError, ErrorCode, Result};
+    20	
+    21	/// The named `CHECK` constraints that fence the state columns on their
+    22	/// state-machine vocabularies (see `migrations/0001_initial.sql`). A
+    23	/// constraint violation naming one of these is a rejected state write, not a
+    24	/// generic data error.
+    25	pub(crate) const STATE_FENCE_CONSTRAINTS: [&str; 3] = [
+    26	    "instance_state_valid",
+    27	    "instance_desired_state_valid",
+    28	    "operation_state_valid",
+    29	];
+    30	
+    31	/// Current UTC time for `updated_at` / `created_at` / audit rows.
+    32	#[must_use]
+    33	pub(crate) fn now() -> DateTime<Utc> {
+    34	    Utc::now()
+    35	}
+    36	
+    37	/// Render a timestamp to its RFC 3339 UTC TEXT column value (millisecond
+    38	/// precision, `Z` suffix — valid RFC 3339).
+    39	#[must_use]
+    40	pub(crate) fn ts_string(value: DateTime<Utc>) -> String {
+    41	    value.to_rfc3339_opts(SecondsFormat::Millis, true)
+    42	}
+    43	
+    44	/// Parse an RFC 3339 TEXT timestamp column back to `DateTime<Utc>`.
+    45	///
+    46	/// # Errors
+    47	///
+    48	/// [`ErrorCode::Internal`] if `raw` is not a parseable RFC 3339 timestamp
+    49	/// (corrupt row).
+    50	pub(crate) fn parse_ts(raw: &str, column: &str) -> Result<DateTime<Utc>> {
+    51	    DateTime::parse_from_rfc3339(raw)
+    52	        .map(|v| v.with_timezone(&Utc))
+    53	        .map_err(|e| {
+    54	            DomainError::with_message(
+    55	                ErrorCode::Internal,
+    56	                format!("stored {column} is not RFC 3339 (got {raw:?}): {e}"),
+    57	            )
+    58	        })
+    59	}
+    60	
+    61	/// Serialize a structured payload to its JSON TEXT column value.
+    62	///
+    63	/// # Errors
+    64	///
+    65	/// [`ErrorCode::Internal`] if `value` cannot be serialized.
+    66	pub(crate) fn to_json<T: serde::Serialize>(value: &T, field: &str) -> Result<String> {
+    67	    serde_json::to_string(value).map_err(|e| {
+    68	        DomainError::with_message(
+    69	            ErrorCode::Internal,
+    70	            format!("serialize {field} failed: {e}"),
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n \"InstanceRecovered|previous_state|recover_non_terminal\" docs crates -g '*.md' -g '*.rs'; git show \"5c90603"'^:crates/persistence/src/store.rs" | wsl.exe -d Ubuntu -- bash -lc "nl -ba | sed -n '"'165,235p'\"" in D:\Workspace\model-serving
+ succeeded in 179ms:
+crates\persistence\src\lib.rs:16://!   (`recover_non_terminal_instances`).
+crates\persistence\src\repos.rs:198:    InstanceRecovered,
+crates\persistence\src\store.rs:175:    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+crates\persistence\src\store.rs:253:                    AuditKind::InstanceRecovered,
+crates\persistence\src\store.rs:257:                    serde_json::json!({ "previous_state": found.state() }),
+crates\persistence\src\tests.rs:905:        .recover_non_terminal_instances()
+crates\persistence\src\tests.rs:913:        .recover_non_terminal_instances()
+crates\persistence\src\tests.rs:945:    assert_eq!(audit.len(), 3, "one InstanceRecovered audit event per mark");
+crates\persistence\src\tests.rs:946:    assert!(audit.iter().all(|e| e.kind == AuditKind::InstanceRecovered));
+crates\persistence\src\tests.rs:948:        audit[0].payload["previous_state"], "loading",
+   165	    /// state), in recovery order. Non-terminal **operations** are exposed
+   166	    /// via `crate::repos::OperationsRepo::non_terminal` for the supervisor
+   167	    /// (job 6) rather than settled here.
+   168	    ///
+   169	    /// # Errors
+   170	    ///
+   171	    /// `InvalidStateTransition` if a stored state cannot legally reach
+   172	    /// `crashed` (defensive: schema fence and state machine agree on the
+   173	    /// vocabulary), or `Internal` on storage failure.
+   174	    pub async fn recover_non_terminal_instances(&self) -> Result<Vec<Instance>> {
+   175	        let stale = InstancesRepo::non_terminal(self.pool()).await?;
+   176	        if stale.is_empty() {
+   177	            return Ok(Vec::new());
+   178	        }
+   179	        let at = now();
+   180	        let mut tx = self.transaction().await?;
+   181	        for found in &stale {
+   182	            // Validate the move through the frozen domain state machine (never
+   183	            // a raw write). The expected `from` is the state just read, so the
+   184	            // guarded update below needs no re-SELECT on the transaction
+   185	            // connection (`&mut SqliteConnection` is not `Copy`, so the
+   186	            // two-query repository guard cannot run in a transaction).
+   187	            transition_instance(found.state(), InstanceState::Crashed).map_err(|_| {
+   188	                DomainError::with_message(
+   189	                    ErrorCode::InvalidStateTransition,
+   190	                    format!(
+   191	                        "instance {} in {:?} cannot legally reach crashed",
+   192	                        found.instance_id(),
+   193	                        found.state()
+   194	                    ),
+   195	                )
+   196	            })?;
+   197	            let result = sqlx::query(
+   198	                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+   199	                 WHERE instance_id = ?1 AND state = ?4",
+   200	            )
+   201	            .bind(found.instance_id())
+   202	            .bind(wire_token(&InstanceState::Crashed))
+   203	            .bind(ts_string(at))
+   204	            .bind(wire_token(&found.state()))
+   205	            .execute(&mut *tx)
+   206	            .await
+   207	            .map_err(|e| storage_error(&e, "write instance state"))?;
+   208	            if result.rows_affected() == 0 {
+   209	                return Err(DomainError::with_message(
+   210	                    ErrorCode::InvalidStateTransition,
+   211	                    format!(
+   212	                        "instance {} changed state before recovery applied",
+   213	                        found.instance_id()
+   214	                    ),
+   215	                ));
+   216	            }
+   217	            AuditRepo::append(
+   218	                &mut *tx,
+   219	                &AuditEvent::new(
+   220	                    AuditKind::InstanceRecovered,
+   221	                    Some("instance".to_owned()),
+   222	                    Some(found.instance_id().to_string()),
+   223	                    None,
+   224	                    serde_json::json!({ "previous_state": found.state() }),
+   225	                    at,
+   226	                ),
+   227	            )
+   228	            .await?;
+   229	        }
+   230	        tx.commit()
+   231	            .await
+   232	            .map_err(|e| storage_error(&e, "commit recovery transaction"))?;
+   233	        Ok(stale)
+   234	    }
+   235	}
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "rg -n \"const T[12]|fn ts\" crates/persistence/src/tests.rs; wsl.exe -d Ubuntu -- bash -lc \"cd /mnt/d/Workspace/model-serving && nl -ba crates/persistence/src/tests.rs | sed -n '25,70p;885,960p' && git diff --check '5c90603"'^'"' 5c90603\"" in D:\Workspace\model-serving
+ succeeded in 408ms:
+31:const T1: &str = "2025-01-02T00:00:00Z";
+32:const T2: &str = "2025-01-03T00:00:00Z";
+34:fn ts(value: &str) -> chrono::DateTime<Utc> {
+    25	    SettingsRepo,
+    26	};
+    27	use crate::test_support::Fixture;
+    28	
+    29	/// RFC 3339 UTC timestamps, distinct and deterministic.
+    30	const T0: &str = "2025-01-01T00:00:00Z";
+    31	const T1: &str = "2025-01-02T00:00:00Z";
+    32	const T2: &str = "2025-01-03T00:00:00Z";
+    33	
+    34	fn ts(value: &str) -> chrono::DateTime<Utc> {
+    35	    value.parse().expect("test timestamps are valid RFC 3339")
+    36	}
+    37	
+    38	fn model_fixture(key: &str) -> Model {
+    39	    Model {
+    40	        id: format!("{key}-id"),
+    41	        key: key.to_owned(),
+    42	        path: format!("/models/{key}.gguf"),
+    43	        artifact_kind: model_serving_domain::model::ArtifactKind::Gguf,
+    44	        size_bytes: 1024,
+    45	        mtime: ts(T0),
+    46	        display_name: Some(format!("{key} display")),
+    47	        default_runtime_id: None,
+    48	        default_load_config: None,
+    49	        metadata: None,
+    50	        deleted: false,
+    51	    }
+    52	}
+    53	
+    54	fn load_config() -> LoadConfig {
+    55	    LoadConfig {
+    56	        context_length: 4096,
+    57	        max_concurrency: None,
+    58	        eval_batch_size: None,
+    59	        flash_attention: None,
+    60	        offload_kv_cache_to_gpu: None,
+    61	        n_gpu_layers: None,
+    62	        engine_config: None,
+    63	    }
+    64	}
+    65	
+    66	fn runtime_fixture(id: &str, kind: RuntimeKind) -> Runtime {
+    67	    Runtime {
+    68	        id: id.to_owned(),
+    69	        kind,
+    70	        executable_path: format!("/bin/{id}"),
+   885	    for (id, state) in [
+   886	        ("i-q", InstanceState::Queued),
+   887	        ("i-l", InstanceState::Loading),
+   888	        ("i-rdy", InstanceState::Ready),
+   889	        ("i-u", InstanceState::Unloaded),
+   890	        ("i-f", InstanceState::Failed),
+   891	    ] {
+   892	        let instance = if state.is_terminal() {
+   893	            terminal_instance(id, &model, "rt", state)
+   894	        } else {
+   895	            non_terminal_instance(id, &model, "rt", state)
+   896	        };
+   897	        InstancesRepo::upsert(store.pool(), &instance)
+   898	            .await
+   899	            .expect("seed instance");
+   900	    }
+   901	
+   902	    // §8: the restart query returns exactly the non-terminal ones, and the
+   903	    // recovery flow marks them crashed (audit event per mark, one tx).
+   904	    let found = store
+   905	        .recover_non_terminal_instances()
+   906	        .await
+   907	        .expect("recovery");
+   908	    let found_ids: Vec<&str> = found.iter().map(Instance::instance_id).collect();
+   909	    // The §8 query orders by `instance_id` (deterministic restart order).
+   910	    assert_eq!(found_ids, vec!["i-l", "i-q", "i-rdy"]);
+   911	
+   912	    let after = store
+   913	        .recover_non_terminal_instances()
+   914	        .await
+   915	        .expect("re-query");
+   916	    assert!(after.is_empty(), "post-recovery query must be empty");
+   917	    for id in ["i-q", "i-l", "i-rdy"] {
+   918	        assert_eq!(
+   919	            InstancesRepo::get(store.pool(), id)
+   920	                .await
+   921	                .expect("get")
+   922	                .expect("row present")
+   923	                .state(),
+   924	            InstanceState::Crashed
+   925	        );
+   926	    }
+   927	    // Terminal instances were untouched.
+   928	    assert_eq!(
+   929	        InstancesRepo::get(store.pool(), "i-u")
+   930	            .await
+   931	            .expect("get")
+   932	            .expect("row present")
+   933	            .state(),
+   934	        InstanceState::Unloaded
+   935	    );
+   936	    assert_eq!(
+   937	        InstancesRepo::get(store.pool(), "i-f")
+   938	            .await
+   939	            .expect("get")
+   940	            .expect("row present")
+   941	            .state(),
+   942	        InstanceState::Failed
+   943	    );
+   944	    let audit = AuditRepo::list(store.pool(), None).await.expect("audit");
+   945	    assert_eq!(audit.len(), 3, "one InstanceRecovered audit event per mark");
+   946	    assert!(audit.iter().all(|e| e.kind == AuditKind::InstanceRecovered));
+   947	    assert_eq!(
+   948	        audit[0].payload["previous_state"], "loading",
+   949	        "first mark is i-l (instance_id order)"
+   950	    );
+   951	}
+   952	
+   953	#[tokio::test]
+   954	async fn audit_append_and_replay_ordering() {
+   955	    let fixture = Fixture::new().await.expect("fixture");
+   956	    let pool = fixture.store.pool();
+   957	    let events = [
+   958	        AuditEvent::new(
+   959	            AuditKind::ModelUpserted,
+   960	            Some("model".into()),
+
+hook: PostToolUse
+hook: PostToolUse Completed
+hook: PreToolUse
+hook: PreToolUse Completed
+exec
+"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "wsl.exe -d Ubuntu -- bash -lc \"cd /mnt/d/Workspace/model-serving && nl -ba crates/persistence/src/repos.rs | sed -n '65,125p' && nl -ba crates/persistence/src/store.rs | sed -n '250,268p'\"" in D:\Workspace\model-serving
+ succeeded in 149ms:
+    65	/// self-loops, so same-state writes are accepted without consulting it.
+    66	/// `ErrorCode::InvalidStateTransition` is returned when the domain machine
+    67	/// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
+    68	/// as `Internal`.
+    69	///
+    70	/// Returns the **current** state plus its `updated_at` revision when the row
+    71	/// exists, or `None` for a first-seen row (no prior state, so a legal initial
+    72	/// state may be written and no transition check applies). Callers then issue
+    73	/// a write guarded on BOTH the returned state and revision
+    74	/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
+    75	/// revision>`) and must check `rows_affected`: the guarded update is a
+    76	/// compare-and-set, so a row that moved concurrently affects 0 rows and the
+    77	/// write is rejected, even though the SELECT and the UPDATE are separate
+    78	/// statements (a transaction is not required for the guard to be safe).
+    79	/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
+    80	/// concurrent legal `ready -> draining -> ready` cycle leaves `state`
+    81	/// unchanged but bumps `updated_at`, so a stale write is still rejected.
+    82	async fn validate_state<'c, E, S>(
+    83	    exec: E,
+    84	    table: &str,
+    85	    key_col: &str,
+    86	    key: &str,
+    87	    to: S,
+    88	    transition: fn(S, S) -> Result<S>,
+    89	) -> Result<Option<(S, String)>>
+    90	where
+    91	    E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+    92	    S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
+    93	{
+    94	    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
+    95	    let row = sqlx::query(&sql)
+    96	        .bind(key)
+    97	        .fetch_optional(exec)
+    98	        .await
+    99	        .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
+   100	    let Some(row) = row else {
+   101	        return Ok(None);
+   102	    };
+   103	    let raw = row.try_get::<String, _>(0).map_err(|e| {
+   104	        DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
+   105	    })?;
+   106	    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
+   107	        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
+   108	    })?;
+   109	    let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+   110	    if current != to {
+   111	        transition(current, to)?;
+   112	    }
+   113	    Ok(Some((current, updated_at)))
+   114	}
+   115	
+   116	/// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+   117	/// guard validated the state and revision, so a row that vanished or moved in
+   118	/// the interim (including a same-state ABA cycle) means the update raced a
+   119	/// concurrent writer.
+   120	#[track_caller]
+   121	fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+   122	    if rows_affected == 0 {
+   123	        return Err(DomainError::with_message(
+   124	            ErrorCode::InvalidStateTransition,
+   125	            format!("{subject} changed state before the update applied"),
+   250	            AuditRepo::append(
+   251	                &mut *tx,
+   252	                &AuditEvent::new(
+   253	                    AuditKind::InstanceRecovered,
+   254	                    Some("instance".to_owned()),
+   255	                    Some(found.instance_id().to_string()),
+   256	                    None,
+   257	                    serde_json::json!({ "previous_state": found.state() }),
+   258	                    at,
+   259	                ),
+   260	            )
+   261	            .await?;
+   262	        }
+   263	        tx.commit()
+   264	            .await
+   265	            .map_err(|e| storage_error(&e, "commit recovery transaction"))?;
+   266	        Ok(stale)
+   267	    }
+   268	}
+
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+VERDICT: NEEDS-FIXES
+
+1. **P1 — ABA remains because `updated_at` is not a unique revision.** Every existing-row path now syntactically guards both columns: instance upsert (`repos.rs:887-916`), `write_state` (`repos.rs:987-1002`), operation advance (`repos.rs:1327-1347`), and recovery (`store.rs:192-249`). However, timestamps are serialized only to millisecond precision (`mapping.rs:37-42`), and `write_state` accepts an arbitrary caller-supplied timestamp (`repos.rs:963-996`). A legal `ready(R) → draining(R) → ready(R)` cycle can therefore reuse revision `R`, after which a stale `(ready, R)` CAS succeeds. Use a monotonic integer/version or another guaranteed-fresh token.
+
+   The first-seen path itself is safe: it uses a plain `INSERT`, so concurrent insertion is rejected by the primary key rather than overwriting (`repos.rs:852-881`).
+
+2. **The regression test does not prove ABA safety.** It captures the seed timestamp generated by `now()` (`tests.rs:1258-1263`) but performs both transitions using fixed `T2` (`tests.rs:1266-1271`). Thus it only proves that a guard rejects a *different* timestamp. Passing the captured revision as both transition timestamps would reproduce the remaining race; the final raw CAS at `tests.rs:1275-1286` would affect one row.
+
+3. **NEW P2 — recovery may audit the wrong previous state.** Recovery rereads and transitions from `current_state` inside the transaction (`store.rs:192-228`), but the audit payload still records the older pool-scan value `found.state()` (`store.rs:250-258`). If the instance changes between scan and transaction, recovery succeeds from the fresh state while recording a false `previous_state`. The payload should use `current_state`.
+
+No other new P1/P2 found.
+hook: Stop
+hook: Stop Completed
+tokens used
+52,385
+VERDICT: NEEDS-FIXES
+
+1. **P1 — ABA remains because `updated_at` is not a unique revision.** Every existing-row path now syntactically guards both columns: instance upsert (`repos.rs:887-916`), `write_state` (`repos.rs:987-1002`), operation advance (`repos.rs:1327-1347`), and recovery (`store.rs:192-249`). However, timestamps are serialized only to millisecond precision (`mapping.rs:37-42`), and `write_state` accepts an arbitrary caller-supplied timestamp (`repos.rs:963-996`). A legal `ready(R) → draining(R) → ready(R)` cycle can therefore reuse revision `R`, after which a stale `(ready, R)` CAS succeeds. Use a monotonic integer/version or another guaranteed-fresh token.
+
+   The first-seen path itself is safe: it uses a plain `INSERT`, so concurrent insertion is rejected by the primary key rather than overwriting (`repos.rs:852-881`).
+
+2. **The regression test does not prove ABA safety.** It captures the seed timestamp generated by `now()` (`tests.rs:1258-1263`) but performs both transitions using fixed `T2` (`tests.rs:1266-1271`). Thus it only proves that a guard rejects a *different* timestamp. Passing the captured revision as both transition timestamps would reproduce the remaining race; the final raw CAS at `tests.rs:1275-1286` would affect one row.
+
+3. **NEW P2 — recovery may audit the wrong previous state.** Recovery rereads and transitions from `current_state` inside the transaction (`store.rs:192-228`), but the audit payload still records the older pool-scan value `found.state()` (`store.rs:250-258`). If the instance changes between scan and transaction, recovery succeeds from the fresh state while recording a false `previous_state`. The payload should use `current_state`.
+
+No other new P1/P2 found.

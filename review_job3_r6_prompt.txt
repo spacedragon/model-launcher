@@ -1,0 +1,5 @@
+Round 6 (closing) review, job 3 (persistence crate) of model-serving. Your round-5 verdict was NEEDS-FIXES on exactly one P1: secure_db_file (crates/persistence/src/store.rs) used create(true)+truncate(true) after a separate absence stat, so a database file created or restored concurrently could be truncated.
+
+Fix in commit f6c1f20 (branch job/3-persistence, now HEAD): the create branch now uses atomic std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) (O_EXCL, never truncates). A lost create race surfaces ErrorKind::AlreadyExists and simply falls through to the re-stat below; any other open error is returned as Internal. The existing post-stat chmod-to-0600 logic is unchanged, so a concurrently created file still ends up owner-only. Gates green on both toolchains (fmt, clippy -D warnings, full cargo test --workspace on Windows and WSL Ubuntu).
+
+Please confirm the P1 is closed by f6c1f20 (or name the concrete remaining issue). Output: VERDICT: APPROVE / NEEDS-FIXES, then per-point findings with file:line evidence.
