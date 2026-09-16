@@ -6,14 +6,73 @@ use std::time::Duration;
 
 use model_serving_domain::error::{DomainError, ErrorCode, Result};
 use model_serving_domain::model::{Instance, InstanceState};
+use model_serving_domain::state_machine::transition_instance;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransaction};
 
-use crate::mapping::{now, storage_error};
+use crate::mapping::{now, storage_error, ts_string, wire_token};
 use crate::repos::{AuditEvent, AuditKind, AuditRepo, InstancesRepo};
 
 /// The `busy_timeout` enforced on every connection, in seconds.
 pub const BUSY_TIMEOUT_SECS: u64 = 10;
+
+/// Ensure the on-disk database file is owner-only (`0600`), per
+/// `docs/security-and-deployment.md` (the file holds credentials-adjacent
+/// state and must not be group/world readable).
+///
+/// If the file does not yet exist it is created owner-only up front (so the
+/// first byte SQLite writes already lands in a `0600` file — no permissive
+/// window); if it exists and is more permissive than `0600` (any group/other
+/// bit set) it is tightened to `0600`. The `set_permissions` call is what makes
+/// the result deterministic regardless of the process `umask`.
+///
+/// Unix-only: on Windows the file-attribute model differs and this is a no-op.
+///
+/// # Errors
+///
+/// [`ErrorCode::Internal`] if the file cannot be stat-ed, created, or `chmod`-ed.
+#[cfg(unix)]
+fn secure_db_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    DomainError::with_message(
+                        ErrorCode::Internal,
+                        format!("create database file {path:?}: {e}"),
+                    )
+                })?;
+            std::fs::metadata(path).map_err(|e| {
+                DomainError::with_message(
+                    ErrorCode::Internal,
+                    format!("stat database file {path:?}: {e}"),
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(DomainError::with_message(
+                ErrorCode::Internal,
+                format!("stat database file {path:?}: {e}"),
+            ));
+        }
+    };
+    // Deterministically force owner-only (0600) regardless of umask.
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            DomainError::with_message(
+                ErrorCode::Internal,
+                format!("set database file {path:?} permissions to 0600: {e}"),
+            )
+        })?;
+    }
+    Ok(())
+}
 
 /// A pooled SQLite connection with the mandatory PRAGMAs applied at connect
 /// time: `journal_mode = WAL`, `foreign_keys = ON`,
@@ -41,8 +100,11 @@ impl SqliteStore {
     ///
     /// The domain `Internal` error code if the database cannot be opened.
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        #[cfg(unix)]
+        secure_db_file(path)?;
         let options = SqliteConnectOptions::new()
-            .filename(path.as_ref())
+            .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
@@ -117,17 +179,41 @@ impl SqliteStore {
         let at = now();
         let mut tx = self.transaction().await?;
         for found in &stale {
-            // Validate the move through the domain state machine (never a
-            // raw write):
-            let _ = found.clone().with_state(InstanceState::Crashed)?;
-            InstancesRepo::write_state(
-                &mut *tx,
-                found.instance_id(),
-                InstanceState::Crashed,
-                &None,
-                at,
+            // Validate the move through the frozen domain state machine (never
+            // a raw write). The expected `from` is the state just read, so the
+            // guarded update below needs no re-SELECT on the transaction
+            // connection (`&mut SqliteConnection` is not `Copy`, so the
+            // two-query repository guard cannot run in a transaction).
+            transition_instance(found.state(), InstanceState::Crashed).map_err(|_| {
+                DomainError::with_message(
+                    ErrorCode::InvalidStateTransition,
+                    format!(
+                        "instance {} in {:?} cannot legally reach crashed",
+                        found.instance_id(),
+                        found.state()
+                    ),
+                )
+            })?;
+            let result = sqlx::query(
+                "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
+                 WHERE instance_id = ?1 AND state = ?4",
             )
-            .await?;
+            .bind(found.instance_id())
+            .bind(wire_token(&InstanceState::Crashed))
+            .bind(ts_string(at))
+            .bind(wire_token(&found.state()))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| storage_error(&e, "write instance state"))?;
+            if result.rows_affected() == 0 {
+                return Err(DomainError::with_message(
+                    ErrorCode::InvalidStateTransition,
+                    format!(
+                        "instance {} changed state before recovery applied",
+                        found.instance_id()
+                    ),
+                ));
+            }
             AuditRepo::append(
                 &mut *tx,
                 &AuditEvent::new(

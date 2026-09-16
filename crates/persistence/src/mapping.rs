@@ -146,6 +146,9 @@ pub(crate) fn storage_error(err: &sqlx::Error, context: &str) -> DomainError {
             // constraint violation is reported as "... constraint failed: ...".
             let message = db.message();
             if message.contains("CHECK constraint failed") {
+                // Only the *named* state fences are state-machine violations;
+                // every other CHECK (unnamed kind fences, value ranges,
+                // booleans) is a data-integrity problem -> `InvalidRequest`.
                 let fence = STATE_FENCE_CONSTRAINTS
                     .iter()
                     .find(|name| message.contains(*name));
@@ -155,7 +158,7 @@ pub(crate) fn storage_error(err: &sqlx::Error, context: &str) -> DomainError {
                         format!("{context}: state rejected by the {name} constraint"),
                     ),
                     None => DomainError::with_message(
-                        ErrorCode::Internal,
+                        ErrorCode::InvalidRequest,
                         format!("{context}: check constraint violated: {message}"),
                     ),
                 }

@@ -18,18 +18,98 @@
 //! and the audit log are storage concerns of the control plane.
 
 use chrono::{DateTime, Utc};
-use model_serving_domain::error::Result;
+use model_serving_domain::error::{DomainError, ErrorCode, Result};
 use model_serving_domain::model::{
     Capabilities, Instance, InstanceFailure, InstanceHealth, InstanceState, LoadConfig, Model,
     Operation, OperationError, OperationKind, OperationState, Runtime, RuntimeKind,
 };
+use model_serving_domain::state_machine::{transition_instance, transition_operation};
 use serde::{Deserialize, Serialize};
+use sqlx::QueryBuilder;
 use sqlx::Sqlite;
 
 use crate::mapping::{
     as_i64, from_i64, from_json, now, parse_ts, parse_wire, storage_error, to_json, ts_string,
     wire_token,
 };
+
+/// The active `instances` list filters, in bind order. Kept as a `Vec` so the
+/// `WHERE` / `AND` separators are derived from the enumeration index rather
+/// than a mutable flag (which leaves a dead assignment when a trailing filter
+/// is absent).
+#[derive(Clone)]
+enum InstanceFilter {
+    ModelId(String),
+    State(InstanceState),
+}
+
+/// The active `operations` list filters, in bind order (see `InstanceFilter`).
+#[derive(Clone)]
+enum OperationFilter {
+    State(OperationState),
+    InstanceId(String),
+    ModelId(String),
+}
+
+/// Read a row's persisted state and validate a transition to `to` against the
+/// frozen domain state machine.
+///
+/// The schema's named `CHECK` fences only prove a token is *in the
+/// vocabulary*; this guard is what proves a write is a *legal* move
+/// (`docs/architecture.md` §8). It selects the row's `state` and, when the row
+/// exists, runs `transition` (the domain machine) on `(current, to)`. A
+/// transition the domain machine rejects returns `DomainError` with
+/// `ErrorCode::InvalidStateTransition`; an undecodable stored state is surfaced
+/// as `Internal`.
+///
+/// Returns the **current** state when the row exists, or `None` for a
+/// first-seen row (no prior state, so a legal initial state may be written and
+/// no transition check applies). Callers then issue a write guarded on the
+/// returned state (`UPDATE ... WHERE <state_col> = <returned>`). Because the
+/// SELECT and the write must run on the same executor, callers pass a
+/// re-usable executor (a pool handle, `Copy`); atomic multi-table guarded
+/// writes are performed inline on a transaction connection.
+async fn validate_state<'c, E, S>(
+    exec: E,
+    table: &str,
+    key_col: &str,
+    key: &str,
+    to: S,
+    transition: fn(S, S) -> Result<S>,
+) -> Result<Option<S>>
+where
+    E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+    S: std::fmt::Debug + Copy + Send + serde::de::DeserializeOwned + 'c,
+{
+    let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
+    let current: Option<String> = sqlx::query_scalar(&sql)
+        .bind(key)
+        .fetch_optional(exec)
+        .await
+        .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
+    match current {
+        None => Ok(None),
+        Some(raw) => {
+            let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+            transition(current, to)?;
+            Ok(Some(current))
+        }
+    }
+}
+
+/// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
+/// guard validated the state, so a row that vanished or moved in the interim
+/// means the update raced the state machine.
+#[track_caller]
+fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
+    if rows_affected == 0 {
+        return Err(DomainError::with_message(
+            ErrorCode::InvalidStateTransition,
+            format!("{subject} changed state before the update applied"),
+        ));
+    }
+    Ok(())
+}
 
 /// A controlled scan directory (`docs/api.md` §5 model-roots).
 ///
@@ -516,24 +596,29 @@ fn model_root_from_row(row: ModelRootRow) -> Result<ModelRoot> {
 pub struct RuntimeRepo;
 
 impl RuntimeRepo {
+    /// Insert or update a runtime record, touching only the CRUD-owned
+    /// columns. The `last_probe_ok` / `last_probed_at` probe columns are
+    /// deliberately **not** in this statement: they belong to the probe path
+    /// (M1 job 5) and a CRUD write must never clobber a probe result (and a
+    /// probe write must never clobber a CRUD write). Probe results are
+    /// recorded via [`Self::record_runtime_probe`].
     const UPSERT: &str = "
         INSERT INTO runtimes (
-            id, kind, executable_path, enabled, version_text, capabilities, fixed_args,
-            last_probe_ok, last_probed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            id, kind, executable_path, enabled, version_text, capabilities, fixed_args
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (id) DO UPDATE SET
             kind = excluded.kind,
             executable_path = excluded.executable_path,
             enabled = excluded.enabled,
             version_text = excluded.version_text,
             capabilities = excluded.capabilities,
-            fixed_args = excluded.fixed_args,
-            last_probe_ok = excluded.last_probe_ok,
-            last_probed_at = excluded.last_probed_at
+            fixed_args = excluded.fixed_args
     ";
 
-    /// Insert or update a runtime record by `id`. The `last_probe_ok` /
-    /// `last_probed_at` fields carry the record's most recent probe outcome.
+    /// Insert or update a runtime record by `id`, writing only the CRUD-owned
+    /// columns. The most recent probe outcome (`last_probe_ok` /
+    /// `last_probed_at`) is left untouched — record it via
+    /// [`Self::record_runtime_probe`].
     ///
     /// # Errors
     ///
@@ -551,11 +636,36 @@ impl RuntimeRepo {
             .bind(&runtime.version_text)
             .bind(to_json(&runtime.capabilities, "capabilities")?)
             .bind(to_json(&runtime.fixed_args, "fixed_args")?)
-            .bind(record.last_probe_ok)
-            .bind(record.last_probed_at.map(ts_string))
             .execute(exec)
             .await
             .map_err(|e| storage_error(&e, "upsert runtime"))?;
+        Ok(())
+    }
+
+    /// Record a runtime probe outcome, touching **only** the
+    /// `last_probe_ok` / `last_probed_at` columns — the probe path (M1 job 5)
+    /// must never clobber a CRUD write, and a CRUD write must never clobber a
+    /// probe result. A runtime that does not exist is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on storage failure.
+    pub async fn record_runtime_probe<'c, E>(
+        exec: E,
+        id: &str,
+        ok: bool,
+        at: DateTime<Utc>,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+    {
+        sqlx::query("UPDATE runtimes SET last_probe_ok = ?1, last_probed_at = ?2 WHERE id = ?3")
+            .bind(ok)
+            .bind(ts_string(at))
+            .bind(id)
+            .execute(exec)
+            .await
+            .map_err(|e| storage_error(&e, "record runtime probe"))?;
         Ok(())
     }
 
@@ -669,12 +779,37 @@ impl InstancesRepo {
     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
     /// `InvalidStateTransition` if the stored state tokens escape the state
     /// fences (defensive), `Internal` otherwise.
+    /// Insert or update an instance row. On insert `desired_state` starts at
+    /// the instance's current state; on update the stored `desired_state` is
+    /// preserved (drive it explicitly via [`Self::set_desired_state`]).
+    ///
+    /// The write is guarded against the persisted state: on an existing row
+    /// the row's current state is validated through the domain state machine
+    /// before the (guarded) update, so an illegal move such as `failed -> ready`
+    /// is rejected and the row left unchanged (`docs/architecture.md` §8).
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` on a constraint violation (unknown model / runtime),
+    /// `InvalidStateTransition` for an illegal state transition or a row that
+    /// raced the guard, `Internal` otherwise.
     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
     where
-        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
     {
-        let at = now();
-        let state = instance.state();
+        let to = instance.state();
+        let expected = validate_state(
+            exec,
+            "instances",
+            "instance_id",
+            &instance.instance_id,
+            to,
+            transition_instance,
+        )
+        .await?;
+        let to_token = wire_token(&to);
+        let load_config = to_json(&instance.load_config, "load_config")?;
+        let device_ids = to_json(&instance.device_ids, "device_ids")?;
         let health = instance
             .health
             .as_ref()
@@ -685,55 +820,89 @@ impl InstancesRepo {
             .as_ref()
             .map(|f| to_json(f, "failure"))
             .transpose()?;
+        let at = now();
         let at_str = ts_string(at);
-        sqlx::query(
-            "INSERT INTO instances (
-                instance_id, model_id, runtime_id, load_config,
-                state, desired_state, pid, port, device_ids,
-                started_at, last_used_at, active_requests, health, failure,
-                created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT (instance_id) DO UPDATE SET
-                model_id = excluded.model_id,
-                runtime_id = excluded.runtime_id,
-                load_config = excluded.load_config,
-                state = excluded.state,
-                pid = excluded.pid,
-                port = excluded.port,
-                device_ids = excluded.device_ids,
-                started_at = excluded.started_at,
-                last_used_at = excluded.last_used_at,
-                active_requests = excluded.active_requests,
-                health = excluded.health,
-                failure = excluded.failure,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&instance.instance_id)
-        .bind(&instance.model_id)
-        .bind(&instance.runtime_id)
-        .bind(to_json(&instance.load_config, "load_config")?)
-        .bind(wire_token(&state))
-        .bind(wire_token(&state))
-        .bind(instance.pid.map(u64::from).map(as_i64))
-        .bind(instance.port.map(i32::from))
-        .bind(to_json(&instance.device_ids, "device_ids")?)
-        .bind(instance.started_at.map(ts_string))
-        .bind(instance.last_used_at.map(ts_string))
-        .bind(i64::from(instance.active_requests))
-        .bind(health)
-        .bind(failure)
-        .bind(&at_str)
-        .bind(&at_str)
-        .execute(exec)
-        .await
-        .map_err(|e| storage_error(&e, "upsert instance"))?;
+        let pid = instance.pid.map(u64::from).map(as_i64);
+        let port = instance.port.map(i32::from);
+        let started_at = instance.started_at.map(ts_string);
+        let last_used_at = instance.last_used_at.map(ts_string);
+        let active_requests = i64::from(instance.active_requests);
+
+        match expected {
+            None => {
+                // First-seen row: insert with `desired_state` = state.
+                sqlx::query(
+                    "INSERT INTO instances (
+                        instance_id, model_id, runtime_id, load_config,
+                        state, desired_state, pid, port, device_ids,
+                        started_at, last_used_at, active_requests, health, failure,
+                        created_at, updated_at
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&instance.instance_id)
+                .bind(&instance.model_id)
+                .bind(&instance.runtime_id)
+                .bind(&load_config)
+                .bind(&to_token)
+                .bind(&to_token)
+                .bind(pid)
+                .bind(port)
+                .bind(&device_ids)
+                .bind(started_at)
+                .bind(last_used_at)
+                .bind(active_requests)
+                .bind(health)
+                .bind(failure)
+                .bind(&at_str)
+                .bind(&at_str)
+                .execute(exec)
+                .await
+                .map_err(|e| storage_error(&e, "upsert instance"))?;
+            }
+            Some(expected_state) => {
+                // Existing row: guarded update (`desired_state` preserved).
+                let expected_token = wire_token(&expected_state);
+                let result = sqlx::query(
+                    "UPDATE instances SET
+                         model_id = ?, runtime_id = ?, load_config = ?,
+                         state = ?, pid = ?, port = ?, device_ids = ?,
+                         started_at = ?, last_used_at = ?, active_requests = ?,
+                         health = ?, failure = ?, updated_at = ?
+                     WHERE instance_id = ? AND state = ?",
+                )
+                .bind(&instance.model_id)
+                .bind(&instance.runtime_id)
+                .bind(&load_config)
+                .bind(&to_token)
+                .bind(pid)
+                .bind(port)
+                .bind(&device_ids)
+                .bind(started_at)
+                .bind(last_used_at)
+                .bind(active_requests)
+                .bind(health)
+                .bind(failure)
+                .bind(&at_str)
+                .bind(&instance.instance_id)
+                .bind(&expected_token)
+                .execute(exec)
+                .await
+                .map_err(|e| storage_error(&e, "upsert instance"))?;
+                require_state_write(
+                    result.rows_affected(),
+                    &format!("instance {}", instance.instance_id),
+                )?;
+            }
+        }
         Ok(())
     }
 
     /// Drive an instance's `desired_state` (written together with the
     /// triggering operation + audit event in one transaction —
-    /// `docs/architecture.md` §9). The token is fenced by the schema's
-    /// `instance_desired_state_valid` `CHECK`.
+    /// `docs/architecture.md` §9). `desired_state` is the target an in-flight
+    /// operation drives the instance toward, so it is fenced only by the
+    /// schema's `instance_desired_state_valid` vocabulary `CHECK` (not by the
+    /// lifecycle state machine, which fences the *actual* `state` column).
     ///
     /// # Errors
     ///
@@ -760,13 +929,15 @@ impl InstancesRepo {
     }
 
     /// Write an instance's actual lifecycle state (plus an optional
-    /// structured failure and the `updated_at` stamp). Callers validate the
-    /// move through the domain state machine first (e.g. via
-    /// [`Instance::with_state`]); the schema fence still guards the write.
+    /// structured failure and the `updated_at` stamp). The move is validated
+    /// against the row's persisted state through the domain state machine
+    /// (e.g. `Instance::with_state` encodes the same rules); the update is
+    /// guarded on the persisted state, so a concurrent change is rejected.
     ///
     /// # Errors
     ///
-    /// `InvalidStateTransition` for a fenced-out token, `Internal` otherwise.
+    /// `InvalidStateTransition` for an illegal move from the persisted state,
+    /// `Internal` otherwise.
     pub async fn write_state<'c, E>(
         exec: E,
         instance_id: &str,
@@ -775,22 +946,38 @@ impl InstancesRepo {
         updated_at: DateTime<Utc>,
     ) -> Result<()>
     where
-        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
     {
         let failure_json = failure
             .as_ref()
             .map(|f| to_json(f, "failure"))
             .transpose()?;
-        sqlx::query(
-            "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 WHERE instance_id = ?1",
+        let expected = validate_state(
+            exec,
+            "instances",
+            "instance_id",
+            instance_id,
+            state,
+            transition_instance,
         )
-        .bind(instance_id)
-        .bind(wire_token(&state))
-        .bind(failure_json)
-        .bind(ts_string(updated_at))
-        .execute(exec)
-        .await
-        .map_err(|e| storage_error(&e, "write instance state"))?;
+        .await?;
+        let state_token = wire_token(&state);
+        if let Some(expected_state) = expected {
+            let expected_token = wire_token(&expected_state);
+            let result = sqlx::query(
+                "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
+                 WHERE instance_id = ?1 AND state = ?5",
+            )
+            .bind(instance_id)
+            .bind(&state_token)
+            .bind(&failure_json)
+            .bind(ts_string(updated_at))
+            .bind(&expected_token)
+            .execute(exec)
+            .await
+            .map_err(|e| storage_error(&e, "write instance state"))?;
+            require_state_write(result.rows_affected(), &format!("instance {instance_id}"))?;
+        }
         Ok(())
     }
 
@@ -817,7 +1004,9 @@ impl InstancesRepo {
     }
 
     /// List instances filtered by [`InstanceQuery`] (model `id` and/or
-    /// actual state), ordered by `instance_id`.
+    /// actual state), ordered by `instance_id`. Every user-controllable
+    /// filter value is bound as a parameter (never string-interpolated into
+    /// the SQL), so no caller input can alter the query structure.
     ///
     /// # Errors
     ///
@@ -826,24 +1015,39 @@ impl InstancesRepo {
     where
         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
     {
-        let mut clauses: Vec<String> = Vec::new();
-        if let Some(model_id) = query.model_id {
-            clauses.push(format!("model_id = {model_id:?}"));
-        }
-        if let Some(state) = query.state {
-            clauses.push(format!("state = {:?}", wire_token(&state)));
-        }
-        let mut sql = String::from(
+        let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT instance_id, model_id, runtime_id, load_config, state, \
              pid, port, device_ids, started_at, last_used_at, active_requests, \
              health, failure FROM instances",
         );
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
+        let mut filters = Vec::new();
+        if let Some(model_id) = &query.model_id {
+            filters.push(InstanceFilter::ModelId(model_id.clone()));
         }
-        sql.push_str(" ORDER BY instance_id");
-        let rows: Vec<InstanceRow> = sqlx::query_as(&sql)
+        if let Some(state) = query.state {
+            filters.push(InstanceFilter::State(state));
+        }
+        if !filters.is_empty() {
+            builder.push(" WHERE ");
+        }
+        for (i, filter) in filters.iter().enumerate() {
+            if i > 0 {
+                builder.push(" AND ");
+            }
+            match filter {
+                InstanceFilter::ModelId(id) => {
+                    builder.push("model_id = ");
+                    builder.push_bind(id.clone());
+                }
+                InstanceFilter::State(state) => {
+                    builder.push("state = ");
+                    builder.push_bind(wire_token(state));
+                }
+            }
+        }
+        builder.push(" ORDER BY instance_id");
+        let rows: Vec<InstanceRow> = builder
+            .build_query_as()
             .fetch_all(exec)
             .await
             .map_err(|e| storage_error(&e, "list instances"))?;
@@ -957,12 +1161,18 @@ fn instance_from_row(row: InstanceRow) -> Result<Instance> {
     for step in reach_path(state) {
         instance = instance.with_state(*step)?;
     }
-    if let Some(pid) = row.pid.and_then(|v| from_i64::<u32>(v, "pid").ok()) {
-        instance.pid = Some(pid);
-    }
-    if let Some(port) = row.port.and_then(|v| from_i64::<u16>(v, "port").ok()) {
-        instance.port = Some(port);
-    }
+    // `pid` / `port` are only trusted once the supervisor confirms them, so a
+    // SQL NULL stays `None`; but a non-NULL value that is out of the column's
+    // unsigned domain is data corruption and must surface `Internal`, never be
+    // silently dropped to `None` (`docs/architecture.md` §3).
+    instance.pid = match row.pid {
+        None => None,
+        Some(v) => Some(from_i64::<u32>(v, "pid")?),
+    };
+    instance.port = match row.port {
+        None => None,
+        Some(v) => Some(from_i64::<u16>(v, "port")?),
+    };
     instance.device_ids = from_json::<Vec<u32>>(&row.device_ids, "device_ids")?;
     if let Some(raw) = &row.started_at {
         instance.started_at = Some(parse_ts(raw, "started_at")?);
@@ -1053,17 +1263,30 @@ impl OperationsRepo {
 
     /// Persist a state advance of an existing operation (terminal or not):
     /// `state`, `finished_at`, the structured `error` and `result` are
-    /// rewritten from the passed domain value. Returns `false` when no such
-    /// operation exists.
+    /// rewritten from the passed domain value. The move is validated against
+    /// the row's persisted state through the domain operation state machine,
+    /// and the update is guarded on that state (`docs/architecture.md` §8).
+    /// Returns `false` when no such operation exists.
     ///
     /// # Errors
     ///
-    /// `InvalidStateTransition` if the stored state token escapes the fence,
-    /// `Internal` otherwise.
+    /// `InvalidStateTransition` for an illegal move from the persisted state
+    /// (or a row that raced the guard), `Internal` otherwise.
     pub async fn advance<'c, E>(exec: E, operation: &Operation) -> Result<bool>
     where
-        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+        E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,
     {
+        let to = operation.state();
+        let expected = validate_state(
+            exec,
+            "operations",
+            "operation_id",
+            &operation.operation_id,
+            to,
+            transition_operation,
+        )
+        .await?;
+        let to_token = wire_token(&to);
         let error_json = operation
             .error
             .as_ref()
@@ -1074,19 +1297,31 @@ impl OperationsRepo {
             .as_ref()
             .map(|r| to_json(r, "result"))
             .transpose()?;
-        let result = sqlx::query(
-            "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
-             WHERE operation_id = ?1",
-        )
-        .bind(&operation.operation_id)
-        .bind(wire_token(&operation.state()))
-        .bind(operation.finished_at.map(ts_string))
-        .bind(error_json)
-        .bind(result_json)
-        .execute(exec)
-        .await
-        .map_err(|e| storage_error(&e, "advance operation"))?;
-        Ok(result.rows_affected() > 0)
+        let finished_at = operation.finished_at.map(ts_string);
+        match expected {
+            None => Ok(false),
+            Some(expected_state) => {
+                let expected_token = wire_token(&expected_state);
+                let result = sqlx::query(
+                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
+                     WHERE operation_id = ?1 AND state = ?6",
+                )
+                .bind(&operation.operation_id)
+                .bind(&to_token)
+                .bind(finished_at)
+                .bind(error_json)
+                .bind(result_json)
+                .bind(&expected_token)
+                .execute(exec)
+                .await
+                .map_err(|e| storage_error(&e, "advance operation"))?;
+                require_state_write(
+                    result.rows_affected(),
+                    &format!("operation {}", operation.operation_id),
+                )?;
+                Ok(true)
+            }
+        }
     }
 
     /// Fetch one operation by `operation_id`.
@@ -1112,7 +1347,8 @@ impl OperationsRepo {
     }
 
     /// List operations filtered by [`OperationQuery`], ordered by
-    /// `created_at` then `operation_id`.
+    /// `created_at` then `operation_id`. Every filter value is bound as a
+    /// parameter — no caller input is spliced into the SQL string.
     ///
     /// # Errors
     ///
@@ -1121,26 +1357,45 @@ impl OperationsRepo {
     where
         E: sqlx::Executor<'c, Database = Sqlite> + 'c,
     {
-        let mut clauses: Vec<String> = Vec::new();
-        if let Some(state) = query.state {
-            clauses.push(format!("state = {:?}", wire_token(&state)));
-        }
-        if let Some(instance_id) = query.instance_id {
-            clauses.push(format!("instance_id = {instance_id:?}"));
-        }
-        if let Some(model_id) = query.model_id {
-            clauses.push(format!("model_id = {model_id:?}"));
-        }
-        let mut sql = String::from(
+        let mut builder = QueryBuilder::<Sqlite>::new(
             "SELECT operation_id, kind, state, instance_id, model_id, \
              created_at, finished_at, error, result FROM operations",
         );
-        if !clauses.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&clauses.join(" AND "));
+        let mut filters = Vec::new();
+        if let Some(state) = query.state {
+            filters.push(OperationFilter::State(state));
         }
-        sql.push_str(" ORDER BY created_at, operation_id");
-        let rows: Vec<OperationRow> = sqlx::query_as(&sql)
+        if let Some(instance_id) = &query.instance_id {
+            filters.push(OperationFilter::InstanceId(instance_id.clone()));
+        }
+        if let Some(model_id) = &query.model_id {
+            filters.push(OperationFilter::ModelId(model_id.clone()));
+        }
+        if !filters.is_empty() {
+            builder.push(" WHERE ");
+        }
+        for (i, filter) in filters.iter().enumerate() {
+            if i > 0 {
+                builder.push(" AND ");
+            }
+            match filter {
+                OperationFilter::State(state) => {
+                    builder.push("state = ");
+                    builder.push_bind(wire_token(state));
+                }
+                OperationFilter::InstanceId(id) => {
+                    builder.push("instance_id = ");
+                    builder.push_bind(id.clone());
+                }
+                OperationFilter::ModelId(id) => {
+                    builder.push("model_id = ");
+                    builder.push_bind(id.clone());
+                }
+            }
+        }
+        builder.push(" ORDER BY created_at, operation_id");
+        let rows: Vec<OperationRow> = builder
+            .build_query_as()
             .fetch_all(exec)
             .await
             .map_err(|e| storage_error(&e, "list operations"))?;

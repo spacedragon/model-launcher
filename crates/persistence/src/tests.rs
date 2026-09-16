@@ -15,6 +15,9 @@ use model_serving_domain::model::{
     RuntimeKind,
 };
 
+use sqlx::Connection;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
+
 use crate::SqliteStore;
 use crate::repos::{
     AuditEvent, AuditKind, AuditRepo, InstanceQuery, InstancesRepo, ModelRoot, ModelRootsRepo,
@@ -219,11 +222,16 @@ fn assert_code(err: &DomainError, expected: ErrorCode) {
 async fn pragmas_are_enforced_on_every_connection() {
     let fixture = Fixture::new().await.expect("fixture");
     let pool = fixture.store.pool();
-
-    for _ in 0..3 {
-        let mut connection = pool.acquire().await.expect("acquire connection");
+    // Hold several distinct pooled connections alive at once (6 < the default
+    // pool max of 10) so the pool cannot recycle a single physical
+    // connection: EACH of them must independently carry the PRAGMAs.
+    let mut connections = Vec::with_capacity(6);
+    for _ in 0..6 {
+        connections.push(pool.acquire().await.expect("acquire connection"));
+    }
+    for connection in &mut connections {
         let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut **connection)
             .await
             .expect("journal mode query");
         assert_eq!(
@@ -231,42 +239,58 @@ async fn pragmas_are_enforced_on_every_connection() {
             "every pooled connection must be in WAL mode"
         );
         let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut **connection)
             .await
             .expect("foreign keys query");
         assert_eq!(foreign_keys, 1, "foreign keys must be ON");
         let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut **connection)
             .await
             .expect("busy timeout query");
         assert_eq!(busy_timeout, 10_000);
-        drop(connection);
     }
 }
 
 #[tokio::test]
 async fn wal_files_exist_and_persist_across_reopen() {
     let fixture = Fixture::new().await.expect("fixture");
-    // A commit must happen so the WAL side file is created.
-    ModelsRepo::upsert(fixture.store.pool(), &model_fixture("m-wal"))
+    let Fixture {
+        dir: _keep_dir,
+        db_path,
+        store,
+    } = fixture;
+    // A commit must happen so the WAL side file is created and the WAL mode
+    // is persisted into the database file header.
+    ModelsRepo::upsert(store.pool(), &model_fixture("m-wal"))
         .await
         .expect("insert");
-    let wal_path = fixture.db_path.with_extension("sqlite-wal");
+    let wal_path = db_path.with_extension("sqlite-wal");
     assert!(
         wal_path.exists(),
         "WAL side file expected at {}",
         wal_path.display()
     );
 
-    // Reopen the same file in a second store: the database is readable and
-    // WAL mode persists (it is a file property).
-    let reopened = SqliteStore::open(&fixture.db_path).await.expect("reopen");
-    reopened.migrate().await.expect("idempotent migrate");
-    let models = ModelsRepo::list(reopened.pool(), false)
+    // Close the store's pool, then reopen with PLAIN options that do NOT
+    // request WAL. WAL mode is a persistent property of the database file, so
+    // a connection that never asked for WAL must still observe
+    // `journal_mode = wal` — proving the first store persisted it. (A
+    // `SqliteStore::open` reopen would itself re-apply WAL and prove nothing.)
+    drop(store);
+    let plain = SqliteConnectOptions::new()
+        .filename(db_path.as_path())
+        .create_if_missing(true);
+    let mut conn = SqliteConnection::connect_with(&plain)
         .await
-        .expect("list");
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0].key, "m-wal");
+        .expect("plain connect");
+    let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut conn)
+        .await
+        .expect("journal mode query");
+    assert_eq!(
+        journal, "wal",
+        "WAL mode must persist across a plain reopen"
+    );
 }
 
 #[tokio::test]
@@ -419,30 +443,65 @@ async fn model_root_round_trip_and_path_lookup() {
 async fn runtime_round_trip_keeps_probe_columns() {
     let fixture = Fixture::new().await.expect("fixture");
     let pool = fixture.store.pool();
-    let record = runtime_record("llama-1", RuntimeKind::LlamaCpp);
-    RuntimeRepo::upsert(pool, &record)
-        .await
-        .expect("upsert runtime");
 
-    let found = RuntimeRepo::get(pool, "llama-1")
+    // CRUD upsert writes ONLY the CRUD columns. The record below carries probe
+    // fields, but the upsert must ignore them — so after a pure CRUD write the
+    // probe columns are still NULL (the probe path has not run yet).
+    let crud = RuntimeWithProbe {
+        runtime: runtime_fixture("llama-1", RuntimeKind::LlamaCpp),
+        last_probe_ok: Some(false),
+        last_probed_at: Some(ts(T0)),
+    };
+    RuntimeRepo::upsert(pool, &crud).await.expect("crud upsert");
+    let after_crud = RuntimeRepo::get(pool, "llama-1")
         .await
         .expect("get")
         .expect("row present");
-    assert_eq!(found, record);
+    assert!(
+        after_crud.last_probe_ok.is_none(),
+        "CRUD must not set last_probe_ok"
+    );
+    assert!(
+        after_crud.last_probed_at.is_none(),
+        "CRUD must not set last_probed_at"
+    );
 
-    // A CRUD update (no new probe) preserves the probe columns and the rest
-    // of the row.
-    let mut updated = record.clone();
-    updated.runtime.version_text = Some("llama-1 0.2.0".into());
-    RuntimeRepo::upsert(pool, &updated)
+    // The probe path records an outcome, touching only the probe columns.
+    RuntimeRepo::record_runtime_probe(pool, "llama-1", true, ts(T1))
         .await
-        .expect("update runtime");
-    let again = RuntimeRepo::get(pool, "llama-1")
+        .expect("record probe");
+    let after_probe = RuntimeRepo::get(pool, "llama-1")
         .await
         .expect("get")
         .expect("row present");
-    assert_eq!(again, updated);
-    assert_eq!(again.last_probe_ok, Some(true));
+    assert_eq!(after_probe.last_probe_ok, Some(true));
+    assert_eq!(after_probe.last_probed_at, Some(ts(T1)));
+
+    // A subsequent CRUD update supplies NO probe data — the record carries
+    // decoy probe values that the upsert must ignore. The previously recorded
+    // probe columns must be UNCHANGED (not clobbered by the CRUD write).
+    let decoy = RuntimeWithProbe {
+        runtime: runtime_fixture("llama-1", RuntimeKind::LlamaCpp),
+        last_probe_ok: Some(false),
+        last_probed_at: Some(ts(T0)),
+    };
+    RuntimeRepo::upsert(pool, &decoy)
+        .await
+        .expect("crud update");
+    let after_update = RuntimeRepo::get(pool, "llama-1")
+        .await
+        .expect("get")
+        .expect("row present");
+    assert_eq!(
+        after_update.last_probe_ok,
+        Some(true),
+        "CRUD update must not clobber last_probe_ok"
+    );
+    assert_eq!(
+        after_update.last_probed_at,
+        Some(ts(T1)),
+        "CRUD update must not clobber last_probed_at"
+    );
 
     assert_eq!(RuntimeRepo::list(pool).await.expect("list").len(), 1);
     assert!(RuntimeRepo::delete(pool, "llama-1").await.expect("delete"));
@@ -635,13 +694,21 @@ async fn operation_round_trip_and_terminal_advance() {
     assert_eq!(fetched.state(), OperationState::Queued);
     assert_eq!(fetched.instance_id.as_deref(), Some("i-op"));
 
-    // Advance to a terminal failed state; the row now carries the
-    // structured error + finish time.
-    let mut failed = fetched.clone();
-    failed = failed
+    // Advance the STORED row through the legal intermediate state (queued ->
+    // running) before the terminal state (running -> failed). The persistence
+    // layer fences every state write on the current stored state via the domain
+    // state machine, so the row must traverse the same path the domain object
+    // does — a direct queued -> failed jump on the row would be rejected.
+    let running = fetched
+        .clone()
         .with_state(OperationState::Running)
         .expect("queued -> running");
-    failed = failed
+    assert!(
+        OperationsRepo::advance(pool, &running)
+            .await
+            .expect("advance to running")
+    );
+    let mut failed = running
         .with_state(OperationState::Failed)
         .expect("running -> failed");
     failed.finished_at = Some(ts(T2));
@@ -652,7 +719,7 @@ async fn operation_round_trip_and_terminal_advance() {
     assert!(
         OperationsRepo::advance(pool, &failed)
             .await
-            .expect("advance")
+            .expect("advance to failed")
     );
     let stored = OperationsRepo::get(pool, "op-1")
         .await
@@ -1037,4 +1104,220 @@ async fn non_terminal_operations_query_tracks_the_state_machine() {
     let pending = OperationsRepo::non_terminal(pool).await.expect("query");
     let ids: Vec<&str> = pending.iter().map(|o| o.operation_id.as_str()).collect();
     assert_eq!(ids, vec!["op-q", "op-r"], "terminal operations excluded");
+}
+
+// P1-1: every persisted state write must be fenced by the frozen domain
+// state machine. An illegal transition must be rejected with
+// InvalidStateTransition AND leave the row unchanged (write_state, upsert,
+// and operation advance are all covered).
+#[tokio::test]
+async fn state_writes_reject_illegal_transitions_and_preserve_rows() {
+    let fixture = Fixture::new().await.expect("fixture");
+    let store = &fixture.store;
+    let pool = store.pool();
+
+    // --- instances: write_state ---
+    seed(store, "m-ws", "i-ws", InstanceState::Ready).await;
+    InstancesRepo::write_state(pool, "i-ws", InstanceState::Draining, &None, ts(T2))
+        .await
+        .expect("legal ready -> draining must be accepted");
+    let err = InstancesRepo::write_state(pool, "i-ws", InstanceState::Queued, &None, ts(T2))
+        .await
+        .expect_err("illegal draining -> queued must be rejected");
+    assert_code(&err, ErrorCode::InvalidStateTransition);
+    assert_eq!(
+        InstancesRepo::get(pool, "i-ws")
+            .await
+            .expect("get")
+            .expect("row")
+            .state(),
+        InstanceState::Draining,
+        "the row must be unchanged after a rejected transition"
+    );
+
+    // --- instances: upsert of an existing row ---
+    seed(store, "m-up", "i-up", InstanceState::Ready).await;
+    let queued = non_terminal_instance("i-up", &model_fixture("m-up"), "rt", InstanceState::Queued);
+    let err = InstancesRepo::upsert(pool, &queued)
+        .await
+        .expect_err("upsert of an illegal transition must be rejected");
+    assert_code(&err, ErrorCode::InvalidStateTransition);
+    assert_eq!(
+        InstancesRepo::get(pool, "i-up")
+            .await
+            .expect("get")
+            .expect("row")
+            .state(),
+        InstanceState::Ready,
+    );
+
+    // --- operations: advance ---
+    seed(store, "m-op", "i-op", InstanceState::Queued).await;
+    let mut queued_op = Operation::new("op-illegal", OperationKind::Load);
+    queued_op.instance_id = Some("i-op".into());
+    OperationsRepo::create(pool, &queued_op)
+        .await
+        .expect("create operation (queued)");
+    // legal path: queued -> running -> succeeded (terminal)
+    let running = queued_op
+        .with_state(OperationState::Running)
+        .expect("queued -> running");
+    assert!(
+        OperationsRepo::advance(pool, &running)
+            .await
+            .expect("advance to running")
+    );
+    let mut succeeded = running
+        .with_state(OperationState::Succeeded)
+        .expect("running -> succeeded");
+    succeeded.finished_at = Some(ts(T2));
+    assert!(
+        OperationsRepo::advance(pool, &succeeded)
+            .await
+            .expect("advance to succeeded")
+    );
+    // illegal: succeeded (terminal) -> running
+    let mut queued_again = Operation::new("op-illegal", OperationKind::Load);
+    queued_again.instance_id = Some("i-op".into());
+    let back_to_running = queued_again
+        .with_state(OperationState::Running)
+        .expect("derive a running-state operation");
+    let err = OperationsRepo::advance(pool, &back_to_running)
+        .await
+        .expect_err("succeeded -> running must be rejected");
+    assert_code(&err, ErrorCode::InvalidStateTransition);
+    assert_eq!(
+        OperationsRepo::get(pool, "op-illegal")
+            .await
+            .expect("get")
+            .expect("row")
+            .state(),
+        OperationState::Succeeded,
+        "the operation must remain in its terminal state"
+    );
+}
+
+// P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
+// InvalidRequest, not InvalidStateTransition (state fences only) and not
+// Internal. The state fence names are the only ones that map to
+// InvalidStateTransition.
+#[tokio::test]
+async fn non_state_check_violation_maps_to_invalid_request() {
+    let fixture = Fixture::new().await.expect("fixture");
+    let store = &fixture.store;
+    seed(store, "m-port", "i-port", InstanceState::Ready).await;
+    let pool = store.pool();
+    let err = sqlx::query("UPDATE instances SET port = ?2 WHERE instance_id = ?1")
+        .bind("i-port")
+        .bind(99_999_i64)
+        .execute(pool)
+        .await
+        .expect_err("out-of-range port must violate the CHECK");
+    assert_code(
+        &crate::mapping::storage_error(&err, "write port"),
+        ErrorCode::InvalidRequest,
+    );
+}
+
+// P1-3: every user-controllable list filter value is bound as a literal. A
+// filter ID containing SQL metacharacters must not break the query and must
+// not match anything; a well-formed ID still matches its row.
+#[tokio::test]
+async fn list_filters_treat_injection_ids_as_literals() {
+    let fixture = Fixture::new().await.expect("fixture");
+    let store = &fixture.store;
+    seed(store, "m-inj", "i-inj", InstanceState::Ready).await;
+    let pool = store.pool();
+    let injection = "x\" OR \"1\"=\"1 --";
+    let by_model = InstancesRepo::list(
+        pool,
+        InstanceQuery {
+            model_id: Some(injection.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("injection model_id filter must not error");
+    assert!(
+        by_model.is_empty(),
+        "a double-quoted injection string must not match any row"
+    );
+    let ops = OperationsRepo::list(
+        pool,
+        OperationQuery {
+            instance_id: Some(injection.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("injection instance_id filter must not error");
+    assert!(
+        ops.is_empty(),
+        "a double-quoted injection string must not match any row"
+    );
+    let by_real_model = InstancesRepo::list(
+        pool,
+        InstanceQuery {
+            model_id: Some("m-inj-id".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("well-formed model_id filter must not error");
+    assert_eq!(
+        by_real_model.len(),
+        1,
+        "a real model_id must still match its instance"
+    );
+    assert_eq!(by_real_model[0].instance_id, "i-inj");
+}
+
+// P1-4 (Unix-only): the database file must carry user-only permissions.
+#[cfg(unix)]
+#[tokio::test]
+async fn db_file_has_user_only_permissions() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new().await.expect("fixture");
+    assert!(fixture.db_path.exists(), "the db file must exist");
+    // Reopen (idempotent) and re-assert the permissions on the db file.
+    let reopened = SqliteStore::open(&fixture.db_path).await.expect("reopen");
+    drop(reopened);
+    let meta = std::fs::metadata(&fixture.db_path).expect("stat the db file");
+    assert_eq!(
+        meta.mode() & 0o077,
+        0,
+        "the db file must not grant group or world access (mode {:o})",
+        meta.mode()
+    );
+}
+
+// P1-5: a stored value that is out of the domain's range (the `pid` column
+// has no range CHECK) must surface as Internal (a corrupt row) — it must not
+// be silently coerced to None and must not panic.
+#[tokio::test]
+async fn out_of_range_pid_surfaces_internal_not_none() {
+    let fixture = Fixture::new().await.expect("fixture");
+    let store = &fixture.store;
+    seed(store, "m-pid", "i-pid", InstanceState::Ready).await;
+    let pool = store.pool();
+    let too_big = i64::from(u32::MAX) + 2;
+    sqlx::query("UPDATE instances SET pid = ?2 WHERE instance_id = ?1")
+        .bind("i-pid")
+        .bind(too_big)
+        .execute(pool)
+        .await
+        .expect("store an out-of-u32-range pid");
+    let err = InstancesRepo::get(pool, "i-pid")
+        .await
+        .expect_err("an out-of-range pid must be an error");
+    assert_eq!(
+        err.code,
+        ErrorCode::Internal,
+        "a stored out-of-range pid must surface Internal, got: {err:?}"
+    );
+    assert!(
+        err.message.contains("pid"),
+        "message should name the column: {}",
+        err.message
+    );
 }
