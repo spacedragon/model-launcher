@@ -57,18 +57,26 @@ enum OperationFilter {
 /// The schema's named `CHECK` fences only prove a token is *in the
 /// vocabulary*; this guard is what proves a write is a *legal* move
 /// (`docs/architecture.md` §8). It selects the row's `state` and, when the row
-/// exists, runs `transition` (the domain machine) on `(current, to)`. A
-/// transition the domain machine rejects returns `DomainError` with
-/// `ErrorCode::InvalidStateTransition`; an undecodable stored state is surfaced
+/// exists and the target differs, runs `transition` (the domain machine) on
+/// `(current, to)`. A write whose target equals the persisted state is an
+/// idempotent *data* update (e.g. pid/health/progress while the lifecycle
+/// state is unchanged), not a transition: the frozen machine defines no
+/// self-loops, so same-state writes are accepted without consulting it.
+/// `ErrorCode::InvalidStateTransition` is returned when the domain machine
+/// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
 /// as `Internal`.
 ///
 /// Returns the **current** state when the row exists, or `None` for a
 /// first-seen row (no prior state, so a legal initial state may be written and
 /// no transition check applies). Callers then issue a write guarded on the
-/// returned state (`UPDATE ... WHERE <state_col> = <returned>`). Because the
-/// SELECT and the write must run on the same executor, callers pass a
-/// re-usable executor (a pool handle, `Copy`); atomic multi-table guarded
-/// writes are performed inline on a transaction connection.
+/// returned state (`UPDATE ... WHERE <state_col> = <returned>`) and must check
+/// `rows_affected`: the guarded update is a compare-and-set, so a row that
+/// moved concurrently affects 0 rows and the write is rejected, even though
+/// the SELECT and the UPDATE are separate statements (a transaction is not
+/// required for the guard to be safe). Callers pass a re-usable executor (a
+/// pool handle, `Copy`); on a transaction connection a non-`Copy` executor
+/// cannot be used twice, so the caller performs the single guarded `UPDATE`
+/// inline (the transaction's own read supplies `expected`).
 async fn validate_state<'c, E, S>(
     exec: E,
     table: &str,
@@ -79,7 +87,7 @@ async fn validate_state<'c, E, S>(
 ) -> Result<Option<S>>
 where
     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
-    S: std::fmt::Debug + Copy + Send + serde::de::DeserializeOwned + 'c,
+    S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
 {
     let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
     let current: Option<String> = sqlx::query_scalar(&sql)
@@ -91,7 +99,9 @@ where
         None => Ok(None),
         Some(raw) => {
             let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
-            transition(current, to)?;
+            if current != to {
+                transition(current, to)?;
+            }
             Ok(Some(current))
         }
     }
@@ -792,7 +802,11 @@ impl InstancesRepo {
     ///
     /// `InvalidRequest` on a constraint violation (unknown model / runtime),
     /// `InvalidStateTransition` for an illegal state transition or a row that
-    /// raced the guard, `Internal` otherwise.
+    /// raced the guard, `Internal` otherwise. A same-state upsert is an
+    /// idempotent *data* update (pid/health/progress while the lifecycle state
+    /// is unchanged) and is always legal: the frozen machine defines no
+    /// self-loops, so same-state writes skip the transition check (see
+    /// `validate_state`).
     pub async fn upsert<'c, E>(exec: E, instance: &Instance) -> Result<()>
     where
         E: sqlx::Executor<'c, Database = Sqlite> + Copy + 'c,

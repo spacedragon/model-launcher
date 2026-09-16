@@ -1197,6 +1197,53 @@ async fn state_writes_reject_illegal_transitions_and_preserve_rows() {
     );
 }
 
+// P1 (codex round 2): a same-state upsert is an idempotent data update, not a
+// transition. The frozen machine has no self-loops, so keeping the persisted
+// state while changing data (pid, active_requests, ...) must be accepted and
+// persisted; write_state of the same state is likewise a legal no-op move.
+#[tokio::test]
+async fn same_state_writes_are_idempotent_data_updates() {
+    let fixture = Fixture::new().await.expect("fixture");
+    let store = &fixture.store;
+    let pool = store.pool();
+
+    seed(store, "m-ss", "i-ss", InstanceState::Ready).await;
+    let found = InstancesRepo::get(pool, "i-ss")
+        .await
+        .expect("get")
+        .expect("row");
+    let mut updated = found.clone();
+    updated.pid = Some(4242);
+    updated.active_requests = 3;
+    InstancesRepo::upsert(pool, &updated)
+        .await
+        .expect("same-state upsert (Ready -> Ready with new data) must be accepted");
+    let after = InstancesRepo::get(pool, "i-ss")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(after.state(), InstanceState::Ready, "state is unchanged");
+    assert_eq!(after.pid, Some(4242), "the new pid is persisted");
+    assert_eq!(
+        after.active_requests, 3,
+        "the new active_requests is persisted"
+    );
+
+    // write_state of the same state is a legal no-op move (e.g. recording a
+    // refreshed failure while already in the same state).
+    InstancesRepo::write_state(pool, "i-ss", InstanceState::Ready, &None, ts(T2))
+        .await
+        .expect("same-state write_state must be accepted");
+    assert_eq!(
+        InstancesRepo::get(pool, "i-ss")
+            .await
+            .expect("get")
+            .expect("row")
+            .state(),
+        InstanceState::Ready
+    );
+}
+
 // P1-2: a NON-state CHECK violation (here the `port` range CHECK) must map to
 // InvalidRequest, not InvalidStateTransition (state fences only) and not
 // Internal. The state fence names are the only ones that map to
