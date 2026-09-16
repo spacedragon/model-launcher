@@ -623,9 +623,11 @@ fn walk_skips_fifos() {
     let root = Root::new();
     root.write("real.gguf", b"x");
     let fifo = root.path().join("pipe.gguf");
-    let name = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).expect("cstring");
-    // `mkfifo` via the standard library: no unsafe, no external crate.
-    let status = std::process::Command::new("mkfifo").arg(&name).status();
+    // `mkfifo` is an ordinary process, so the argument is an `OsStr` path —
+    // `Command::arg` accepts a `Path` directly. A `CString` would be both wrong
+    // here (`CString` is not `AsRef<OsStr>`, which does not compile) and lossy
+    // (`to_string_lossy` mangles non-UTF-8 paths). No libc call is involved.
+    let status = std::process::Command::new("mkfifo").arg(&fifo).status();
     match status {
         Ok(status) if status.success() => {}
         // No `mkfifo` on this host: the non-regular-file branch is still
