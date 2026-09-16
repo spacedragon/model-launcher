@@ -1533,6 +1533,32 @@ const fn operation_reach_path(target: OperationState) -> &'static [OperationStat
 pub struct AuditRepo;
 
 impl AuditRepo {
+    /// Number of audit-log rows.
+    ///
+    /// This is a row count only. It is **not** the latest event id: ids are
+    /// autoincrement values that start at `1` and can contain gaps (a rolled
+    /// back transaction consumes its ids), so `count` and the newest id are
+    /// unrelated quantities. Callers that need the newest event id must read it
+    /// from the rows themselves; the log stays append-only, so the set of rows
+    /// only ever grows.
+    ///
+    /// # Errors
+    ///
+    /// `Internal` on storage failure.
+    pub async fn count<'c, E>(exec: E) -> Result<u64>
+    where
+        E: sqlx::Executor<'c, Database = Sqlite> + 'c,
+    {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM audit_events")
+            .fetch_one(exec)
+            .await
+            .map_err(|e| storage_error(&e, "count audit events"))?;
+        let count = row.try_get::<i64, _>("n").map_err(|e| {
+            DomainError::with_message(ErrorCode::Internal, format!("count audit events: {e}"))
+        })?;
+        Ok(u64::try_from(count).unwrap_or_default())
+    }
+
     /// Append one event. The autoincrement row id becomes the event id.
     ///
     /// # Errors
