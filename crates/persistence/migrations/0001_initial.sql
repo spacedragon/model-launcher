@@ -128,6 +128,7 @@ CREATE TABLE operations (
     instance_id  TEXT REFERENCES instances (instance_id) ON DELETE SET NULL,
     model_id     TEXT REFERENCES models (id) ON DELETE SET NULL,
     created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
     finished_at  TEXT,
     error        TEXT,
     result       TEXT

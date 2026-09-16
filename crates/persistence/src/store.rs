@@ -7,10 +7,11 @@ use std::time::Duration;
 use model_serving_domain::error::{DomainError, ErrorCode, Result};
 use model_serving_domain::model::{Instance, InstanceState};
 use model_serving_domain::state_machine::transition_instance;
+use sqlx::Row;
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteTransaction};
 
-use crate::mapping::{now, storage_error, ts_string, wire_token};
+use crate::mapping::{now, parse_wire, storage_error, ts_string, wire_token};
 use crate::repos::{AuditEvent, AuditKind, AuditRepo, InstancesRepo};
 
 /// The `busy_timeout` enforced on every connection, in seconds.
@@ -179,29 +180,61 @@ impl SqliteStore {
         let at = now();
         let mut tx = self.transaction().await?;
         for found in &stale {
-            // Validate the move through the frozen domain state machine (never
-            // a raw write). The expected `from` is the state just read, so the
-            // guarded update below needs no re-SELECT on the transaction
-            // connection (`&mut SqliteConnection` is not `Copy`, so the
-            // two-query repository guard cannot run in a transaction).
-            transition_instance(found.state(), InstanceState::Crashed).map_err(|_| {
+            // Re-read the row inside the transaction: the pool-based scan
+            // above predates it, and a legal `ready -> draining -> ready`
+            // cycle could have moved the row and back. Validate the move
+            // through the frozen domain state machine (never a raw write)
+            // against this fresh state, then guard the update on BOTH the
+            // state and the `updated_at` revision so a same-state ABA
+            // cycle is rejected too (`&mut SqliteConnection` is not `Copy`,
+            // so the two-query repository guard cannot run in a transaction;
+            // sequential re-borrows of the transaction do the same job).
+            let current =
+                sqlx::query("SELECT state, updated_at FROM instances WHERE instance_id = ?1")
+                    .bind(found.instance_id())
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|e| storage_error(&e, "read instance state"))?;
+            let Some(current) = current else {
+                return Err(DomainError::with_message(
+                    ErrorCode::Internal,
+                    format!(
+                        "instance {} vanished before recovery applied",
+                        found.instance_id()
+                    ),
+                ));
+            };
+            let raw_state = current.try_get::<String, _>(0).map_err(|e| {
+                DomainError::with_message(
+                    ErrorCode::Internal,
+                    format!("read instance {} state: {e}", found.instance_id()),
+                )
+            })?;
+            let revised = current.try_get::<String, _>(1).map_err(|e| {
+                DomainError::with_message(
+                    ErrorCode::Internal,
+                    format!("read instance {} updated_at: {e}", found.instance_id()),
+                )
+            })?;
+            let current_state = parse_wire::<InstanceState>(&raw_state, "instances.state")?;
+            transition_instance(current_state, InstanceState::Crashed).map_err(|_| {
                 DomainError::with_message(
                     ErrorCode::InvalidStateTransition,
                     format!(
-                        "instance {} in {:?} cannot legally reach crashed",
-                        found.instance_id(),
-                        found.state()
+                        "instance {} in {current_state:?} cannot legally reach crashed",
+                        found.instance_id()
                     ),
                 )
             })?;
             let result = sqlx::query(
                 "UPDATE instances SET state = ?2, failure = NULL, updated_at = ?3 \
-                 WHERE instance_id = ?1 AND state = ?4",
+                 WHERE instance_id = ?1 AND state = ?4 AND updated_at = ?5",
             )
             .bind(found.instance_id())
             .bind(wire_token(&InstanceState::Crashed))
             .bind(ts_string(at))
-            .bind(wire_token(&found.state()))
+            .bind(wire_token(&current_state))
+            .bind(&revised)
             .execute(&mut *tx)
             .await
             .map_err(|e| storage_error(&e, "write instance state"))?;

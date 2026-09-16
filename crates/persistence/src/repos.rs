@@ -26,6 +26,7 @@ use model_serving_domain::model::{
 use model_serving_domain::state_machine::{transition_instance, transition_operation};
 use serde::{Deserialize, Serialize};
 use sqlx::QueryBuilder;
+use sqlx::Row;
 use sqlx::Sqlite;
 
 use crate::mapping::{
@@ -66,17 +67,18 @@ enum OperationFilter {
 /// rejects a transition or a guarded write affects 0 rows; an undecodable stored state is surfaced
 /// as `Internal`.
 ///
-/// Returns the **current** state when the row exists, or `None` for a
-/// first-seen row (no prior state, so a legal initial state may be written and
-/// no transition check applies). Callers then issue a write guarded on the
-/// returned state (`UPDATE ... WHERE <state_col> = <returned>`) and must check
-/// `rows_affected`: the guarded update is a compare-and-set, so a row that
-/// moved concurrently affects 0 rows and the write is rejected, even though
-/// the SELECT and the UPDATE are separate statements (a transaction is not
-/// required for the guard to be safe). Callers pass a re-usable executor (a
-/// pool handle, `Copy`); on a transaction connection a non-`Copy` executor
-/// cannot be used twice, so the caller performs the single guarded `UPDATE`
-/// inline (the transaction's own read supplies `expected`).
+/// Returns the **current** state plus its `updated_at` revision when the row
+/// exists, or `None` for a first-seen row (no prior state, so a legal initial
+/// state may be written and no transition check applies). Callers then issue
+/// a write guarded on BOTH the returned state and revision
+/// (`UPDATE ... WHERE <state_col> = <returned state> AND updated_at = <returned
+/// revision>`) and must check `rows_affected`: the guarded update is a
+/// compare-and-set, so a row that moved concurrently affects 0 rows and the
+/// write is rejected, even though the SELECT and the UPDATE are separate
+/// statements (a transaction is not required for the guard to be safe).
+/// Guarding on `updated_at` as well as `state` closes the ABA hole: a
+/// concurrent legal `ready -> draining -> ready` cycle leaves `state`
+/// unchanged but bumps `updated_at`, so a stale write is still rejected.
 async fn validate_state<'c, E, S>(
     exec: E,
     table: &str,
@@ -84,32 +86,37 @@ async fn validate_state<'c, E, S>(
     key: &str,
     to: S,
     transition: fn(S, S) -> Result<S>,
-) -> Result<Option<S>>
+) -> Result<Option<(S, String)>>
 where
     E: sqlx::Executor<'c, Database = Sqlite> + 'c,
     S: std::fmt::Debug + Copy + PartialEq + Send + serde::de::DeserializeOwned + 'c,
 {
-    let sql = format!("SELECT state FROM {table} WHERE {key_col} = ?1");
-    let current: Option<String> = sqlx::query_scalar(&sql)
+    let sql = format!("SELECT state, updated_at FROM {table} WHERE {key_col} = ?1");
+    let row = sqlx::query(&sql)
         .bind(key)
         .fetch_optional(exec)
         .await
         .map_err(|e| storage_error(&e, &format!("read {table} state")))?;
-    match current {
-        None => Ok(None),
-        Some(raw) => {
-            let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
-            if current != to {
-                transition(current, to)?;
-            }
-            Ok(Some(current))
-        }
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let raw = row.try_get::<String, _>(0).map_err(|e| {
+        DomainError::with_message(ErrorCode::Internal, format!("read {table}.state: {e}"))
+    })?;
+    let updated_at = row.try_get::<String, _>(1).map_err(|e| {
+        DomainError::with_message(ErrorCode::Internal, format!("read {table}.updated_at: {e}"))
+    })?;
+    let current = parse_wire::<S>(&raw, &format!("{table}.state"))?;
+    if current != to {
+        transition(current, to)?;
     }
+    Ok(Some((current, updated_at)))
 }
 
 /// Surface a `0`-row guarded write as an `InvalidStateTransition` error: the
-/// guard validated the state, so a row that vanished or moved in the interim
-/// means the update raced the state machine.
+/// guard validated the state and revision, so a row that vanished or moved in
+/// the interim (including a same-state ABA cycle) means the update raced a
+/// concurrent writer.
 #[track_caller]
 fn require_state_write(rows_affected: u64, subject: &str) -> Result<()> {
     if rows_affected == 0 {
@@ -873,7 +880,7 @@ impl InstancesRepo {
                 .await
                 .map_err(|e| storage_error(&e, "upsert instance"))?;
             }
-            Some(expected_state) => {
+            Some((expected_state, expected_revised)) => {
                 // Existing row: guarded update (`desired_state` preserved).
                 let expected_token = wire_token(&expected_state);
                 let result = sqlx::query(
@@ -882,7 +889,7 @@ impl InstancesRepo {
                          state = ?, pid = ?, port = ?, device_ids = ?,
                          started_at = ?, last_used_at = ?, active_requests = ?,
                          health = ?, failure = ?, updated_at = ?
-                     WHERE instance_id = ? AND state = ?",
+                     WHERE instance_id = ? AND state = ? AND updated_at = ?",
                 )
                 .bind(&instance.model_id)
                 .bind(&instance.runtime_id)
@@ -899,6 +906,7 @@ impl InstancesRepo {
                 .bind(&at_str)
                 .bind(&instance.instance_id)
                 .bind(&expected_token)
+                .bind(&expected_revised)
                 .execute(exec)
                 .await
                 .map_err(|e| storage_error(&e, "upsert instance"))?;
@@ -976,17 +984,18 @@ impl InstancesRepo {
         )
         .await?;
         let state_token = wire_token(&state);
-        if let Some(expected_state) = expected {
+        if let Some((expected_state, expected_revised)) = expected {
             let expected_token = wire_token(&expected_state);
             let result = sqlx::query(
                 "UPDATE instances SET state = ?2, failure = ?3, updated_at = ?4 \
-                 WHERE instance_id = ?1 AND state = ?5",
+                 WHERE instance_id = ?1 AND state = ?5 AND updated_at = ?6",
             )
             .bind(instance_id)
             .bind(&state_token)
             .bind(&failure_json)
             .bind(ts_string(updated_at))
             .bind(&expected_token)
+            .bind(&expected_revised)
             .execute(exec)
             .await
             .map_err(|e| storage_error(&e, "write instance state"))?;
@@ -1257,14 +1266,15 @@ impl OperationsRepo {
         sqlx::query(
             "INSERT INTO operations (
                 operation_id, kind, state, instance_id, model_id,
-                created_at, finished_at, error, result
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                created_at, updated_at, finished_at, error, result
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&operation.operation_id)
         .bind(wire_token(&operation.kind))
         .bind(wire_token(&operation.state()))
         .bind(&operation.instance_id)
         .bind(&operation.model_id)
+        .bind(ts_string(created))
         .bind(ts_string(created))
         .bind(operation.finished_at.map(ts_string))
         .bind(error_json)
@@ -1314,18 +1324,20 @@ impl OperationsRepo {
         let finished_at = operation.finished_at.map(ts_string);
         match expected {
             None => Ok(false),
-            Some(expected_state) => {
+            Some((expected_state, expected_revised)) => {
                 let expected_token = wire_token(&expected_state);
                 let result = sqlx::query(
-                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5 \
-                     WHERE operation_id = ?1 AND state = ?6",
+                    "UPDATE operations SET state = ?2, finished_at = ?3, error = ?4, result = ?5, updated_at = ?6 \
+                     WHERE operation_id = ?1 AND state = ?7 AND updated_at = ?8",
                 )
                 .bind(&operation.operation_id)
                 .bind(&to_token)
                 .bind(finished_at)
                 .bind(error_json)
                 .bind(result_json)
+                .bind(ts_string(now()))
                 .bind(&expected_token)
+                .bind(&expected_revised)
                 .execute(exec)
                 .await
                 .map_err(|e| storage_error(&e, "advance operation"))?;
