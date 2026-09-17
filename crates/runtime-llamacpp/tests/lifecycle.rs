@@ -627,6 +627,134 @@ async fn adapter_launch_convenience_executes_lifecycle() {
     assert_process_dead(pid);
 }
 
+// ── Inference check validation (malformed JSON, empty choices, empty content) ──
+
+#[tokio::test]
+async fn inference_rejects_malformed_json_and_cleans_up() {
+    let port = free_port();
+    let spec = fake_spec("inference_malformed_json", port, "inf-malformed-model");
+    let mut lifecycle = LlamaCppLifecycle::launch_from_spec(
+        &spec,
+        port,
+        "inf-malformed-model".into(),
+        fast_config(),
+    )
+    .expect("spawn must succeed");
+
+    let pid = lifecycle.pid();
+    lifecycle
+        .wait_ready()
+        .await
+        .expect("readiness must succeed");
+    lifecycle
+        .verify_identity()
+        .await
+        .expect("identity must succeed");
+
+    let error = lifecycle
+        .verify_inference()
+        .await
+        .expect_err("verify_inference must reject malformed JSON");
+
+    match &error {
+        LifecycleError::InferenceCheck(msg) => {
+            assert!(
+                msg.contains("malformed JSON"),
+                "expected malformed JSON message, got: {msg}"
+            );
+        }
+        other => panic!("expected InferenceCheck error, got {other:?}"),
+    }
+
+    // Verify child is cleaned up on error and not orphaned
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_process_dead(pid);
+}
+
+#[tokio::test]
+async fn inference_rejects_empty_choices_and_cleans_up() {
+    let port = free_port();
+    let spec = fake_spec("inference_empty_choices", port, "inf-empty-choices-model");
+    let mut lifecycle = LlamaCppLifecycle::launch_from_spec(
+        &spec,
+        port,
+        "inf-empty-choices-model".into(),
+        fast_config(),
+    )
+    .expect("spawn must succeed");
+
+    let pid = lifecycle.pid();
+    lifecycle
+        .wait_ready()
+        .await
+        .expect("readiness must succeed");
+    lifecycle
+        .verify_identity()
+        .await
+        .expect("identity must succeed");
+
+    let error = lifecycle
+        .verify_inference()
+        .await
+        .expect_err("verify_inference must reject empty choices");
+
+    match &error {
+        LifecycleError::InferenceCheck(msg) => {
+            assert!(
+                msg.contains("empty 'choices'"),
+                "expected empty choices message, got: {msg}"
+            );
+        }
+        other => panic!("expected InferenceCheck error, got {other:?}"),
+    }
+
+    // Verify child is cleaned up on error and not orphaned
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_process_dead(pid);
+}
+
+#[tokio::test]
+async fn inference_rejects_empty_completion_content_and_cleans_up() {
+    let port = free_port();
+    let spec = fake_spec("inference_empty_content", port, "inf-empty-content-model");
+    let mut lifecycle = LlamaCppLifecycle::launch_from_spec(
+        &spec,
+        port,
+        "inf-empty-content-model".into(),
+        fast_config(),
+    )
+    .expect("spawn must succeed");
+
+    let pid = lifecycle.pid();
+    lifecycle
+        .wait_ready()
+        .await
+        .expect("readiness must succeed");
+    lifecycle
+        .verify_identity()
+        .await
+        .expect("identity must succeed");
+
+    let error = lifecycle
+        .verify_inference()
+        .await
+        .expect_err("verify_inference must reject empty completion content");
+
+    match &error {
+        LifecycleError::InferenceCheck(msg) => {
+            assert!(
+                msg.contains("empty completion content"),
+                "expected empty completion content message, got: {msg}"
+            );
+        }
+        other => panic!("expected InferenceCheck error, got {other:?}"),
+    }
+
+    // Verify child is cleaned up on error and not orphaned
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_process_dead(pid);
+}
+
 // ── Real-runtime smoke test (opt-in) ─────────────────────────────────
 
 /// This test is opt-in: set `LLAMACPP_SMOKE_EXECUTABLE` and

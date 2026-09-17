@@ -301,13 +301,15 @@ impl LlamaCppLifecycle {
     }
 
     /// After identity verification, run a minimal inference check: send a
-    /// `POST /v1/chat/completions` with `max_tokens: 1` and verify a 200
-    /// response.
+    /// `POST /v1/chat/completions` with `max_tokens: 1`, parse the `OpenAI`
+    /// response JSON, and verify non-empty completion content.
     ///
     /// # Errors
     ///
-    /// Returns [`LifecycleError::InferenceCheck`] on failure. On any error,
-    /// the child is shut down.
+    /// Returns [`LifecycleError::InferenceCheck`] if the request fails, returns
+    /// a non-success HTTP status, produces malformed JSON, has an empty
+    /// `choices` array, or has empty completion content. On any error, the
+    /// child is shut down.
     pub async fn verify_inference(&mut self) -> Result<(), LifecycleError> {
         let url = format!("http://{LOOPBACK_HOST}:{}/v1/chat/completions", self.port);
         let client = match build_http_client(&self.config) {
@@ -329,17 +331,70 @@ impl LlamaCppLifecycle {
                 return Err(LifecycleError::InferenceCheck(error.to_string()));
             }
         };
-        if response.status().is_success() {
-            Ok(())
-        } else {
+        if !response.status().is_success() {
             let status = response.status();
             let response_body = response.text().await.unwrap_or_default();
             let error = LifecycleError::InferenceCheck(format!(
                 "/v1/chat/completions returned HTTP {status}: {response_body}"
             ));
             self.shutdown_on_error().await;
-            Err(error)
+            return Err(error);
         }
+
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(error) => {
+                self.shutdown_on_error().await;
+                return Err(LifecycleError::InferenceCheck(format!(
+                    "failed to read /v1/chat/completions response body: {error}"
+                )));
+            }
+        };
+
+        let body: serde_json::Value = match serde_json::from_str(&response_text) {
+            Ok(body) => body,
+            Err(error) => {
+                self.shutdown_on_error().await;
+                return Err(LifecycleError::InferenceCheck(format!(
+                    "malformed JSON in /v1/chat/completions response: {error}; body: {response_text}"
+                )));
+            }
+        };
+
+        let Some(choices) = body.get("choices").and_then(serde_json::Value::as_array) else {
+            let error = LifecycleError::InferenceCheck(
+                "missing or non-array 'choices' in /v1/chat/completions response".to_string(),
+            );
+            self.shutdown_on_error().await;
+            return Err(error);
+        };
+
+        if choices.is_empty() {
+            let error = LifecycleError::InferenceCheck(
+                "empty 'choices' in /v1/chat/completions response".to_string(),
+            );
+            self.shutdown_on_error().await;
+            return Err(error);
+        }
+
+        let has_non_empty_content = choices.iter().any(|choice| {
+            let content = choice
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| choice.get("text").and_then(serde_json::Value::as_str));
+            content.is_some_and(|c| !c.trim().is_empty())
+        });
+
+        if !has_non_empty_content {
+            let error = LifecycleError::InferenceCheck(
+                "empty completion content in /v1/chat/completions response".to_string(),
+            );
+            self.shutdown_on_error().await;
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     /// Shut down the engine child cleanly (ADR-0002: TERM→grace→KILL).

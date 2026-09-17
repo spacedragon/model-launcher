@@ -30,10 +30,8 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use model_serving_domain::model::{
-    ArtifactKind, Capabilities, LoadConfig, Model, Runtime, RuntimeKind,
-};
-use model_serving_runtime::SupervisorConfig;
+use model_serving_domain::model::{ArtifactKind, LoadConfig, Model, Runtime, RuntimeKind};
+use model_serving_runtime::{DoctorReport, ProbeConfig, SupervisorConfig};
 use model_serving_runtime_llamacpp::{
     LaunchContext, LifecycleConfig, LlamaCppAdapter, MIN_SUPPORTED_BUILD,
 };
@@ -231,6 +229,18 @@ fn validate_environment(config: &RunnerConfig) -> Result<(), String> {
     Ok(())
 }
 
+async fn diagnose_runtime(executable: &std::path::Path) -> Result<DoctorReport, String> {
+    let probe_config = ProbeConfig::new();
+    let report = LlamaCppAdapter::diagnose(executable, &probe_config).await;
+    if !report.is_ready() {
+        return Err(format!(
+            "llama-server diagnostic check failed (status: {} [{}]: {})",
+            report.status, report.code, report.message
+        ));
+    }
+    Ok(report)
+}
+
 async fn run_single_cycle(
     cycle: usize,
     total: usize,
@@ -304,31 +314,10 @@ async fn run_single_cycle(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
-    let config = match parse_args() {
-        Ok(c) => c,
-        Err(err) => {
-            eprintln!("Error: {err}");
-            eprintln!("Run with --help for usage details.");
-            std::process::exit(1);
-        }
-    };
-
-    println!("================================================================");
-    println!(" llama.cpp Real-Runtime Smoke Test Runner (Job 8)");
-    println!(" Supported Version: llama.cpp b{MIN_SUPPORTED_BUILD}+ (ADR-0003 baseline)");
-    println!(" Executable:       {}", config.executable.display());
-    println!(" Model:            {}", config.model_path.display());
-    println!(" Target Cycles:    {}", config.cycles);
-    println!(" Context Length:   {} tokens", config.ctx_size);
-    println!("================================================================");
-
-    if let Err(err) = validate_environment(&config) {
-        eprintln!("Error: {err}");
-        std::process::exit(1);
-    }
-
+fn create_smoke_context(
+    config: &RunnerConfig,
+    doctor_report: &DoctorReport,
+) -> (Model, Runtime, LoadConfig, LifecycleConfig) {
     let model_key = config
         .model_path
         .file_stem()
@@ -355,8 +344,8 @@ async fn main() {
         kind: RuntimeKind::LlamaCpp,
         executable_path: config.executable.to_string_lossy().into_owned(),
         enabled: true,
-        version_text: None,
-        capabilities: Capabilities::default(),
+        version_text: doctor_report.version_text.clone(),
+        capabilities: doctor_report.capabilities.clone(),
         fixed_args: vec![],
     };
 
@@ -384,26 +373,30 @@ async fn main() {
         http_connect_timeout: Duration::from_secs(5),
     };
 
-    let start_all = Instant::now();
+    (model, runtime, load_config, lifecycle_config)
+}
 
+async fn execute_smoke_cycles(
+    config: &RunnerConfig,
+    model: &Model,
+    runtime: &Runtime,
+    load_config: &LoadConfig,
+    lifecycle_config: &LifecycleConfig,
+) -> Result<(), String> {
+    let start_all = Instant::now();
     for cycle in 1..=config.cycles {
         let port = config.port.unwrap_or_else(allocate_free_port);
-        if let Err(err) = run_single_cycle(
+        run_single_cycle(
             cycle,
             config.cycles,
             port,
-            &model,
-            &runtime,
-            &load_config,
-            &lifecycle_config,
+            model,
+            runtime,
+            load_config,
+            lifecycle_config,
         )
-        .await
-        {
-            eprintln!("[FAIL] Cycle {cycle}: {err}");
-            std::process::exit(1);
-        }
+        .await?;
     }
-
     let elapsed_total = start_all.elapsed();
     println!("================================================================");
     println!(
@@ -412,4 +405,53 @@ async fn main() {
     );
     println!(" Zero orphan processes detected across all cycles.");
     println!("================================================================");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let config = match parse_args() {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            eprintln!("Run with --help for usage details.");
+            std::process::exit(1);
+        }
+    };
+
+    println!("================================================================");
+    println!(" llama.cpp Real-Runtime Smoke Test Runner (Job 8)");
+    println!(" Supported Version: llama.cpp b{MIN_SUPPORTED_BUILD}+ (ADR-0003 baseline)");
+    println!(" Executable:       {}", config.executable.display());
+    println!(" Model:            {}", config.model_path.display());
+    println!(" Target Cycles:    {}", config.cycles);
+    println!(" Context Length:   {} tokens", config.ctx_size);
+    println!("================================================================");
+
+    if let Err(err) = validate_environment(&config) {
+        eprintln!("Error: {err}");
+        std::process::exit(1);
+    }
+
+    let doctor_report = match diagnose_runtime(&config.executable).await {
+        Ok(report) => {
+            let version = report.version_text.as_deref().unwrap_or("unknown");
+            println!("  -> Runtime preflight: OK (version: {version})");
+            report
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            std::process::exit(1);
+        }
+    };
+
+    let (model, runtime, load_config, lifecycle_config) =
+        create_smoke_context(&config, &doctor_report);
+
+    if let Err(err) =
+        execute_smoke_cycles(&config, &model, &runtime, &load_config, &lifecycle_config).await
+    {
+        eprintln!("[FAIL] {err}");
+        std::process::exit(1);
+    }
 }
