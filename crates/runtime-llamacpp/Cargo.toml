@@ -1,18 +1,37 @@
 [package]
 name = "model-serving-runtime-llamacpp"
 edition = "2024"
-description = "llama.cpp (llama-server) parameter mapping and capability snapshot"
+description = "llama.cpp (llama-server) parameter mapping, capability snapshot, and lifecycle orchestration"
 
 version.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+# Test-support fake llama-server used by `tests/lifecycle.rs` to exercise the
+# lifecycle orchestrator against controllable child behaviour modes.
+name = "fake_llama_server"
+path = "src/bin/fake_llama_server.rs"
+
+[[bin]]
+# Standalone smoke test runner capable of executing 20 (or user-configured)
+# consecutive load-infer-unload cycles against a real or fake llama-server.
+name = "llama_smoke_runner"
+path = "src/bin/llama_smoke_runner.rs"
+
 [dependencies]
+chrono = { workspace = true }
 model-serving-domain = { workspace = true }
 model-serving-runtime = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
-chrono = { workspace = true }
 tokio = { workspace = true }
 
 [lints]
