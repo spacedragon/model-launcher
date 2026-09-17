@@ -112,9 +112,14 @@ fn handle_request(
     never_ready: bool,
     ready: &AtomicBool,
 ) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap_or_else(|_| {
-        std::process::exit(1);
-    }));
+    let cloned = match stream.try_clone() {
+        Ok(s) => s,
+        Err(err) => {
+            eprintln!("fake_llama_server: failed to clone stream: {err}");
+            return;
+        }
+    };
+    let mut reader = BufReader::new(cloned);
 
     // Read the request line
     let mut request_line = String::new();
@@ -129,11 +134,8 @@ fn handle_request(
         if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
             break;
         }
-        if let Some(value) = header.strip_prefix("Content-Length: ") {
-            content_length = value.trim().parse().unwrap_or(0);
-        }
-        if let Some(value) = header.strip_prefix("content-length: ") {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some(len) = parse_content_length(&header) {
+            content_length = len;
         }
     }
 
@@ -199,4 +201,50 @@ fn respond(stream: &mut std::net::TcpStream, status: u16, body: &str) {
     );
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
+}
+
+fn parse_content_length(header_line: &str) -> Option<usize> {
+    let (name, value) = header_line.split_once(':')?;
+    if name.trim().eq_ignore_ascii_case("content-length") {
+        value.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_content_length_standard() {
+        assert_eq!(parse_content_length("Content-Length: 42"), Some(42));
+    }
+
+    #[test]
+    fn parse_content_length_case_insensitive() {
+        assert_eq!(parse_content_length("content-length: 42"), Some(42));
+        assert_eq!(parse_content_length("CONTENT-LENGTH: 42"), Some(42));
+        assert_eq!(parse_content_length("CoNtEnT-lEnGtH: 42"), Some(42));
+    }
+
+    #[test]
+    fn parse_content_length_whitespace_around_colon_and_value() {
+        assert_eq!(parse_content_length("Content-Length : 42"), Some(42));
+        assert_eq!(
+            parse_content_length("Content-Length:    42   \r\n"),
+            Some(42)
+        );
+        assert_eq!(parse_content_length("Content-Length   :   42\n"), Some(42));
+        assert_eq!(parse_content_length("Content-Length:0"), Some(0));
+    }
+
+    #[test]
+    fn parse_content_length_other_headers_or_invalid() {
+        assert_eq!(parse_content_length("Content-Type: application/json"), None);
+        assert_eq!(parse_content_length("Host: 127.0.0.1"), None);
+        assert_eq!(parse_content_length("invalid header without colon"), None);
+        assert_eq!(parse_content_length("Content-Length: not_a_number"), None);
+        assert_eq!(parse_content_length("Content-Length: -5"), None);
+    }
 }
