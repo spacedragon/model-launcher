@@ -42,6 +42,10 @@ use model_serving_runtime::{
     fixed_arg_collision,
 };
 
+pub mod lifecycle;
+
+pub use lifecycle::{LifecycleConfig, LifecycleError, LlamaCppLifecycle, LoadResult};
+
 /// Minimum supported `llama.cpp` build number (`ADR-0003` candidate `b5555`).
 pub const MIN_SUPPORTED_BUILD: u32 = 5555;
 
@@ -287,6 +291,65 @@ impl LlamaCppAdapter {
             spec = spec.with_arg(arg.as_str());
         }
         Ok(spec)
+    }
+
+    /// Launch a llama.cpp instance using [`LlamaCppLifecycle`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LifecycleError`] if argv validation or child process spawn fails.
+    pub fn launch(
+        ctx: &LaunchContext<'_>,
+        config: lifecycle::LifecycleConfig,
+    ) -> Result<lifecycle::LlamaCppLifecycle, lifecycle::LifecycleError> {
+        lifecycle::LlamaCppLifecycle::launch(ctx, config)
+    }
+
+    /// Classify process termination using exit status and stderr output
+    /// (`docs/architecture.md` §4, §6).
+    #[must_use]
+    pub fn classify_exit(
+        exit: std::process::ExitStatus,
+        stderr_tail: &str,
+    ) -> model_serving_domain::model::FailureClass {
+        if exit.success() {
+            model_serving_domain::model::FailureClass::ProcessCrash
+        } else {
+            Self::classify_stderr(stderr_tail)
+        }
+    }
+
+    /// Classify stderr output for known failure patterns (OOM, port conflict, invalid model).
+    #[must_use]
+    pub fn classify_stderr(stderr_tail: &str) -> model_serving_domain::model::FailureClass {
+        use model_serving_domain::model::FailureClass;
+        let lower = stderr_tail.to_ascii_lowercase();
+        if lower.contains("cuda out of memory")
+            || lower.contains("failed to allocate")
+            || lower.contains("cudamalloc failed")
+            || lower.contains("cublas_status_alloc_failed")
+            || lower.contains("ggml_cuda_init: failed to allocate")
+        {
+            FailureClass::GpuOomLikely
+        } else if lower.contains("cannot bind")
+            || lower.contains("address already in use")
+            || lower.contains("failed to bind")
+            || lower.contains("wsaeaddrinuse")
+            || lower.contains("eaddrinuse")
+        {
+            FailureClass::PortConflict
+        } else if lower.contains("failed to load model")
+            || lower.contains("error loading model")
+            || lower.contains("invalid model")
+            || lower.contains("not a valid gguf")
+            || lower.contains("unknown model architecture")
+            || lower.contains("unsupported format")
+            || lower.contains("failed to parse")
+        {
+            FailureClass::InvalidModel
+        } else {
+            FailureClass::ProcessCrash
+        }
     }
 }
 
