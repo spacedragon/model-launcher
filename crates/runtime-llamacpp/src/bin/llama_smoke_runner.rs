@@ -164,47 +164,77 @@ fn allocate_free_port() -> u16 {
     listener.local_addr().expect("query local address").port()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_csv_contains_pid(output: &str, pid: u32) -> Result<bool, String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err("tasklist returned empty output".to_owned());
+    }
+    let wanted = pid.to_string();
+    let mut found_any_valid_line = false;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line
+            .split(',')
+            .map(|field| field.trim_matches('"').trim())
+            .collect();
+        if fields.len() < 2 {
+            return Err(format!(
+                "tasklist output is indeterminate (unparseable line: {line:?})"
+            ));
+        }
+        if fields[1].parse::<u32>().is_err() {
+            return Err(format!(
+                "tasklist output is indeterminate (non-numeric PID field {:?} in line: {line:?})",
+                fields[1]
+            ));
+        }
+        found_any_valid_line = true;
+        if fields[1] == wanted {
+            return Ok(true);
+        }
+    }
+    if !found_any_valid_line {
+        return Err("tasklist output is indeterminate (no valid process records found)".to_owned());
+    }
+    Ok(false)
+}
+
 #[cfg(windows)]
-fn pid_present(pid: u32) -> Option<bool> {
+fn is_process_alive(pid: u32) -> Result<bool, String> {
     let output = std::process::Command::new("tasklist")
         .arg("/NH")
         .arg("/FO")
         .arg("CSV")
         .output()
-        .ok()?;
+        .map_err(|err| format!("failed to spawn tasklist: {err}"))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "tasklist exited with non-zero status ({:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        ));
     }
-    let wanted = pid.to_string();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields: Vec<&str> = line
-            .split(',')
-            .map(|field| field.trim_matches('"').trim())
-            .collect();
-        if fields.len() >= 2 && fields[1] == wanted {
-            return Some(true);
-        }
-    }
-    Some(false)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tasklist_csv_contains_pid(&stdout, pid)
 }
 
-fn is_process_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(pid as libc::pid_t, 0) == 0
-        }
-    }
-    #[cfg(windows)]
-    {
-        pid_present(pid).unwrap_or(false)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        false
-    }
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn is_process_alive(pid: u32) -> Result<bool, String> {
+    #[allow(unsafe_code)]
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+    Ok(alive)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_process_alive(pid: u32) -> Result<bool, String> {
+    let _ = pid;
+    Err("unsupported platform for orphan check".to_owned())
 }
 
 fn validate_environment(config: &RunnerConfig) -> Result<(), String> {
@@ -301,7 +331,9 @@ async fn run_single_cycle(
 
     // Confirm child process cleanup (no-orphan verification)
     tokio::time::sleep(Duration::from_millis(150)).await;
-    if is_process_alive(pid) {
+    let alive =
+        is_process_alive(pid).map_err(|err| format!("orphan check failed for PID {pid}: {err}"))?;
+    if alive {
         return Err(format!(
             "process {pid} is still alive after unload! (orphan detected)"
         ));
@@ -453,5 +485,37 @@ async fn main() {
     {
         eprintln!("[FAIL] {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_tasklist_finds_matching_pid() {
+        let sample = r#""smss.exe","408","Services","0","1,234 K"
+"llama-server.exe","12345","Console","1","50,000 K"
+"explorer.exe","5678","Console","1","80,000 K""#;
+        assert_eq!(parse_tasklist_csv_contains_pid(sample, 12345), Ok(true));
+        assert_eq!(parse_tasklist_csv_contains_pid(sample, 99999), Ok(false));
+    }
+
+    #[test]
+    fn parse_tasklist_rejects_empty_output() {
+        assert!(parse_tasklist_csv_contains_pid("", 12345).is_err());
+        assert!(parse_tasklist_csv_contains_pid("   \r\n  ", 12345).is_err());
+    }
+
+    #[test]
+    fn parse_tasklist_rejects_indeterminate_non_csv_or_info_message() {
+        let info = "INFO: No tasks are running which match the specified criteria.";
+        assert!(parse_tasklist_csv_contains_pid(info, 12345).is_err());
+    }
+
+    #[test]
+    fn parse_tasklist_rejects_non_numeric_pid() {
+        let bad = r#""Image Name","PID","Session Name""#;
+        assert!(parse_tasklist_csv_contains_pid(bad, 12345).is_err());
     }
 }
