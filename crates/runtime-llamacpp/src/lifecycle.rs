@@ -13,7 +13,7 @@
 //!    model key appears in the response.
 //! 4. **Inference check**: A minimal `POST /v1/chat/completions` with
 //!    `max_tokens: 1` to verify the engine can actually generate.
-//! 5. **Unload**: ADR-0002 TERM→grace→KILL shutdown via [`ManagedProcess`].
+//! 5. **Unload**: ADR-0002 TERM -> grace -> KILL shutdown via [`ManagedProcess`].
 //!
 //! Every failure path ensures the child is cleaned up (shutdown + pipe settle)
 //! before returning, so a failed lifecycle never orphans a process.
@@ -84,10 +84,6 @@ pub enum LifecycleError {
     /// The process supervisor reported a lifecycle failure.
     #[error("supervisor error: {0}")]
     Supervisor(#[source] SupervisorError),
-    /// The `/health` endpoint did not return `{"status":"ok"}` before the
-    /// startup deadline. The child has already been shut down.
-    #[error("health check failed: {0}")]
-    HealthCheck(String),
     /// The `/v1/models` response did not contain the expected model key.
     #[error("identity mismatch: expected model key {expected:?}, got {got:?}")]
     IdentityMismatch {
@@ -117,7 +113,6 @@ impl LifecycleError {
                 }
             }
             Self::Supervisor(error) => supervisor_failure_class(error),
-            Self::HealthCheck(_) => FailureClass::StartupTimeout,
             Self::IdentityMismatch { .. } => FailureClass::ConfigError,
             Self::InferenceCheck(_) | Self::Http(_) => FailureClass::Unknown,
         }
@@ -306,10 +301,11 @@ impl LlamaCppLifecycle {
     ///
     /// # Errors
     ///
-    /// Returns [`LifecycleError::InferenceCheck`] if the request fails, returns
-    /// a non-success HTTP status, produces malformed JSON, has an empty
-    /// `choices` array, or has empty completion content. On any error, the
-    /// child is shut down.
+    /// Returns [`LifecycleError::Http`] if communicating with the child fails
+    /// (client construction, request dispatch, or body read), or
+    /// [`LifecycleError::InferenceCheck`] if the endpoint returns a non-success
+    /// HTTP status, produces malformed JSON, has an empty `choices` array, or has
+    /// empty completion content. On any error, the child is shut down.
     pub async fn verify_inference(&mut self) -> Result<(), LifecycleError> {
         let url = format!("http://{LOOPBACK_HOST}:{}/v1/chat/completions", self.port);
         let client = match build_http_client(&self.config) {
@@ -328,7 +324,7 @@ impl LlamaCppLifecycle {
             Ok(response) => response,
             Err(error) => {
                 self.shutdown_on_error().await;
-                return Err(LifecycleError::InferenceCheck(error.to_string()));
+                return Err(LifecycleError::Http(error.to_string()));
             }
         };
         if !response.status().is_success() {
@@ -345,7 +341,7 @@ impl LlamaCppLifecycle {
             Ok(text) => text,
             Err(error) => {
                 self.shutdown_on_error().await;
-                return Err(LifecycleError::InferenceCheck(format!(
+                return Err(LifecycleError::Http(format!(
                     "failed to read /v1/chat/completions response body: {error}"
                 )));
             }
@@ -397,7 +393,7 @@ impl LlamaCppLifecycle {
         Ok(())
     }
 
-    /// Shut down the engine child cleanly (ADR-0002: TERM→grace→KILL).
+    /// Shut down the engine child cleanly (ADR-0002: TERM -> grace -> KILL).
     ///
     /// # Errors
     ///
@@ -462,8 +458,9 @@ impl LlamaCppLifecycle {
                     FailureClass::ConfigError
                 }
             }
-            LifecycleError::Supervisor(SupervisorError::ReadinessTimeout)
-            | LifecycleError::HealthCheck(_) => FailureClass::StartupTimeout,
+            LifecycleError::Supervisor(SupervisorError::ReadinessTimeout) => {
+                FailureClass::StartupTimeout
+            }
             LifecycleError::Supervisor(SupervisorError::ExitedBeforeReady) => {
                 let stderr_tail = self.process.logs().stderr_tail();
                 let stderr = String::from_utf8_lossy(&stderr_tail);
@@ -574,6 +571,10 @@ mod tests {
         );
         assert_eq!(
             LifecycleError::InferenceCheck("boom".into()).failure_class(),
+            FailureClass::Unknown
+        );
+        assert_eq!(
+            LifecycleError::Http("boom".into()).failure_class(),
             FailureClass::Unknown
         );
     }

@@ -755,6 +755,90 @@ async fn inference_rejects_empty_completion_content_and_cleans_up() {
     assert_process_dead(pid);
 }
 
+#[tokio::test]
+async fn inference_transport_failure_reports_http_error_and_cleans_up() {
+    let port = free_port();
+    let spec = fake_spec("healthy", port, "inf-http-fail-model");
+    let mut lifecycle = LlamaCppLifecycle::launch_from_spec(
+        &spec,
+        port,
+        "inf-http-fail-model".into(),
+        fast_config(),
+    )
+    .expect("spawn must succeed");
+
+    let pid = lifecycle.pid();
+    lifecycle
+        .wait_ready()
+        .await
+        .expect("readiness must succeed");
+    lifecycle
+        .verify_identity()
+        .await
+        .expect("identity must succeed");
+
+    // Unload the child process so the loopback port is no longer listening.
+    lifecycle.unload().await.expect("unload must succeed");
+
+    let error = lifecycle
+        .verify_inference()
+        .await
+        .expect_err("verify_inference must report Http error when child is unreachable");
+
+    match &error {
+        LifecycleError::Http(_) => {}
+        other => panic!("expected Http error, got {other:?}"),
+    }
+    assert_eq!(error.failure_class(), FailureClass::Unknown);
+    assert_eq!(
+        lifecycle.classify_lifecycle_error(&error),
+        FailureClass::Unknown
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_process_dead(pid);
+}
+
+#[tokio::test]
+async fn identity_transport_failure_reports_http_error_and_cleans_up() {
+    let port = free_port();
+    let spec = fake_spec("healthy", port, "id-http-fail-model");
+    let mut lifecycle = LlamaCppLifecycle::launch_from_spec(
+        &spec,
+        port,
+        "id-http-fail-model".into(),
+        fast_config(),
+    )
+    .expect("spawn must succeed");
+
+    let pid = lifecycle.pid();
+    lifecycle
+        .wait_ready()
+        .await
+        .expect("readiness must succeed");
+
+    // Unload the child process so the loopback port is no longer listening.
+    lifecycle.unload().await.expect("unload must succeed");
+
+    let error = lifecycle
+        .verify_identity()
+        .await
+        .expect_err("verify_identity must report Http error when child is unreachable");
+
+    match &error {
+        LifecycleError::Http(_) => {}
+        other => panic!("expected Http error, got {other:?}"),
+    }
+    assert_eq!(error.failure_class(), FailureClass::Unknown);
+    assert_eq!(
+        lifecycle.classify_lifecycle_error(&error),
+        FailureClass::Unknown
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_process_dead(pid);
+}
+
 // ── Real-runtime smoke test (opt-in) ─────────────────────────────────
 
 /// This test is opt-in: set `LLAMACPP_SMOKE_EXECUTABLE` and
