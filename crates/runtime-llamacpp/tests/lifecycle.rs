@@ -847,6 +847,11 @@ async fn identity_transport_failure_reports_http_error_and_cleans_up() {
 /// When both are set, runs 20 consecutive load/readiness/identity/inference/
 /// unload cycles against a real `llama-server` and a real GGUF model.
 ///
+/// Note: This acceptance test intentionally hardcodes exactly 20 cycles
+/// (`const CYCLES: usize = 20`) and does not read `LLAMACPP_SMOKE_CYCLES`.
+/// Configurable cycle counts are supported by the standalone
+/// `llama_smoke_runner` CLI tool (`--cycles <N>` or `LLAMACPP_SMOKE_CYCLES=<N>`).
+///
 /// # Environment variables
 ///
 /// - `LLAMACPP_SMOKE_EXECUTABLE`: Absolute path to `llama-server`.
@@ -858,7 +863,7 @@ async fn identity_transport_failure_reports_http_error_and_cleans_up() {
 /// LLAMACPP_SMOKE_EXECUTABLE=/usr/local/bin/llama-server \
 /// LLAMACPP_SMOKE_MODEL=/mnt/d/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf \
 /// cargo test --package model-serving-runtime-llamacpp \
-///   --test lifecycle smoke_test_real_runtime -- --ignored --nocapture
+///   --test lifecycle smoke_test_real_runtime_20_cycles -- --ignored --nocapture
 /// ```
 #[tokio::test]
 #[ignore = "requires LLAMACPP_SMOKE_EXECUTABLE and LLAMACPP_SMOKE_MODEL environment variables"]

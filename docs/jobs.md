@@ -41,11 +41,12 @@
 #### 环境变量 (Environment Variables)
 - `LLAMACPP_SMOKE_EXECUTABLE`: 真实 `llama-server` 可执行文件的绝对路径。
 - `LLAMACPP_SMOKE_MODEL`: 真实 `.gguf` 模型权重文件的绝对路径。
-- `LLAMACPP_SMOKE_CYCLES`: 循环轮次，默认为 `20`。
+- `LLAMACPP_SMOKE_CYCLES`: 循环轮次，默认为 `20`。仅独立 runner (`llama_smoke_runner`) 支持此环境变量（或 `--cycles` 参数）；`smoke_test_real_runtime_20_cycles` 集成测试为固定 20 轮验收测试，不读取此环境变量。
 
 #### 执行命令 (Commands)
 
 **方式一：Cargo Ignored 集成测试**
+严格固定执行 20 轮验收测试（不读取 `LLAMACPP_SMOKE_CYCLES`）。
 ```bash
 LLAMACPP_SMOKE_EXECUTABLE=/path/to/llama-server \
 LLAMACPP_SMOKE_MODEL=/path/to/model.gguf \
@@ -54,13 +55,14 @@ cargo test --package model-serving-runtime-llamacpp \
 ```
 
 **方式二：独立可执行 Runner (`llama_smoke_runner`)**
+支持通过命令行参数 `--cycles <N>` 或环境变量 `LLAMACPP_SMOKE_CYCLES` 自定义轮次（默认 20 轮）。
 ```bash
 cargo run --package model-serving-runtime-llamacpp --bin llama_smoke_runner -- \
   --executable /path/to/llama-server \
   --model /path/to/model.gguf \
   --cycles 20
 ```
-*(Windows PowerShell 下可使用 `$env:LLAMACPP_SMOKE_EXECUTABLE="C:\path\to\llama-server.exe"; $env:LLAMACPP_SMOKE_MODEL="C:\path\to\model.gguf"; cargo test --package model-serving-runtime-llamacpp --test lifecycle smoke_test_real_runtime_20_cycles -- --ignored --nocapture`)*
+*(Windows PowerShell 下执行方式一：`$env:LLAMACPP_SMOKE_EXECUTABLE="C:\path\to\llama-server.exe"; $env:LLAMACPP_SMOKE_MODEL="C:\path\to\model.gguf"; cargo test --package model-serving-runtime-llamacpp --test lifecycle smoke_test_real_runtime_20_cycles -- --ignored --nocapture`)*
 
 #### 预期断言 (Expected Assertions per Cycle)
 在全部 20 轮循环中，每一轮均严格执行并断言以下条件：
