@@ -27,29 +27,77 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local address").port()
 }
 
-/// Cross-platform liveness check for a direct child PID.
+/// Pure parser for Windows `tasklist /NH /FO CSV` output.
+///
+/// Fails closed with an informative error if:
+/// - Output is empty or whitespace only
+/// - Any non-empty line has fewer than 2 fields (image name, PID)
+/// - The PID field is non-numeric
+/// - No valid process records were found
+///
+/// Returns `Ok(true)` if exact PID matches, or `Ok(false)` only when tasklist output
+/// was successfully parsed and verified to not contain the PID.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_tasklist_csv_contains_pid(output: &str, pid: u32) -> Result<bool, String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return Err("tasklist returned empty output".to_owned());
+    }
+    let mut found_any_valid_line = false;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line
+            .split(',')
+            .map(|field| field.trim_matches('"').trim())
+            .collect();
+        if fields.len() < 2 {
+            return Err(format!(
+                "tasklist output is indeterminate (unparseable line: {line:?})"
+            ));
+        }
+        let parsed_pid = fields[1].parse::<u32>().map_err(|err| {
+            format!(
+                "tasklist output is indeterminate (non-numeric PID field {:?} in line {:?}: {err})",
+                fields[1], line
+            )
+        })?;
+        found_any_valid_line = true;
+        if parsed_pid == pid {
+            return Ok(true);
+        }
+    }
+    if !found_any_valid_line {
+        return Err("tasklist output is indeterminate (no valid process records found)".to_owned());
+    }
+    Ok(false)
+}
+
+/// Windows liveness check for a direct child PID.
+///
+/// Fails closed: returns `Err` on spawn failure, non-zero exit, invalid UTF-8,
+/// or indeterminate output. Never returns vacuous false or unverified success.
 #[cfg(windows)]
-fn pid_present(pid: u32) -> Option<bool> {
+fn pid_present(pid: u32) -> Result<bool, String> {
     let output = std::process::Command::new("tasklist")
         .arg("/NH")
         .arg("/FO")
         .arg("CSV")
         .output()
-        .ok()?;
+        .map_err(|err| format!("failed to spawn tasklist: {err}"))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "tasklist exited with non-zero status ({:?}): {}",
+            output.status.code(),
+            stderr.trim()
+        ));
     }
-    let wanted = pid.to_string();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields: Vec<&str> = line
-            .split(',')
-            .map(|field| field.trim_matches('"').trim())
-            .collect();
-        if fields.len() >= 2 && fields[1] == wanted {
-            return Some(true);
-        }
-    }
-    Some(false)
+    let stdout = std::str::from_utf8(&output.stdout)
+        .map_err(|err| format!("tasklist stdout is not valid UTF-8: {err}"))?;
+    parse_tasklist_csv_contains_pid(stdout, pid)
 }
 
 /// Verify that a child process is completely reaped and no longer exists in the OS.
@@ -68,14 +116,15 @@ fn assert_process_dead(pid: u32) {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             match pid_present(pid) {
-                Some(false) | None => break,
-                Some(true) => {
+                Ok(false) => break,
+                Ok(true) => {
                     assert!(
                         std::time::Instant::now() < deadline,
-                        "process {pid} should no longer exist (orphan check)"
+                        "process {pid} should no longer exist (orphan check timed out)"
                     );
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                Err(err) => panic!("orphan check failed for process {pid}: {err}"),
             }
         }
     }
@@ -979,4 +1028,59 @@ async fn smoke_test_real_runtime_20_cycles() {
         assert_process_dead(pid);
     }
     eprintln!("=== All {CYCLES} smoke cycles passed ===");
+}
+
+// ── Windows tasklist orphan-check parser tests ───────────────────────
+
+#[test]
+fn parse_tasklist_finds_matching_pid() {
+    let sample = r#""smss.exe","408","Services","0","1,234 K"
+"fake_llama_server.exe","12345","Console","1","50,000 K"
+"explorer.exe","5678","Console","1","80,000 K""#;
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 12345), Ok(true));
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 99999), Ok(false));
+}
+
+#[test]
+fn parse_tasklist_exact_pid_matching_avoids_substring_matches() {
+    let sample = r#""proc1.exe","1234","Console","1","10,000 K"
+"proc2.exe","41230","Console","1","20,000 K""#;
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 123), Ok(false));
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 1234), Ok(true));
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 4123), Ok(false));
+    assert_eq!(parse_tasklist_csv_contains_pid(sample, 41230), Ok(true));
+}
+
+#[test]
+fn parse_tasklist_rejects_empty_output() {
+    assert!(parse_tasklist_csv_contains_pid("", 12345).is_err());
+    assert!(parse_tasklist_csv_contains_pid("   \r\n\t  ", 12345).is_err());
+}
+
+#[test]
+fn parse_tasklist_rejects_indeterminate_non_csv_or_info_message() {
+    let info = "INFO: No tasks are running which match the specified criteria.";
+    assert!(parse_tasklist_csv_contains_pid(info, 12345).is_err());
+}
+
+#[test]
+fn parse_tasklist_rejects_non_numeric_pid() {
+    let header_or_corrupt = r#""Image Name","PID","Session Name""#;
+    assert!(parse_tasklist_csv_contains_pid(header_or_corrupt, 12345).is_err());
+    let bad_pid = r#""process.exe","abc","Console","1","1,000 K""#;
+    assert!(parse_tasklist_csv_contains_pid(bad_pid, 12345).is_err());
+}
+
+#[test]
+fn parse_tasklist_rejects_unparseable_line() {
+    let unparseable = "not-a-csv-line";
+    assert!(parse_tasklist_csv_contains_pid(unparseable, 12345).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn pid_present_finds_current_process_and_reports_absent_for_impossible_pid() {
+    let current_pid = std::process::id();
+    assert_eq!(pid_present(current_pid), Ok(true));
+    assert_eq!(pid_present(u32::MAX), Ok(false));
 }
