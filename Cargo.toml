@@ -9,6 +9,7 @@ members = [
     "crates/api-types",
     "crates/persistence",
     "crates/scanner",
+    "crates/ops",
     "crates/spike",
 ]
 
@@ -28,6 +29,7 @@ model-serving-runtime-ninfer = { path = "crates/runtime-ninfer" }
 model-serving-api-types = { path = "crates/api-types" }
 model-serving-persistence = { path = "crates/persistence" }
 model-serving-scanner = { path = "crates/scanner" }
+model-serving-ops = { path = "crates/ops" }
 
 # External (see docs/architecture.md §2)
 axum = "0.8"
