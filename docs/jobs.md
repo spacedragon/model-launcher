@@ -32,7 +32,7 @@
 
 ### 2. 真实环境执行状态 (Real Runtime Execution Note)
 - **诚实说明**: 在当前本地开发与 CI 环境中，**未执行**真实的 `llama-server` 二进制程序与真实 `.gguf` 权重文件（当前环境未安装真实 runtime 二进制，亦无下载的大模型权重）。
-- **验证手段**: 本地与 CI 自动化回归测试由可控测试二进制 `fake_llama_server`（覆盖 healthy、slow_start、crash_early、invalid_model、port_conflict、never_ready 等多种行为模式）以及 synthetic-pinned 契约 fixtures (`fixtures/runtimes/health-and-models.json`) 完整保障；真实运行测试作为 opt-in 机制落地。
+- **验证手段**: 本地与 CI 自动化回归测试由可控测试二进制 `fake_llama_server`（覆盖 healthy、slow_start、crash_early、invalid_model、never_ready 等多种行为模式；确定性端口冲突场景通过预占端口拉起常规 healthy fixture 触发子进程退出）以及 synthetic-pinned 契约 fixtures (`fixtures/runtimes/health-and-models.json`) 完整保障；真实运行测试作为 opt-in 机制落地。
 
 ### 3. Opt-in 真实冒烟执行指南 (20 Cycles Real Smoke Instructions)
 
