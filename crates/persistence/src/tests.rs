@@ -306,7 +306,11 @@ async fn migrate_is_idempotent() {
             .fetch_all(reopened.pool())
             .await
             .expect("migrations table");
-    assert_eq!(versions, vec![1], "exactly one applied migration");
+    assert_eq!(
+        versions,
+        vec![1, 2],
+        "each migration is applied exactly once"
+    );
 }
 
 #[tokio::test]
@@ -841,6 +845,16 @@ async fn three_table_write_is_atomic() {
     assert_eq!(audit[0].operation_id.as_deref(), Some("op-a"));
     assert_eq!(audit[0].subject_id.as_deref(), Some("i-a"));
     assert!(audit[0].id > 0, "autoincrement event id");
+
+    // Release the per-instance active-operation guard before constructing a
+    // second operation for the rollback check below.
+    let succeeded = operation
+        .clone()
+        .with_state(OperationState::Succeeded)
+        .expect("running -> succeeded");
+    OperationsRepo::advance(store.pool(), &succeeded)
+        .await
+        .expect("settle first operation");
 
     // And a rollback of the same shape (fresh operation id — `create` is an
     // INSERT, so the committed `op-a` row cannot be re-inserted) leaves zero
